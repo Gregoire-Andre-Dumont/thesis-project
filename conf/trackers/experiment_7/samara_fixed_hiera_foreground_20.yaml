@@ -1,0 +1,24 @@
+tracker:
+  _target_: src.modules.samara_fixed.SamaraFixed
+  iou_threshold: 0.5
+  pred_iou_threshold: -1
+  trainer_config_path: conf/offline_trainers/experiment_9/cnn_fixed_samara_hiera_foreground_20.yaml
+
+  model:
+    _target_: src.modules.models.samara_hiera_model.SamaraHieraModel
+    sam_model_path: tm/sam_large.pt
+    padding_size: 12
+    crop_resize: 384
+    n_references: 6
+    token_source: hiera
+
+  main_memory:
+    _target_: src.modules.memories.main_memory.MainMemory
+    max_memory_history: 6
+    max_pointer_history: 15
+
+experiment:
+  _target_: src.experiments.tracking_experiment.TrackingExperiment
+  resolution: 1024
+  experiment_name: samara_fixed_hiera_foreground_20
+  video_path: data/visualize/samara_fixed_hiera_foreground_20

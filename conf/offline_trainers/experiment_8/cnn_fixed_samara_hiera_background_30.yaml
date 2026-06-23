@@ -1,0 +1,34 @@
+main_trainer:
+  _target_: src.offline_training.main_trainer.MainTrainer
+  model_name: experiment_8_cnn_fixed_n32_hiera_background_30
+  model:
+    _target_: src.offline_training.classifiers.cnn_fixed.CNNFixed
+    n_channels: 32
+    cnn_dim: 64
+    mlp_hidden: 512
+    dropout: 0.15
+    channel: background
+  criterion:
+    _target_: src.offline_training.losses.bce_iou.BCEIouLoss
+  dataset:
+    _target_: src.offline_training.main_dataset.MainDataset
+    dataset_path: data/datasets/hiera_anchor/clean
+    epoch_size_divisor: 2
+    iou_threshold: 0.3
+  collate_fn:
+    _target_: hydra.utils.get_method
+    path: src.offline_training.main_dataset.collate_fn
+  optimizer:
+    _target_: functools.partial
+    _args_:
+      - _target_: hydra.utils.get_class
+        path: torch.optim.Adam
+    lr: 0.000005001
+  epochs: 15
+  batch_size: 32
+  patience: 30
+  n_folds: 5
+  checkpointing_resume_if_exists: False
+  dataloader_args:
+    num_workers: 16
+    prefetch_factor: 4

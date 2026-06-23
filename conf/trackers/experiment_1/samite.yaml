@@ -1,0 +1,7 @@
+tracker:
+  _target_: src.modules.baselines.samite.Samite
+  checkpoint: tm/sam_large.pt
+ 
+
+experiment:
+  _target_: src.experiments.tracking_experiment.TrackingExperiment

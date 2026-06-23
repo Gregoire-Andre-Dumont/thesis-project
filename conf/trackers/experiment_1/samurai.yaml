@@ -1,0 +1,10 @@
+tracker:
+  _target_: src.modules.baselines.samurai.Samurai
+  checkpoint: tm/sam_large.pt
+ 
+
+experiment:
+  _target_: src.experiments.tracking_experiment.TrackingExperiment
+  resolution: 1024
+  experiment_name: sam original
+  video_path: data/visualize

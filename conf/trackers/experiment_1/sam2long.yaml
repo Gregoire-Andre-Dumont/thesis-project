@@ -1,0 +1,13 @@
+tracker:
+  _target_: src.modules.baselines.sam2long.SAM2Long
+  checkpoint: tm/sam_large.pt
+  model_config: SAM2/sam2long_hiera_large.yaml
+  num_pathway: 2
+  iou_thre: 0.1
+  uncertainty: 2
+
+experiment:
+  _target_: src.experiments.tracking_experiment.TrackingExperiment
+  resolution: 1024
+  experiment_name: sam2long
+  video_path: data/visualize/sam2long
