@@ -1,0 +1,32 @@
+# Model weights
+*.pt
+*.pth
+*.onnx
+
+# Selection history file
+.history
+
+# Cache files
+*.pyc
+__pycache__
+
+# Common environment names
+venv/
+.venv/
+env/
+.env/
+
+# Catch-all for local ignorables
+ignore/
+saved_images/
+/data/docker
+/videos
+/data
+/tm
+/results
+/outputs
+/docker_2
+/docker_1
+/wandb
+.ipynb_checkpoints
+/helper

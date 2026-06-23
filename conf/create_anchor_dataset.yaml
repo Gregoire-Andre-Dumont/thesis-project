@@ -1,0 +1,37 @@
+defaults:
+  - trackers@oracle: memory_oracle
+
+detection_data:
+  _target_: src.typing.detection_data.DetectionData
+  amodal_directory: data/person_path/amodal
+  visible_directory: data/person_path/visible
+  video_directory: data/person_path/videos
+  load_frames: True
+  num_threads: 32
+  resize_resolution: 1024
+
+person_path:
+  _target_: src.typing.person_path.PersonPath
+  main_directory: data/person_path
+  occlusion_ranges: [5, 75]
+  n_experiments: 1100
+  n_after_occlusion: 40
+  random_seed: 44
+  min_visible_ratio: 0.9
+  min_frames_after_anchor: 50
+  non_targets:
+    - "crowd"
+    - "person_in_vehicle"
+    - "reflection"
+    - "person_in_background"
+    - "severly_occluded_person"
+
+wandb_enabled: True
+hiera_dataset_path: data/datasets/hiera_anchor
+shard_index: 0
+num_shards: 3
+
+n_references: 9
+commit_threshold: 0.4
+random_seed: 42
+coverage_threshold: 0.05

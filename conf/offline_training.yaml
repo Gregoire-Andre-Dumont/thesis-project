@@ -1,0 +1,20 @@
+defaults:
+  - offline_trainers: cnn_fixed_samara
+  - trackers@tracker: memory_oracle
+  
+detection_data:
+  _target_: src.typing.detection_data.DetectionData
+  amodal_directory: data/person_path/amodal
+  visible_directory: data/person_path/visible
+  video_directory: data/person_path/videos
+  load_frames: True
+  num_threads: 32
+  resize_resolution: 1024
+
+wandb_enabled: True
+train_test_split: 0.5
+deploy_controller: True
+dataset_path: data/datasets/hiera_anchor/clean
+
+commit_threshold: 0.4
+n_references: 9
