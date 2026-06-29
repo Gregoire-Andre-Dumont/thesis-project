@@ -5,7 +5,7 @@ import numpy as np
 from dataclasses import dataclass
 from src.typing.detection_data import DetectionData
 from src.modules.memories.main_memory import MainMemory
-from src.modules.models.samara_hiera_model import SamaraHieraModel
+from src.modules.samara_hiera_model import SamaraHieraModel
 
 
 @dataclass
@@ -28,7 +28,7 @@ class SAMBaseline:
 
         # Reset and initialize the memory bank with the new target
         self.main_memory.reset_memory()
-        self.main_memory.initialize_references(self.model, detection_data)
+        self.main_memory.initialize_references(self.model, detection_data, anchor_index=0)
 
         n_frames = detection_data.frames.shape[0]
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)

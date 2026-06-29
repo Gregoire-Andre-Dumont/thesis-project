@@ -2,11 +2,10 @@ tracker:
   _target_: src.modules.baselines.memory_oracle.MemoryOracle
   iou_threshold: 0.10
   model:
-    _target_: src.modules.models.samara_hiera_model.SamaraHieraModel
+    _target_: src.modules.samara_hiera_model.SamaraHieraModel
     sam_model_path: tm/sam_large.pt
-    padding_size: 32
     crop_resize: 512
-    n_references: 9
+    pad_ratio: 1.0
     
   main_memory: 
     _target_: src.modules.memories.main_memory.MainMemory

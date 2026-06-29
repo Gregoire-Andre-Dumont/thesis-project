@@ -8,18 +8,15 @@ from muggled_sam.make_sam_v2 import make_samv2_from_state_dict
 
 
 class SamaraHieraModel(SAMV2Model):
-    """SAM 2 with multi-reference feature extraction for SAMARA. Crops with a fixed
-    amodal-floor square window when `set_amodal_anchor` has been called (new offline
-    pipeline); otherwise falls back to a mask-bbox-with-padding crop (existing runtime
-    trackers). Patch tokens are SAM 2's Hiera image-encoder lowres features."""
+    """SAM 2 with multi-reference patch-token extraction for SAMARA."""
+
+    OBJECT_SCORE_VALUE = 100.0
 
     def __init__(
         self,
         sam_model_path: str | None = None,
-        padding_size: int | None = None,
         controller: torch.nn.Module | None = None,
         crop_resize: int | None = None,
-        n_references: int = 9,
         pad_ratio: float = 0.25,
         token_source: str = "hiera",
     ):
@@ -27,14 +24,10 @@ class SamaraHieraModel(SAMV2Model):
             raise ValueError(f"token_source must be 'hiera' or 'memory', got {token_source!r}")
         _, sam_model = make_samv2_from_state_dict(sam_model_path)
         self.stochastic_policy = True
-        self.padding_size = padding_size
         self.crop_resize = crop_resize
-        self.n_references = n_references
         self.pad_ratio = pad_ratio
         self.token_source = token_source
-        self.first_amodal_bbox_norm = None
-        self.first_frame_height = None
-        self.first_frame_width = None
+        self.anchor_amodal_pixels = 0
 
         super().__init__(
             image_encoder_model = sam_model.image_encoder,
@@ -44,38 +37,34 @@ class SamaraHieraModel(SAMV2Model):
             memory_encoder_model = sam_model.memory_encoder,
             memory_fusion_model = sam_model.memory_fusion)
 
-        # Assigned AFTER super().__init__() because the controller can be a real
-        # nn.Module (e.g., a heuristic instantiated directly from a tracker YAML), and
-        # nn.Module's __setattr__ requires Module.__init__() to have already run.
         self.controller = controller
         self.eval()
 
-    def set_amodal_anchor(self, amodal_bbox_norm, frame_height, frame_width):
-        """Configure the fixed amodal-floor crop side for the current trajectory. Once
-        set, `extract_crops` builds square crops of side
-        `max(amodal_w, amodal_h) * (1 + 2*pad_ratio)`, centered on each frame's
-        predicted-mask centroid. Call once per trajectory, before encoding."""
+    # -------------------------------------------------------------------------------
+    # Calibrator-driven mask scoring (unchanged from before)
+    # -------------------------------------------------------------------------------
 
-        self.first_amodal_bbox_norm = tuple(float(v) for v in amodal_bbox_norm)
-        self.first_frame_height = int(frame_height)
-        self.first_frame_width = int(frame_width)
-
-    def _score_masks(self, current_frame, candidate_masks_raw, reference_foreground):
+    def _score_masks(self, current_frame, candidate_masks_raw, reference_foreground, reference_background):
         """Run the calibrator on a batch of candidate masks. Returns `(samara_ious,
-        foreground, background, features)` where `features` is the patch-similarity tensor
-        already shaped for the controller — callers can use it to run an alternate
-        controller without recomputing similarities. A controller that is None produces a
-        NaN-filled prediction array, so a downstream gate can detect "no signal" explicitly."""
+        foreground, background, features)` where `features` is the 4-channel patch-
+        similarity tensor shaped for the controller. Channels (last axis):"""
 
         candidate_masks = (candidate_masks_raw > 0.0).to(torch.float64).cpu().numpy()
         frames = np.repeat(np.asarray(current_frame)[None], len(candidate_masks), axis=0)
+        
         cropped_frames, cropped_masks = self.extract_crops(frames, candidate_masks)
         foreground, background = self.extract_patch_tokens(cropped_frames, cropped_masks)
 
         side = int(round(foreground.shape[1] ** 0.5))
-        foreground_similarities = self.compute_patch_similarities(reference_foreground, foreground).reshape(len(candidate_masks), -1, side, side)
-        background_similarities = self.compute_patch_similarities(reference_foreground, background).reshape(len(candidate_masks), -1, side, side)
-        features = torch.from_numpy(np.stack([foreground_similarities, background_similarities], axis=-1).astype(np.float32)).to("cuda")
+        foreground_to_anchor_fg = self.compute_patch_similarities(reference_foreground, foreground).reshape(len(candidate_masks), -1, side, side)
+        background_to_anchor_fg = self.compute_patch_similarities(reference_foreground, background).reshape(len(candidate_masks), -1, side, side)
+        foreground_to_anchor_bg = self.compute_patch_similarities(reference_background, foreground).reshape(len(candidate_masks), -1, side, side)
+        background_to_anchor_bg = self.compute_patch_similarities(reference_background, background).reshape(len(candidate_masks), -1, side, side)
+        foreground_diff = foreground_to_anchor_fg - foreground_to_anchor_bg
+        background_diff = background_to_anchor_fg - background_to_anchor_bg
+        features = torch.from_numpy(np.stack(
+            [foreground_to_anchor_fg, background_to_anchor_fg, foreground_diff, background_diff],
+            axis=-1).astype(np.float32)).to("cuda")
 
         samara_ious = self._run_controller(self.controller, features)
         return samara_ious, foreground, background, features
@@ -83,13 +72,10 @@ class SamaraHieraModel(SAMV2Model):
     def _run_controller(self, controller, features):
         """Run the calibrator and return its predictions as a `(N,)` numpy array.
 
-        The calibrator is trained as a binary classifier (`BCEWithLogitsLoss` on `IoU > t` where
-        `t` is `MainDataset.iou_threshold`). The model outputs raw logits; we apply sigmoid here
-        so callers can compare the result against a confidence threshold in `[0, 1]` (the
-        tracker's `iou_threshold` field).
-
-        Disables autocast so a bf16-leaked context can't collapse the float32 calibrator
-        weights. Returns a NaN-filled array of the right length when no controller is attached."""
+        The calibrator is trained as a binary classifier (`BCEWithLogitsLoss` on
+        `IoU > t`). The model outputs raw logits; sigmoid is applied here so callers
+        can threshold in `[0, 1]`. Autocast is disabled so a bf16-leaked context can't
+        collapse the float32 calibrator weights. Returns NaN when no controller."""
 
         if controller is None:
             return np.full(features.shape[0], np.nan, dtype=np.float32)
@@ -100,9 +86,9 @@ class SamaraHieraModel(SAMV2Model):
 
     @torch.inference_mode()
     def select_best_mask_gated(self, current_frame, main_memory, reference_foreground, reference_background):
-        """Pick SAM 2's highest-IoU candidate mask and score that mask with the moving calibrator for
-        the memory-commit gate. The calibrator does NOT influence which mask is selected — selection
-        is pure SAM-argmax."""
+        """Pick SAM 2's highest-IoU candidate and score it with the moving calibrator
+        for the memory-commit gate. Selection is pure SAM-argmax; the calibrator only
+        scores it. (No SAMARA-driven re-ranking.)"""
 
         encoded_image_features_list, _, _ = self.encode_image(cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR))
         mask_preds, iou_scores, object_pointers, object_score, _, _ = self.step_video_masking(
@@ -111,7 +97,8 @@ class SamaraHieraModel(SAMV2Model):
         sam_ious = iou_scores.squeeze(0)[1:4].float().cpu().numpy()
         chosen = int(np.argmax(sam_ious))
         samara_ious, foreground, background, calibrator_features = self._score_masks(
-            current_frame, mask_preds[:, 1 + chosen:2 + chosen, :, :].squeeze(0), reference_foreground)
+            current_frame, mask_preds[:, 1 + chosen:2 + chosen, :, :].squeeze(0),
+            reference_foreground, reference_background)
 
         best_index = 1 + chosen
         chosen_mask_raw = mask_preds[:, best_index:best_index + 1, :, :]
@@ -129,108 +116,99 @@ class SamaraHieraModel(SAMV2Model):
             "object_score": torch.sigmoid(object_score).squeeze().item(),
             "target_foreground": foreground[0],
             "target_background": background[0],
-            # Patch-similarity tensor consumed by the (current) controller — exposed so a
-            # caller can run a SECOND controller on the same features without paying for
-            # a recompute (e.g. SamaraMoving runs both moving + fixed calibrators).
             "calibrator_features": calibrator_features}
 
+    # -------------------------------------------------------------------------------
+    # Cropping — per-frame adaptive, driven entirely by pad_ratio
+    # -------------------------------------------------------------------------------
+
     def extract_crops(self, frames: NDArray[np.uint8], masks: NDArray[np.uint8]):
-        """Square crops at `crop_resize`. If `set_amodal_anchor` has configured a fixed
-        amodal-floor crop side, every crop reuses that side and is centered on the
-        predicted-mask centroid (shifted inward at frame edges so it stays square).
-        Otherwise falls back to a mask-bbox crop expanded by `padding_size` and squared."""
+        """Per-frame square crops at `crop_resize` pixels:
+
+            crop_side = min(mask_side × (1 + 2 × pad_ratio), frame_width, frame_height)
+            mask_side = max(mask_bbox_width, mask_bbox_height)
+
+        The crop is centered on the mask centroid, shifted inward at frame edges. The
+        crop side is capped at the smallest frame dimension so the square always fits
+        — no border padding is ever needed (the crop shrinks instead). Frames whose
+        mask is empty are returned as zeros."""
 
         crop_size = self.crop_resize
         cropped_frames = np.zeros((masks.shape[0], crop_size, crop_size, 3), dtype=np.float32)
         cropped_masks = np.zeros((masks.shape[0], crop_size, crop_size), dtype=np.float32)
 
-        fixed_crop_side = self._fixed_crop_side()
-
-        for idx, (frame, mask) in enumerate(zip(frames, masks)):
+        for index, (frame, mask) in enumerate(zip(frames, masks)):
             mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
             coordinates = cv2.findNonZero(mask.astype(np.uint8))
             if coordinates is None:
                 continue
 
             x, y, width, height = cv2.boundingRect(coordinates)
-            if fixed_crop_side is not None:
-                x_min, y_min, x_max, y_max = self._amodal_floor_window(
-                    x, y, width, height, fixed_crop_side, frame.shape[:2])
-            else:
-                x_min, y_min, x_max, y_max = self._padded_square_window(
-                    x, y, width, height, frame.shape[:2])
+            x_min, y_min, x_max, y_max = self._padding_ratio_window(
+                x, y, width, height, frame.shape[:2])
 
             crop_frame = frame[y_min:y_max, x_min:x_max]
             crop_mask = mask[y_min:y_max, x_min:x_max]
-            cropped_frames[idx] = cv2.resize(crop_frame, (crop_size, crop_size), interpolation=cv2.INTER_CUBIC)
-            cropped_masks[idx] = cv2.resize(crop_mask, (crop_size, crop_size), interpolation=cv2.INTER_NEAREST)
+            cropped_frames[index] = cv2.resize(crop_frame, (crop_size, crop_size), interpolation=cv2.INTER_CUBIC)
+            cropped_masks[index] = cv2.resize(crop_mask, (crop_size, crop_size), interpolation=cv2.INTER_NEAREST)
 
         return cropped_frames, cropped_masks
 
-    def _fixed_crop_side(self):
-        """Crop side in pixels when an amodal anchor is configured, else `None`."""
-
-        if self.first_amodal_bbox_norm is None:
-            return None
-        _, _, amodal_w_norm, amodal_h_norm = self.first_amodal_bbox_norm
-        amodal_w_px = amodal_w_norm * self.first_frame_width
-        amodal_h_px = amodal_h_norm * self.first_frame_height
-        return int(round(max(amodal_w_px, amodal_h_px, 1.0) * (1 + 2 * self.pad_ratio)))
-
-    @staticmethod
-    def _amodal_floor_window(x, y, width, height, fixed_side, frame_shape):
-        """Square `(x_min, y_min, x_max, y_max)` of side `fixed_side`, centered on the
-        mask-bbox centroid, shifted inward when it would extend past the frame."""
+    def set_anchor_amodal_from_normalized(self, amodal_bbox_norm, frame_shape):
+        """Convenience: set `self.anchor_amodal_pixels` from a normalized `(x, y, w, h)`
+        anchor amodal bbox and a frame `(height, width)`. Pass `(0, 0, 0, 0)` to disable
+        (falls back to mask-derived crop sizing)."""
 
         frame_height, frame_width = frame_shape
-        side = min(fixed_side, frame_height, frame_width)
-        center_x = x + width // 2
-        center_y = y + height // 2
-        half = side // 2
-        x_min = center_x - half
-        y_min = center_y - half
-        x_max = x_min + side
-        y_max = y_min + side
+        amodal_width_pixels = amodal_bbox_norm[2] * frame_width
+        amodal_height_pixels = amodal_bbox_norm[3] * frame_height
+        self.anchor_amodal_pixels = int(round(max(amodal_width_pixels, amodal_height_pixels)))
+
+    def _padding_ratio_window(self, x, y, width, height, frame_shape):
+        """Square `(x_min, y_min, x_max, y_max)` centered on the mask's centroid.
+
+        Crop side:
+            base = max(current_mask_side, anchor_amodal_pixels)
+            crop = base × (1 + 2 × pad_ratio)
+            crop = min(crop, frame_width, frame_height)
+
+        So the crop is at LEAST as large as the anchor's amodal extent (SiamFC/STARK-
+        style floor), but grows beyond it whenever the current frame's mask is larger
+        (target moves closer, occlusion clears). Falls back to mask-derived-only when
+        `anchor_amodal_pixels == 0`."""
+
+        frame_height, frame_width = frame_shape
+        mask_side = max(width, height, 1)
+        base_side = max(mask_side, self.anchor_amodal_pixels)
+        crop_side = int(round(base_side * (1 + 2 * self.pad_ratio)))
+        crop_side = min(crop_side, frame_width, frame_height)
+
+        center_x = x + width / 2
+        center_y = y + height / 2
+        half = crop_side / 2
+        x_min = int(round(center_x - half))
+        y_min = int(round(center_y - half))
+        x_max = x_min + crop_side
+        y_max = y_min + crop_side
+
         if x_min < 0:
             x_max -= x_min; x_min = 0
-        elif x_max > frame_width:
-            x_min -= (x_max - frame_width); x_max = frame_width
         if y_min < 0:
             y_max -= y_min; y_min = 0
-        elif y_max > frame_height:
+        if x_max > frame_width:
+            x_min -= (x_max - frame_width); x_max = frame_width
+        if y_max > frame_height:
             y_min -= (y_max - frame_height); y_max = frame_height
-        return int(x_min), int(y_min), int(x_max), int(y_max)
-
-    def _padded_square_window(self, x, y, width, height, frame_shape):
-        """Square `(x_min, y_min, x_max, y_max)` derived from the mask bbox expanded by
-        `padding_size`, then made square by extending the shorter side equally on both
-        ends. The legacy crop used by every runtime tracker."""
-
-        frame_height, frame_width = frame_shape
-        x_min = max(0, x - self.padding_size)
-        y_min = max(0, y - self.padding_size)
-        x_max = min(frame_width, x + width + self.padding_size)
-        y_max = min(frame_height, y + height + self.padding_size)
-
-        bounding_box_width = x_max - x_min
-        bounding_box_height = y_max - y_min
-        difference = abs(bounding_box_width - bounding_box_height)
-        if bounding_box_width < bounding_box_height:
-            x_min = max(0, x_min - difference // 2)
-            x_max = min(frame_width, x_max + (difference - difference // 2))
-        elif bounding_box_height < bounding_box_width:
-            y_min = max(0, y_min - difference // 2)
-            y_max = min(frame_height, y_max + (difference - difference // 2))
         return x_min, y_min, x_max, y_max
 
-    OBJECT_SCORE_VALUE = 100.0
+    # -------------------------------------------------------------------------------
+    # Patch-token extraction (Hiera or Memory) + foreground/background split
+    # -------------------------------------------------------------------------------
 
     def extract_raw_patch_tokens(self, cropped_frames, cropped_masks, encoder_chunk_size=16):
-        """Encode cropped frames into raw patch tokens and the patch-grid foreground mask.
-
-        Returns (patch_tokens, patch_masks): patch_tokens (B, n_patches, feature_dim) are the raw
-        SAM 2 image-encoder tokens; patch_masks (B, n_patches) is the predicted mask downsampled to
-        the patch grid. The foreground/background split is deferred to `split_foreground_background`."""
+        """Encode cropped frames into raw patch tokens and the patch-grid foreground
+        mask. Returns `(patch_tokens, patch_masks)`. The foreground/background split
+        is deferred to `split_foreground_background`."""
 
         with torch.inference_mode():
             feature_chunks = []
@@ -255,35 +233,11 @@ class SamaraHieraModel(SAMV2Model):
         patch_masks = (patch_masks > 0).flatten(2).squeeze(1)
         return patch_tokens, patch_masks
 
-    def split_foreground_background(self, patch_tokens, patch_masks):
-        """Split raw patch tokens into foreground/background views via the -5 padding sentinel."""
-
-        patch_masks = patch_masks.bool().unsqueeze(-1)
-        padding_value = torch.tensor(-5, device=patch_tokens.device, dtype=patch_tokens.dtype)
-        foreground = torch.where(patch_masks, patch_tokens, padding_value)
-        background = torch.where(~patch_masks, patch_tokens, padding_value)
-        return foreground, background
-
-    def extract_patch_tokens(self, cropped_frames, cropped_masks, encoder_chunk_size=16):
-        """Extract foreground/background patch-token views of the cropped frames. Routes
-        through `extract_raw_patch_tokens` (Hiera image tokens) when
-        `token_source == 'hiera'` and through `extract_memory_patch_tokens` (mask-
-        conditioned memory tokens) when `token_source == 'memory'`. The dispatch lets the
-        same model class drive both the Hiera-trained and memory-trained calibrators at
-        deploy time without subclassing."""
-
-        if self.token_source == "memory":
-            patch_tokens, patch_masks = self.extract_memory_patch_tokens(cropped_frames, cropped_masks)
-        else:
-            patch_tokens, patch_masks = self.extract_raw_patch_tokens(cropped_frames, cropped_masks, encoder_chunk_size)
-        return self.split_foreground_background(patch_tokens, patch_masks)
-
     def extract_memory_patch_tokens(self, cropped_frames, cropped_masks, encoder_chunk_size=8):
-        """Encode each crop with the image encoder, then the memory encoder against the crop's mask.
-        Returns (memory_tokens, patch_masks) with the same shape semantics as
-        `extract_raw_patch_tokens` so `split_foreground_background` applies unchanged. Memory
-        tokens have `lowres_channels / 4` features and are mask-conditioned — the representation
-        SAM 2 cross-attends over at deployment."""
+        """Encode each crop with the image encoder, then the memory encoder against
+        the crop's mask. Returns `(memory_tokens, patch_masks)` with the same shape
+        semantics as `extract_raw_patch_tokens`. Memory tokens are mask-conditioned —
+        the representation SAM 2 cross-attends over at deployment."""
 
         with torch.inference_mode():
             token_chunks = []
@@ -319,11 +273,35 @@ class SamaraHieraModel(SAMV2Model):
         patch_masks = torch.cat(patch_mask_chunks, dim=0)
         return memory_tokens, patch_masks
 
+    def split_foreground_background(self, patch_tokens, patch_masks):
+        """Split raw patch tokens into foreground/background views via the -5
+        padding sentinel."""
+
+        patch_masks = patch_masks.bool().unsqueeze(-1)
+        padding_value = torch.tensor(-5, device=patch_tokens.device, dtype=patch_tokens.dtype)
+        foreground = torch.where(patch_masks, patch_tokens, padding_value)
+        background = torch.where(~patch_masks, patch_tokens, padding_value)
+        return foreground, background
+
+    def extract_patch_tokens(self, cropped_frames, cropped_masks, encoder_chunk_size=16):
+        """Dispatch to either the Hiera or Memory patch-token extractor based on
+        `token_source`, then split into foreground/background views. Lets the same
+        model class drive both calibrator variants at deploy time without subclassing."""
+
+        if self.token_source == "memory":
+            patch_tokens, patch_masks = self.extract_memory_patch_tokens(cropped_frames, cropped_masks)
+        else:
+            patch_tokens, patch_masks = self.extract_raw_patch_tokens(cropped_frames, cropped_masks, encoder_chunk_size)
+        return self.split_foreground_background(patch_tokens, patch_masks)
+
+    # -------------------------------------------------------------------------------
+    # Patch similarity
+    # -------------------------------------------------------------------------------
+
     def compute_patch_similarities(self, reference_tokens, target_tokens, target_chunk_size=16):
-        """Per (reference, target patch) BEST-MATCH cosine similarity. Both token sets are
-        L2-normalized so each pairwise score is bounded in [-1, 1], and we take the MAX over the
-        reference's patches. No temperature, no soft attention — invariant to padding count, and
-        unaffected by adding extra non-argmax valid ref patches."""
+        """Per (target patch) best-match cosine similarity to the reference's FG patches
+        (argmax over reference patches). Both token sets are L2-normalized; padding-
+        sentinel patches (rows of -5) are masked to -inf so they never win the max."""
 
         ref_valid = ~(reference_tokens == -5).all(dim=-1)
         ref_mask = ref_valid[:, None, :, None]

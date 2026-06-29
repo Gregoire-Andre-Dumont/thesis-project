@@ -113,14 +113,6 @@ def main(config: DictConfig):
     output_directory = Path(f"data/experiment_{experiment_number}")
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    trajectory_paths, train_indices, test_indices = build_trajectory_split(
-        dataset_path=config.dataset_path, test_size=config.train_test_split)
-    print(f"running on {len(test_indices)}/{len(trajectory_paths)} test trajectories")
-
-    max_test_trajectories = config.get("max_test_trajectories", None)
-    if max_test_trajectories is not None:
-        test_indices = test_indices[: int(max_test_trajectories)]
-
     detection_data = hydra.utils.instantiate(config.detection_data)
 
     tracker_name_override = config.get("tracker_name", None)
@@ -137,6 +129,21 @@ def main(config: DictConfig):
         trainer_config_path = tracker_config.tracker.get("trainer_config_path", None)
         if trainer_config_path is not None and Path(trainer_config_path).exists():
             trainer_config = OmegaConf.load(trainer_config_path)
+            split_dataset_path = trainer_config.main_trainer.dataset.dataset_path
+        else:
+            trainer_config = None
+            split_dataset_path = config.dataset_path
+
+        trajectory_paths, train_indices, test_indices = build_trajectory_split(
+            dataset_path=split_dataset_path, test_size=config.train_test_split)
+        print(f"  split source: {split_dataset_path}  → "
+                  f"{len(test_indices)}/{len(trajectory_paths)} test trajectories")
+
+        max_test_trajectories = config.get("max_test_trajectories", None)
+        if max_test_trajectories is not None:
+            test_indices = test_indices[: int(max_test_trajectories)]
+
+        if trainer_config is not None:
             train_fraction = trainer_config.get("train_fraction", None)
             if train_fraction is not None:
                 n_train = int(round(float(train_fraction) * len(trajectory_paths)))

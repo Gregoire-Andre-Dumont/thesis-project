@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 import pickle
 import warnings
 from collections import defaultdict
@@ -11,14 +11,25 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from src.experiments.dataset_experiment import DatasetExperiment
-from src.offline_training.references import build_reference_features
+from src.offline_training.references import (
+    compute_features,
+    extract_tokens_at_pad_ratio,
+    predict_and_filter_trajectory,
+)
 from src.typing.setup_wandb import setup_wandb
-from src.utils.compute_iou import compute_iou
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["HYDRA_FULL_ERROR"] = "1"
+
+
+# Token-source variants. Patch similarities use MAX reduction over the anchor's FG
+# patches; the per-pad_ratio sweep is configured in `create_anchor_dataset.yaml`.
+VARIANTS = [
+    ("hiera",  "hiera"),
+    ("memory", "memory"),
+]
 
 
 def shard_by_video(person_path, shard_index, num_shards):
@@ -36,22 +47,9 @@ def shard_by_video(person_path, shard_index, num_shards):
     return videos, [pair for video in videos for pair in by_video[video]]
 
 
-def post_occlusion_coverage(iou_scores, occlusions, threshold):
-    """Fraction of visible post-first-occlusion frames with IoU > `threshold`."""
-
-    occluded = np.where(occlusions > 0.5)[0]
-    visible = np.where(occlusions < 0.5)[0]
-    if len(occluded) == 0:
-        return 0.0
-    post = visible[visible > occluded[0]]
-    return (iou_scores[post] > threshold).mean() if len(post) else 0.0
-
-
 def anchor_trajectory_index(detection_data, anchor_video_frame):
-    """Map the anchor's *video* frame index (selected by `PersonPath`) to its index in
-    the trajectory's `frame_indices` array. Returns `None` only if `anchor_video_frame`
-    is not present in `frame_indices` at all (shouldn't happen since PersonPath selects
-    from annotated frames)."""
+    """Map the anchor's video-frame index to its index in the trajectory's
+    `frame_indices` array. Returns `None` only if the anchor isn't in the array."""
 
     positions = np.where(detection_data.frame_indices == anchor_video_frame)[0]
     return int(positions[0]) if len(positions) else None
@@ -59,12 +57,8 @@ def anchor_trajectory_index(detection_data, anchor_video_frame):
 
 def slice_detection_data_for_tracker(detection_data, anchor_index):
     """Slice every per-frame array so the anchor lands at sliced index 1 — where
-    `MainMemory.initialize_references` reads from. When `anchor_index == 0` (anchor is
-    the first annotated frame), there's nothing to slice back to, so the sliced data is
-    unchanged; the tracker then initializes from `frames[1]` = the next annotated frame
-    rather than the anchor itself. Returns the number of pre-anchor warmup frames that
-    must be dropped from every per-frame array after tracking (0 or 1) so that the
-    SAVED trajectory's frame 0 is always the anchor."""
+    `MainMemory.initialize_references` reads from. Returns the number of pre-anchor
+    warmup frames that must be dropped post-tracking (0 or 1)."""
 
     warmup_count = 1 if anchor_index >= 1 else 0
     start = anchor_index - warmup_count
@@ -76,106 +70,123 @@ def slice_detection_data_for_tracker(detection_data, anchor_index):
     return warmup_count
 
 
+def pad_ratio_label(pad_ratio):
+    """Folder-friendly label for a pad ratio (e.g. `0.5` → `padding_0.50`)."""
+
+    return f"padding_{float(pad_ratio):.2f}"
+
+
+def variant_path(base_directory, pad_ratio, variant_name, stem):
+    return base_directory / variant_name / pad_ratio_label(pad_ratio) / f"{stem}.pkl"
+
+
+def save_variants_for_pad_ratio(model, base_directory, pad_ratio, stem, video_name, person_id,
+                                            metadata_kwargs, hiera_pair, memory_pair):
+    """Compute features for each token-source variant at this pad_ratio and pickle into
+    `<base>/<variant>/padding_<X.XX>/<stem>.pkl`. Returns the number of variants
+    actually written (existing files are skipped). Each variant's anchor FG and BG
+    patches are sliced from the first frame of the (foreground, background) pair —
+    the BG slice powers the new diff channels in `compute_features`."""
+
+    hiera_anchor_fg = hiera_pair[0][0:1]
+    hiera_anchor_bg = hiera_pair[1][0:1]
+    memory_anchor_fg = memory_pair[0][0:1]
+    memory_anchor_bg = memory_pair[1][0:1]
+    sources = {
+        "hiera":  (hiera_pair,  hiera_anchor_fg,  hiera_anchor_bg),
+        "memory": (memory_pair, memory_anchor_fg, memory_anchor_bg),
+    }
+    saved_here = 0
+    for variant_name, token_source in VARIANTS:
+        output_path = variant_path(base_directory, pad_ratio, variant_name, stem)
+        if output_path.exists():
+            continue
+        (foreground, background), anchor_fg, anchor_bg = sources[token_source]
+        features = compute_features(model, foreground, background, anchor_fg, anchor_bg)
+        with open(output_path, "wb") as handle:
+            pickle.dump(DatasetExperiment(video_name=video_name, person_id=person_id,
+                                                      features=features, **metadata_kwargs), handle)
+        saved_here += 1
+    return saved_here
+
+
 @hydra.main(config_path="conf", config_name="create_anchor_dataset", version_base=None)
 def create_anchor_dataset(config: DictConfig):
-    """Build two parallel per-trajectory datasets of precomputed patch-similarity
-    features, anchored on the first fully-visible frame and cropped at a fixed amodal-
-    floor square. Both datasets share the same anchor, tracker prediction, and crops;
-    they differ only in which encoder produces the patch tokens:
-    `SamaraHieraModel.extract_raw_patch_tokens` (Hiera image tokens) → `hiera_dataset_path`."""
+    """Build per-trajectory datasets of precomputed patch-similarity features at MULTIPLE
+    pad_ratios in a single tracker pass:
 
-    
+        <dataset_path>/<variant>/padding_<X.XX>/<video>_<person_id>.pkl
+
+    where `variant ∈ {hiera, memory}` and `pad_ratio ∈ config.pad_ratios`.
+
+    Efficiency: the expensive SAM 2 tracker forward pass runs ONCE per trajectory
+    (via `predict_and_filter_trajectory`); only the crop + encoder pass is repeated
+    per pad_ratio."""
+
     detection_data = hydra.utils.instantiate(config.detection_data)
     person_path = hydra.utils.instantiate(config.person_path)
     tracker = hydra.utils.instantiate(config.oracle.tracker)
     model = tracker.model
 
-    output_directory = Path(config.hiera_dataset_path) / "clean"
-    output_directory.mkdir(parents=True, exist_ok=True)
+    pad_ratios = [float(p) for p in config.pad_ratios]
+
+    base_directory = Path(config.dataset_path)
+    for variant_name, _ in VARIANTS:
+        for pad_ratio in pad_ratios:
+            (base_directory / variant_name / pad_ratio_label(pad_ratio)
+             ).mkdir(parents=True, exist_ok=True)
 
     videos, pairs = shard_by_video(person_path, config.shard_index, config.num_shards)
     print(f"[create_anchor_dataset] shard {config.shard_index}/{config.num_shards} → "
-          f"{len(videos)} videos, {len(pairs)} trajectories")
+          f"{len(videos)} videos, {len(pairs)} trajectories, pad_ratios={pad_ratios}")
 
-    skipped_already_exists = 0
-    skipped_no_anchor = 0
-    skipped_coverage = 0
+    skipped = defaultdict(int)
     saved = 0
 
     for video_name, person_id, anchor_video_frame in tqdm(pairs, desc=f"shard {config.shard_index}"):
         stem = f"{video_name}_{person_id}"
-        output_path = output_directory / f"{stem}.pkl"
-        if output_path.exists():
-            skipped_already_exists += 1
+
+        all_done = all(variant_path(base_directory, pad_ratio, variant, stem).exists()
+                            for pad_ratio in pad_ratios for variant, _ in VARIANTS)
+        if all_done:
+            skipped["already_exists"] += 1
             continue
 
         detection_data.initialize_target(video_name, person_id)
         anchor_index = anchor_trajectory_index(detection_data, anchor_video_frame)
         if anchor_index is None:
-            skipped_no_anchor += 1
+            skipped["no_anchor"] += 1
             continue
 
         warmup_count = slice_detection_data_for_tracker(detection_data, anchor_index)
 
-        # Configure the model's fixed crop side from the ANCHOR's amodal bbox. The
-        # anchor sits at `warmup_count` in the sliced detection_data (index 1 when we
-        # have a warmup, index 0 when the anchor is the first annotated frame).
-        anchor_slot = warmup_count
-        anchor_frame_height, anchor_frame_width = detection_data.frames[anchor_slot].shape[:2]
-        model.set_amodal_anchor(detection_data.amodal_norm[anchor_slot],
-                                  frame_height=anchor_frame_height,
-                                  frame_width=anchor_frame_width)
-
-        predicted_masks = tracker.predict_masks(detection_data).numpy()
-        iou_scores = compute_iou(detection_data.bboxes_norm, predicted_masks)
-        iou_scores[detection_data.occlusions > 0.5] = 0.0
-
-        # Drop the pre-anchor warmup frame(s) so saved frame 0 IS the anchor.
-        predicted_masks = predicted_masks[warmup_count:]
-        iou_scores = iou_scores[warmup_count:]
-        occlusions = detection_data.occlusions[warmup_count:]
-        bboxes_norm = detection_data.bboxes_norm[warmup_count:]
-        frames = detection_data.frames[warmup_count:]
-        frame_indices = detection_data.frame_indices[warmup_count:]
-        tracker_iou_scores = tracker.iou_scores.numpy()[warmup_count:]
-
-        coverage = post_occlusion_coverage(iou_scores, occlusions, config.commit_threshold)
-        if coverage < config.coverage_threshold:
-            skipped_coverage += 1
-            continue
-
-        cropped_frames, cropped_masks = model.extract_crops(frames, predicted_masks)
-        hiera_tokens, hiera_patch_masks = model.extract_raw_patch_tokens(cropped_frames, cropped_masks)
-        foreground, background = model.split_foreground_background(hiera_tokens, hiera_patch_masks)
-
-        features, fifo_ious = build_reference_features(
-            model=model,
-            foreground=foreground,
-            background=background,
-            iou_scores=iou_scores,
-            occlusions=occlusions,
-            n_references=config.n_references,
+        # Run the tracker ONCE and reuse its outputs across all pad_ratios.
+        trajectory_result = predict_and_filter_trajectory(
+            tracker, detection_data, warmup_count,
+            coverage_threshold=config.coverage_threshold,
             commit_threshold=config.commit_threshold)
+        if trajectory_result is None:
+            skipped["coverage_filter"] += 1
+            continue
+        metadata_kwargs, frames, predicted_masks = trajectory_result
 
-        metadata = DatasetExperiment(
-            video_name=video_name,
-            person_id=person_id,
-            frame_indices=frame_indices.astype(np.int64),
-            iou_scores=iou_scores.astype(np.float32),
-            occlusions=occlusions.astype(np.float32),
-            predicted_iou=tracker_iou_scores.astype(np.float32),
-            true_bboxes=bboxes_norm.astype(np.float32),
-            features=features,
-            fifo_ious=fifo_ious)
-        with open(output_path, "wb") as handle:
-            pickle.dump(metadata, handle)
-        saved += 1
+        for pad_ratio in pad_ratios:
+            # Skip pad_ratios whose variants are already all on disk for this trajectory.
+            pad_done = all(variant_path(base_directory, pad_ratio, variant, stem).exists() for variant, _ in VARIANTS)
+            if pad_done:
+                continue
+
+            hiera_pair, memory_pair = extract_tokens_at_pad_ratio(
+                model, frames, predicted_masks, pad_ratio)
+            saved += save_variants_for_pad_ratio(
+                model, base_directory, pad_ratio, stem, video_name, person_id,
+                metadata_kwargs, hiera_pair, memory_pair)
 
     total = len(pairs)
-    print(f"[create_anchor_dataset] total={total}  saved={saved}  "
-          f"already_exists={skipped_already_exists}  "
-          f"no_anchor={skipped_no_anchor}  "
-          f"coverage_filter={skipped_coverage}")
+    print(f"[create_anchor_dataset] total={total}  saved_files={saved}  "
+          f"already_exists={skipped['already_exists']}  "
+          f"no_anchor={skipped['no_anchor']}  "
+          f"coverage_filter={skipped['coverage_filter']}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import warnings
 from copy import deepcopy
@@ -39,20 +40,29 @@ def predict_on_dataset(model, dataset, batch_size=32):
 
 
 def build_trajectory_split(dataset_path, test_size):
-    """List the clean trajectories under `dataset_path` and split by identity."""
+    """List the clean trajectories under `dataset_path` and split BY VIDEO following
+    PersonPath22's OFFICIAL split (`data/person_path/splits.json` — 138 train / 98
+    test video names). This guarantees no within-video leakage and matches the
+    standard benchmark protocol."""
 
-    trajectory_paths = np.array([str(Path(dataset_path) / filename) for filename in os.listdir(dataset_path)])
-    train_indices, test_indices = train_test_split(np.arange(len(trajectory_paths)), test_size=test_size, random_state=42)
+    splits = json.load(open("data/person_path/splits.json", "r"))
+    train_videos_set = set(name.replace(".mp4", "") for name in splits["train"])
+    test_videos_set  = set(name.replace(".mp4", "") for name in splits["test"])
+
+    trajectory_paths = np.array([str(Path(dataset_path) / filename) for filename in sorted(os.listdir(dataset_path))])
+    video_names = np.array([Path(path).name.split(".mp4_")[0] for path in trajectory_paths])
+
+    train_indices = np.array([i for i, v in enumerate(video_names) if v in train_videos_set])
+    test_indices  = np.array([i for i, v in enumerate(video_names) if v in test_videos_set])
+    unmapped = sum(1 for v in video_names if v not in train_videos_set and v not in test_videos_set)
+    if unmapped:
+        print(f"[build_trajectory_split] WARNING: {unmapped} trajectories whose video is "
+                  f"in neither PersonPath22 train nor test split — they will be excluded")
     return trajectory_paths, train_indices, test_indices
 
 
 def evaluate_calibrator(trainer, test_indices):
-    """Run the trained calibrator on the held-out validation split and print F1 / ROC AUC.
-
-    The calibrator is a binary classifier (`IoU > MainDataset.iou_threshold`) trained with
-    `BCEWithLogitsLoss`. Model outputs are raw logits; we apply sigmoid here to get
-    probabilities, threshold at 0.5 for the F1, and feed the raw probabilities into
-    `roc_auc_score`."""
+    """Run the trained calibrator on the held-out validation split"""
 
     val_dataset = deepcopy(trainer.dataset)
     val_dataset.initialize(test_indices)

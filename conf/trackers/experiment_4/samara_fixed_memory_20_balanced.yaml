@@ -2,7 +2,7 @@ tracker:
   _target_: src.modules.samara_fixed.SamaraFixed
   iou_threshold: 0.5
   pred_iou_threshold: -1
-  trainer_config_path: conf/offline_trainers/experiment_4/cnn_fixed_samara_memory_40.yaml
+  trainer_config_path: conf/offline_trainers/experiment_4/cnn_fixed_samara_memory_20_balanced.yaml
 
   model:
     _target_: src.modules.samara_hiera_model.SamaraHieraModel
@@ -19,5 +19,5 @@ tracker:
 experiment:
   _target_: src.experiments.tracking_experiment.TrackingExperiment
   resolution: 1024
-  experiment_name: samara_fixed_memory_30
-  video_path: data/visualize/samara_fixed_memory_30
+  experiment_name: samara_fixed_memory_20_balanced
+  video_path: data/visualize/experiment_4/samara_fixed_memory_20_balanced

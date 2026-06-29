@@ -79,11 +79,9 @@ class MainTrainer(TorchTrainer, Logger):
 
         train_dataset = deepcopy(self.dataset)
         train_dataset.random_sampling = True
-        train_dataset.n_references = self.model.n_references
         train_dataset.initialize(train_indices)
 
         validation_dataset = deepcopy(self.dataset)
-        validation_dataset.n_references = self.model.n_references
         validation_dataset.initialize(val_indices)
 
         return train_dataset, validation_dataset

@@ -5,7 +5,7 @@ from omegaconf import OmegaConf
 from dataclasses import dataclass, field
 from src.typing.detection_data import DetectionData
 from src.modules.memories.main_memory import MainMemory
-from src.modules.models.samara_hiera_model import SamaraHieraModel
+from src.modules.samara_hiera_model import SamaraHieraModel
 
 
 @dataclass
@@ -16,7 +16,7 @@ class SamaraFixed:
     Frame 0 is processed with a standard SAM 2 step to obtain the initial mask + memory entry,
     after which the anchor features are extracted from that mask."""
 
-    iou_threshold: float = 0.4
+    iou_threshold: float = 0.5
     pred_iou_threshold: float = -1.0
     trainer_config_path: str | None = None
 
@@ -26,13 +26,12 @@ class SamaraFixed:
     _trajectory_counter: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self):
-        """Move SAM 2 to GPU, force the moving FIFO to zero (anchor-only), and load the calibrator
-        from `trainer_config_path` via epochalyst's cache."""
+        """Move SAM 2 to GPU and load the calibrator from `trainer_config_path`
+        via epochalyst's cache."""
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         self.model = self.model.to(device=self.device, dtype=self.dtype)
-        self.main_memory.moving_capacity = 0
 
         if self.trainer_config_path is not None:
             trainer_config = OmegaConf.load(self.trainer_config_path)
@@ -45,17 +44,9 @@ class SamaraFixed:
     def predict_masks(self, detection_data: DetectionData):
         """Predict the masks of the target object with the calibrated tracker (no warmup)."""
 
-        # MUST run before any patch-token extraction so `extract_crops` uses the same
-        # fixed amodal-floor crop side that `create_anchor_dataset.py` used at training.
-        # Without this the calibrator sees mask-bbox+padding crops at deploy but was
-        # trained on amodal-floor crops → totally different feature distribution.
-        frame_height, frame_width = detection_data.frames[0].shape[:2]
-        self.model.set_amodal_anchor(detection_data.amodal_norm[0],
-                                       frame_height=frame_height, frame_width=frame_width)
-
         self.main_memory.reset_memory()
-        init_mask = self.main_memory.initialize_references(self.model, detection_data)
-        self.main_memory.initialize_calibrator_anchor(self.model, detection_data, init_mask)
+        init_mask = self.main_memory.initialize_references(self.model, detection_data, anchor_index=0)
+        self.main_memory.initialize_calibrator_anchor(self.model, detection_data, init_mask, anchor_index=0)
 
         n_frames = detection_data.frames.shape[0]
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)

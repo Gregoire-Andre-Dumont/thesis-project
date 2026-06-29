@@ -21,6 +21,5 @@ class DatasetExperiment:
     predicted_iou: npt.NDArray[np.float32] | None = None
     true_bboxes: npt.NDArray[np.float32] | None = None
 
-    # Precomputed similarity features: (n_frames, n_references, side, side, 2) float16.
+    # Precomputed similarity features against the fixed anchor: (n_frames, 1, side, side, 2) float16.
     features: npt.NDArray[np.float16] | None = None
-    fifo_ious: npt.NDArray[np.float32] | None = None

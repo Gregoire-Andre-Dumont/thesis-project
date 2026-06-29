@@ -5,11 +5,10 @@ tracker:
   trainer_config_path: conf/offline_trainers/experiment_3/cnn_fixed_samara_hiera_20.yaml
 
   model:
-    _target_: src.modules.models.samara_hiera_model.SamaraHieraModel
+    _target_: src.modules.samara_hiera_model.SamaraHieraModel
     sam_model_path: tm/sam_large.pt
-    padding_size: 12
-    crop_resize: 384
-    n_references: 6
+    crop_resize: 512
+    pad_ratio: 0.25
     token_source: hiera
 
   main_memory:

@@ -12,9 +12,7 @@ detection_data:
   resize_resolution: 1024
 
 wandb_enabled: True
-train_test_split: 0.5
+train_test_split: 0.3
 deploy_controller: True
-dataset_path: data/datasets/hiera_anchor/clean
-
+dataset_path: data/memory_oracle/memory/padding_0.10
 commit_threshold: 0.4
-n_references: 9

@@ -11,9 +11,9 @@ main_trainer:
     _target_: src.offline_training.losses.bce_iou.BCEIouLoss
   dataset:
     _target_: src.offline_training.main_dataset.MainDataset
-    dataset_path: data/datasets/memory_oracle/clean
+    dataset_path: ${dataset_path}
     epoch_size_divisor: 2
-    iou_threshold: 0.2
+    iou_threshold: 0.5
   collate_fn:
     _target_: hydra.utils.get_method
     path: src.offline_training.main_dataset.collate_fn

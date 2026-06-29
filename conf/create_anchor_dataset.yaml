@@ -1,5 +1,5 @@
 defaults:
-  - trackers@oracle: memory_oracle
+  - trackers@oracle: combined_oracle
 
 detection_data:
   _target_: src.typing.detection_data.DetectionData
@@ -13,8 +13,10 @@ detection_data:
 person_path:
   _target_: src.typing.person_path.PersonPath
   main_directory: data/person_path
+  min_frames: 0
+  max_frames: 20000
   occlusion_ranges: [5, 75]
-  n_experiments: 1100
+  n_experiments: 1200
   n_after_occlusion: 40
   random_seed: 44
   min_visible_ratio: 0.9
@@ -27,11 +29,11 @@ person_path:
     - "severly_occluded_person"
 
 wandb_enabled: True
-hiera_dataset_path: data/datasets/hiera_anchor
-shard_index: 0
+dataset_path: data/memory_oracle
+shard_index: 2
 num_shards: 3
 
-n_references: 9
+pad_ratios: [0.05, 0.1, 0.25, 0.5]
 commit_threshold: 0.4
 random_seed: 42
 coverage_threshold: 0.05
