@@ -27,6 +27,6 @@ saved_images/
 /outputs
 /docker_2
 /docker_1
-/wandb
 .ipynb_checkpoints
 /helper
+/.thesis_venv

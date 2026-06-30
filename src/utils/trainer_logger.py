@@ -1,13 +1,12 @@
-"""A logger that logs to the terminal and to W&B."""
+"""A logger that logs to the terminal."""
 from typing import Any
 
-import wandb
 from epochalyst.logging import Logger as _Logger
 from src.utils.logger import logger
 
 
 class Logger(_Logger):
-    """A logger that logs to the terminal and to W&B.
+    """A logger that logs to the terminal.
 
     To use this logger, inherit, this will make the following methods available:
     - log_to_terminal(message: str) -> None
@@ -40,29 +39,17 @@ class Logger(_Logger):
         logger.warning(message)
 
     def log_to_external(self, message: dict[str, Any], **kwargs: Any) -> None:
-        """Log a message to an external service.
+        """No-op: external (W&B) logging has been removed.
 
         :param message: The message to log
         :param kwargs: Any additional arguments
         """
-        if wandb.run:
-            if message.get("type") == "wandb_plot" and message["plot_type"] == "line_series":
-                plot_data = message["data"]
-                # Construct the plot here using the provided data
-                plot = wandb.plot.line_series(
-                    xs=plot_data["xs"],
-                    ys=plot_data["ys"],
-                    keys=plot_data["keys"],
-                    title=plot_data["title"],
-                    xname=plot_data["xname"],
-                )
-                wandb.log({plot_data["title"]: plot}, commit=False, **kwargs)
+        return None
 
     def external_define_metric(self, metric: str, metric_type: str) -> None:
-        """Define a metric in an external service.
+        """No-op: external (W&B) metric definition has been removed.
 
         :param metric: The metric to define
         :param metric_type: The type of the metric
         """
-        if wandb.run:
-            wandb.define_metric(metric, step_metric=metric_type)
+        return None

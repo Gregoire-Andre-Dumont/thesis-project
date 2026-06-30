@@ -1,10 +1,24 @@
 import os
 import json
-
 from pathlib import Path
+from dataclasses import dataclass
+
 import numpy as np
 from tqdm import tqdm
-from dataclasses import dataclass
+
+
+def _frame_idx(entity: dict) -> int:
+    """Annotated video-frame index of an entity."""
+
+    return entity["blob"]["frame_idx"]
+
+
+def _bbox_area(bbox) -> float:
+    """Area of a `(x, y, w, h)` bbox, clamping negative extents to zero."""
+
+    _, _, width, height = bbox
+    return max(0, width) * max(0, height)
+
 
 @dataclass
 class PersonPath:
@@ -34,11 +48,10 @@ class PersonPath:
     selected_anchor_video_frames: list[int] | None = None
 
     def __post_init__(self):
-        """Extract the paths to the videos and metadata"""
+        """Resolve dataset paths, then enumerate and sample the target trajectories."""
 
         main_directory = Path(self.main_directory)
         self.metadata_path = main_directory / "visible.json"
-
         self.video_directory = main_directory / "videos"
         self.amodal_directory = main_directory / "amodal"
         self.visible_directory = main_directory / "visible"
@@ -49,25 +62,22 @@ class PersonPath:
         self.select_targets(video_names, video_person_ids)
         self.total_experiments = self.n_experiments * len(self.occlusion_ranges)
 
-    def filter_targets(self, video_names):
-        """Filter the visible targets from each video."""
+    # -------------------------------------------------------------------------------
+    # Target enumeration + sampling
+    # -------------------------------------------------------------------------------
+
+    def filter_targets(self, video_names: list[str]) -> list[list[int]]:
+        """Per video, the person ids annotated as a valid target in BOTH the amodal and
+        visible files (excluding any entity carrying a `non_targets` label)."""
 
         video_person_ids = []
-        filter_targets = lambda e: not any(x in self.non_targets for x in e['labels'])
+        for video_name in video_names:
+            amodal_entities = self._read_entities(self.amodal_directory, video_name)
+            visible_entities = self._read_entities(self.visible_directory, video_name)
 
-        for idx, video_name in enumerate(video_names):
-            amodal_path = self.amodal_directory / (video_name + ".json")
-            visible_path = self.visible_directory / (video_name + ".json")
-
-            amodal_data = json.load(open(amodal_path, "r"))
-            visible_data = json.load(open(visible_path, "r"))
-
-            amodal_entities = filter(filter_targets, amodal_data['entities'])
-            visible_entities = filter(filter_targets, visible_data['entities'])
-
-            amodal_entities = {e["id"] for e in list(amodal_entities)}
-            visible_entities = {e["id"] for e in list(visible_entities)}
-            video_person_ids.append(list(amodal_entities & visible_entities))
+            amodal_ids = {e["id"] for e in amodal_entities if self._is_target(e)}
+            visible_ids = {e["id"] for e in visible_entities if self._is_target(e)}
+            video_person_ids.append(list(amodal_ids & visible_ids))
 
         return video_person_ids
 
@@ -80,46 +90,68 @@ class PersonPath:
 
         for video_name, person_ids in tqdm(zip(video_names, video_person_ids),
                                            total=len(video_names), desc="Enumerate"):
-            amodal = json.load(open(self.amodal_directory / (video_name + ".json")))
-            visible = json.load(open(self.visible_directory / (video_name + ".json")))
-
-            amodal_by_pid = self._group_by_id(amodal["entities"])
-            visible_by_pid = self._group_by_id(visible["entities"])
+            amodal_by_pid = self._group_by_id(self._read_entities(self.amodal_directory, video_name))
+            visible_by_pid = self._group_by_id(self._read_entities(self.visible_directory, video_name))
 
             for person_id in person_ids:
                 amodal_entities = amodal_by_pid.get(person_id, [])
                 visible_entities = visible_by_pid.get(person_id, [])
-                occlusions = self._occlusion_array(amodal_entities, visible_entities)
-                bin_idx = self._bin_index(occlusions)
+
+                bin_idx = self._bin_index(self._occlusion_array(amodal_entities, visible_entities))
                 if bin_idx is None:
                     continue
+
                 anchor_video_frame = self._anchor_video_frame(
                     amodal_entities, visible_entities, self.min_visible_ratio)
                 if anchor_video_frame is None:
                     continue
+
                 if not self._has_enough_post_anchor_frames(
                         amodal_entities, visible_entities, anchor_video_frame,
                         self.min_frames_after_anchor):
                     continue
+
                 candidates[bin_idx].append((video_name, person_id, anchor_video_frame))
 
         random_generator = np.random.default_rng(self.random_seed)
         selected = []
-        for bin_idx, pool in enumerate(candidates):
+        for pool in candidates:
             chosen = random_generator.choice(len(pool), size=self.n_experiments, replace=False)
             selected.extend(pool[i] for i in chosen)
-
         random_generator.shuffle(selected)
-        self.selected_video_names = np.array([s[0] for s in selected])
-        self.selected_person_ids = np.array([s[1] for s in selected])
-        self.selected_anchor_video_frames = np.array([s[2] for s in selected], dtype=np.int64)
+
+        self.selected_video_names = np.array([video_name for video_name, _, _ in selected])
+        self.selected_person_ids = np.array([person_id for _, person_id, _ in selected])
+        self.selected_anchor_video_frames = np.array(
+            [anchor_frame for _, _, anchor_frame in selected], dtype=np.int64)
+
+    # -------------------------------------------------------------------------------
+    # Annotation IO
+    # -------------------------------------------------------------------------------
+
+    def _is_target(self, entity: dict) -> bool:
+        """True when none of the entity's labels mark it as a non-target."""
+
+        return not any(label in self.non_targets for label in entity["labels"])
+
+    def _read_entities(self, directory: Path, video_name: str) -> list[dict]:
+        """Load the `entities` list from `<directory>/<video_name>.json`."""
+
+        with open(directory / (video_name + ".json"), "r") as handle:
+            return json.load(handle)["entities"]
 
     @staticmethod
-    def _group_by_id(entities):
+    def _group_by_id(entities: list[dict]) -> dict[int, list[dict]]:
+        """Group entities by their person id."""
+
         grouped = {}
         for entity in entities:
             grouped.setdefault(entity["id"], []).append(entity)
         return grouped
+
+    # -------------------------------------------------------------------------------
+    # Per-target derivations
+    # -------------------------------------------------------------------------------
 
     @staticmethod
     def _anchor_video_frame(amodal_entities, visible_entities, min_visible_ratio):
@@ -132,30 +164,28 @@ class PersonPath:
         if not amodal_entities or not visible_entities:
             return None
 
-        amodal_sorted = sorted(amodal_entities, key=lambda entity: entity["blob"]["frame_idx"])
-        amodal_frames = np.array([entity["blob"]["frame_idx"] for entity in amodal_sorted])
-        amodal_areas = np.array([max(0, entity["bb"][2]) * max(0, entity["bb"][3])
-                                   for entity in amodal_sorted], dtype=np.float64)
-        occluded_frames = {entity["blob"]["frame_idx"]
-                              for entity in amodal_entities
-                              if "fully_occluded" in entity["labels"]}
+        amodal_sorted = sorted(amodal_entities, key=_frame_idx)
+        amodal_frames = np.array([_frame_idx(entity) for entity in amodal_sorted])
+        amodal_areas = np.array([_bbox_area(entity["bb"]) for entity in amodal_sorted], dtype=np.float64)
+        occluded_frames = {_frame_idx(entity) for entity in amodal_entities
+                           if "fully_occluded" in entity["labels"]}
 
-        for entity in sorted(visible_entities, key=lambda entity: entity["blob"]["frame_idx"]):
-            visible_frame = int(entity["blob"]["frame_idx"])
+        for entity in sorted(visible_entities, key=_frame_idx):
+            visible_frame = int(_frame_idx(entity))
             if visible_frame in occluded_frames:
                 continue
-            _, _, visible_w, visible_h = entity["bb"]
-            visible_area = max(0, visible_w) * max(0, visible_h)
+            visible_area = _bbox_area(entity["bb"])
             if visible_area <= 0:
                 continue
 
             position = int(np.searchsorted(amodal_frames, visible_frame))
-            candidates = []
+            neighbours = []
             if position < len(amodal_frames):
-                candidates.append(position)
+                neighbours.append(position)
             if position > 0:
-                candidates.append(position - 1)
-            nearest = min(candidates, key=lambda i: abs(amodal_frames[i] - visible_frame))
+                neighbours.append(position - 1)
+            nearest = min(neighbours, key=lambda i: abs(amodal_frames[i] - visible_frame))
+
             amodal_area = float(amodal_areas[nearest])
             if amodal_area <= 0:
                 continue
@@ -164,32 +194,32 @@ class PersonPath:
                 return visible_frame
         return None
 
-
     @staticmethod
-    def _has_enough_post_anchor_frames(amodal_entities, visible_entities,
-                                          anchor_video_frame, min_frames_after_anchor):
+    def _has_enough_post_anchor_frames(amodal_entities, visible_entities,anchor_video_frame, min_frames_after_anchor):
         """True when the trajectory's annotated frames (amodal ∪ visible) contain at
         least `min_frames_after_anchor` entries strictly after `anchor_video_frame`."""
 
         if min_frames_after_anchor <= 0:
             return True
-        amodal_frames = np.fromiter((entity["blob"]["frame_idx"] for entity in amodal_entities), dtype=np.int64)
-        visible_frames = np.fromiter((entity["blob"]["frame_idx"] for entity in visible_entities), dtype=np.int64)
-        annotated = np.unique(np.concatenate([amodal_frames, visible_frames]))
+        annotated = PersonPath._annotated_frames(amodal_entities, visible_entities)
         return int(np.sum(annotated > anchor_video_frame)) >= min_frames_after_anchor
-
 
     @staticmethod
     def _occlusion_array(amodal_entities, visible_entities):
         """Sparse occlusion vector at the annotated-frame cadence (1 where the amodal entity
         carries `fully_occluded`, 0 elsewhere)."""
 
-        amodal_frames = np.fromiter((e["blob"]["frame_idx"] for e in amodal_entities), dtype=np.int64)
-        visible_frames = np.fromiter((e["blob"]["frame_idx"] for e in visible_entities), dtype=np.int64)
+        annotated = PersonPath._annotated_frames(amodal_entities, visible_entities)
+        occluded = {_frame_idx(entity) for entity in amodal_entities if "fully_occluded" in entity["labels"]}
+        return np.array([frame in occluded for frame in annotated], dtype=np.int32)
 
-        annotated = np.unique(np.concatenate([amodal_frames, visible_frames]))
-        occluded = {e["blob"]["frame_idx"] for e in amodal_entities if "fully_occluded" in e["labels"]}
-        return np.array([f in occluded for f in annotated], dtype=np.int32)
+    @staticmethod
+    def _annotated_frames(amodal_entities, visible_entities) -> np.ndarray:
+        """Sorted unique union of the amodal- and visible-annotated frame indices."""
+
+        amodal_frames = np.fromiter((_frame_idx(e) for e in amodal_entities), dtype=np.int64)
+        visible_frames = np.fromiter((_frame_idx(e) for e in visible_entities), dtype=np.int64)
+        return np.unique(np.concatenate([amodal_frames, visible_frames]))
 
     def _bin_index(self, occlusions):
         """Bin index satisfying every selection condition, or None when one fails."""

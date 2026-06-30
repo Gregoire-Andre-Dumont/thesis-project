@@ -3,7 +3,6 @@
 import contextlib
 import gc
 
-import wandb
 import torch
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
@@ -63,12 +62,10 @@ class MainTrainer(TorchTrainer, Logger):
         return sum(losses) / len(losses)
 
     def save_model_to_external(self) -> None:
-        """Save the model to external storage."""
+        """No-op: external (W&B) model artifact logging has been removed. The model is
+        still saved to disk via the trainer's local `save_model`/`get_model_path`."""
 
-        if wandb.run:
-            model_artifact = wandb.Artifact(self.model_name, type="model")
-            model_artifact.add_file(self.get_model_path())
-            wandb.log_artifact(model_artifact)
+        return None
 
     def create_datasets(self, X, y, train_indices, val_indices):
         """Create the torch datasets for training and validation. `X` and `y` are unused — the

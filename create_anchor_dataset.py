@@ -16,7 +16,6 @@ from src.offline_training.references import (
     extract_tokens_at_pad_ratio,
     predict_and_filter_trajectory,
 )
-from src.typing.setup_wandb import setup_wandb
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)

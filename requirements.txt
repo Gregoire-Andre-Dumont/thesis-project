@@ -2,4 +2,3 @@ matplotlib
 hydra
 epochalyst
 tqdm
-wandb

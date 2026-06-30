@@ -8,7 +8,6 @@ from pathlib import Path
 import hydra
 import numpy as np
 import torch
-import wandb
 from omegaconf import DictConfig
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -17,7 +16,6 @@ from tqdm import tqdm
 
 from src.offline_training.main_dataset import collate_fn
 from src.utils.compute_iou import compute_iou
-from src.typing.setup_wandb import setup_wandb
 from src.metrics import coverage_auc
 
 
@@ -80,12 +78,13 @@ def evaluate_calibrator(trainer, test_indices):
 
 
 def stream_metrics(tracker, trajectory_paths, test_indices, detection_data):
-    """Stream per-trajectory coverage-AUC to wandb (AUC over the IoU threshold)."""
+    """Log per-trajectory coverage-AUC to the terminal (AUC over the IoU threshold)."""
 
     coverages = []
     test_trajectories = [trajectory_paths[i] for i in test_indices]
 
-    for trajectory_path in tqdm(test_trajectories, desc="Coverage"):
+    pbar = tqdm(test_trajectories, desc="Coverage")
+    for trajectory_path in pbar:
         video_name, person_id = Path(trajectory_path).stem.rsplit("_", 1)
         detection_data.initialize_target(video_name, int(person_id))
         predicted_masks = tracker.predict_masks(detection_data).numpy()
@@ -97,15 +96,12 @@ def stream_metrics(tracker, trajectory_paths, test_indices, detection_data):
         if not np.isnan(coverage):
             coverages.append(coverage)
 
-        wandb.log({"Average Coverage AUC": np.mean(coverages) if coverages else float("nan")})
-
+        pbar.set_postfix(avg_coverage_auc=(np.mean(coverages) if coverages else float("nan")))
 
 @hydra.main(config_path="conf", config_name="offline_training", version_base=None)
 def train_models(config: DictConfig):
     """Train and evaluate the calibrator, then optionally stream tracker coverage."""
 
-    if config.wandb_enabled:
-        setup_wandb(config, "offline_training", Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir))
     main_trainer = hydra.utils.instantiate(config.offline_trainers.main_trainer)
 
     trajectory_paths, train_indices, test_indices = build_trajectory_split(

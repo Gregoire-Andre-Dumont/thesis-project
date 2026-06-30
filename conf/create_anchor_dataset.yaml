@@ -28,7 +28,6 @@ person_path:
     - "person_in_background"
     - "severly_occluded_person"
 
-wandb_enabled: True
 dataset_path: data/memory_oracle
 shard_index: 2
 num_shards: 3
