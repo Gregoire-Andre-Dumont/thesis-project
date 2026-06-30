@@ -171,7 +171,6 @@ def create_anchor_dataset(config: DictConfig):
         metadata_kwargs, frames, predicted_masks = trajectory_result
 
         for pad_ratio in pad_ratios:
-            # Skip pad_ratios whose variants are already all on disk for this trajectory.
             pad_done = all(variant_path(base_directory, pad_ratio, variant, stem).exists() for variant, _ in VARIANTS)
             if pad_done:
                 continue
