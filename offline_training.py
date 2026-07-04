@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import warnings
 from copy import deepcopy
@@ -27,7 +26,7 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 def predict_on_dataset(model, dataset, batch_size=32):
     """Run the trained calibrator on every sample of `dataset` and return predictions in order."""
 
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=16, collate_fn=collate_fn)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
     device = next(model.parameters()).device
     model.eval()
     predictions = []
@@ -37,26 +36,15 @@ def predict_on_dataset(model, dataset, batch_size=32):
     return np.concatenate(predictions, axis=0)
 
 
-def build_trajectory_split(dataset_path, test_size):
-    """List the clean trajectories under `dataset_path` and split BY VIDEO following
-    PersonPath22's OFFICIAL split (`data/person_path/splits.json` — 138 train / 98
-    test video names). This guarantees no within-video leakage and matches the
-    standard benchmark protocol."""
-
-    splits = json.load(open("data/person_path/splits.json", "r"))
-    train_videos_set = set(name.replace(".mp4", "") for name in splits["train"])
-    test_videos_set  = set(name.replace(".mp4", "") for name in splits["test"])
+def build_trajectory_split(dataset_path, test_size, random_seed=42):
+    """List the clean trajectories under `dataset_path` and split BY TRAJECTORY
+    (random `test_size` holdout, seeded for reproducibility)."""
 
     trajectory_paths = np.array([str(Path(dataset_path) / filename) for filename in sorted(os.listdir(dataset_path))])
-    video_names = np.array([Path(path).name.split(".mp4_")[0] for path in trajectory_paths])
-
-    train_indices = np.array([i for i, v in enumerate(video_names) if v in train_videos_set])
-    test_indices  = np.array([i for i, v in enumerate(video_names) if v in test_videos_set])
-    unmapped = sum(1 for v in video_names if v not in train_videos_set and v not in test_videos_set)
-    if unmapped:
-        print(f"[build_trajectory_split] WARNING: {unmapped} trajectories whose video is "
-                  f"in neither PersonPath22 train nor test split — they will be excluded")
-    return trajectory_paths, train_indices, test_indices
+    indices = np.arange(len(trajectory_paths))
+    train_indices, test_indices = train_test_split(
+        indices, test_size=test_size, random_state=random_seed, shuffle=True)
+    return trajectory_paths, np.sort(train_indices), np.sort(test_indices)
 
 
 def evaluate_calibrator(trainer, test_indices):
@@ -67,8 +55,10 @@ def evaluate_calibrator(trainer, test_indices):
 
     predictions = predict_on_dataset(trainer.model, val_dataset)
     stride = val_dataset.epoch_size_divisor
+    
     true_iou = np.asarray([val_dataset._frame_map[i * stride][2] for i in range(len(predictions))], dtype=np.float32)
     true_labels = (true_iou > val_dataset.iou_threshold).astype(np.int32)
+
     probabilities = 1.0 / (1.0 + np.exp(-predictions[:, 0]))
     predicted_labels = (probabilities > 0.5).astype(np.int32)
 

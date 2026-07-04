@@ -1,125 +1,147 @@
 import os
 import pickle
-from dataclasses import dataclass, field
 from pathlib import Path
+from dataclasses import dataclass, field
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 
 def collate_fn(batch):
-    """Stack the pairs into batched tensors for the DataLoader."""
+    """Stack `(feature, label)` pairs into batched tensors. When the dataset's
+    `__getitems__` already returns a pre-gathered `(features, labels)` batch (the
+    GPU-resident path), pass it straight through."""
+
+    if isinstance(batch, tuple) and len(batch) == 2 and torch.is_tensor(batch[0]):
+        return batch
     features, labels = zip(*batch)
     return torch.stack(features), torch.stack(labels)
 
 
 @dataclass
 class MainDataset(Dataset):
-    """Per-frame calibrator dataset. `initialize(indices)` scans `dataset_path` in
-    sorted order and builds a per-frame index map for the trajectories selected by
-    `indices`. `__getitem__` then gathers one frame's precomputed similarity features
-    from disk."""
+    """Per-frame calibrator dataset.
+
+    `initialize(indices)` lists the trajectory pickles under `dataset_path` (sorted),
+    keeps those at `indices`, and builds a flat per-frame index map. `__getitem__` returns
+    one frame's precomputed similarity features and its `iou > iou_threshold` label.
+
+    When CUDA is available and `load_on_gpu` is set, every selected frame is stacked into a
+    single GPU tensor at `initialize` time, so training has zero per-batch host->device
+    transfer (the bottleneck for this small model)."""
 
     dataset_path: str | None = None
     epoch_size_divisor: int = 3
     random_sampling: bool = False
     iou_threshold: float = 0.5
-    easy_positive_iou: float = 1.0           # frames with iou > this are "easy positives"
-    easy_positive_factor: float = 1.0        # < 1 down-samples, > 1 upsamples easy positives
-    hard_trajectory_factor: float = 1.0      # > 1 upsamples frames of below-median-oracle-coverage trajectories
+    load_on_gpu: bool = True
 
-    _frame_map: list = field(default_factory=list)
+    _frame_map: list = field(default_factory=list)          # [(path, frame_idx, iou), ...]
+    _feature_cache: dict = field(default_factory=dict)      # path -> in-RAM features array
+    _gpu_features: object = None                            # (N, 1, H, W, C) float32 on GPU, or None
+    _gpu_labels: object = None                              # (N,) float32 on GPU, or None
+
+    # -------------------------------------------------------------------------------
+    # Setup
+    # -------------------------------------------------------------------------------
 
     def initialize(self, indices):
-        """Build the per-frame index map for the trajectories at `indices` (positions
-        into the sorted listing of `dataset_path`).
+        """Build the per-frame index map for the trajectories at `indices` (positions into
+        the sorted listing of `dataset_path`), then optionally preload it onto the GPU."""
 
-        When `hard_trajectory_factor != 1.0`, the median ORACLE coverage across the
-        selected trajectories is used as the split point — trajectories below the
-        median are 'hard' and their frames get re-weighted by `hard_trajectory_factor`."""
-
+        self._feature_cache = {}
         clean_directory = Path(self.dataset_path)
         clean_paths = sorted(clean_directory / filename for filename in os.listdir(clean_directory))
         selected_paths = [clean_paths[trajectory_idx] for trajectory_idx in indices]
 
-        # First pass — per-trajectory entries + oracle coverage
-        per_trajectory = []
-        for path in selected_paths:
-            entries, oracle_coverage = self._build_entries_with_coverage(path)
-            per_trajectory.append((entries, oracle_coverage))
-
-        # Compute median oracle coverage to use as the hard/easy split
-        finite_covs = np.array([cov for _, cov in per_trajectory if not np.isnan(cov)])
-        if self.hard_trajectory_factor != 1.0 and len(finite_covs) > 0:
-            median_coverage = float(np.median(finite_covs))
-        else:
-            median_coverage = -1.0   # disables the hard/easy split
-
-        # Second pass — apply per-frame multiplier (composes hard-trajectory and
-        # easy-positive factors).
         self._frame_map = []
-        for entries, oracle_coverage in per_trajectory:
-            is_hard = not np.isnan(oracle_coverage) and oracle_coverage < median_coverage
-            hard_factor = self.hard_trajectory_factor if is_hard else 1.0
-            rng = np.random.default_rng(seed=hash(entries[0][0]) & 0xFFFFFFFF)
-            for entry in entries:
-                _, _, iou_float = entry
-                easy_factor = self.easy_positive_factor if iou_float > self.easy_positive_iou else 1.0
-                factor = hard_factor * easy_factor
-                if factor == 1.0:
-                    self._frame_map.append(entry)
-                    continue
-                if factor < 1.0:
-                    if rng.random() < factor:
-                        self._frame_map.append(entry)
-                else:
-                    n_copies = int(factor)
-                    if rng.random() < (factor - n_copies):
-                        n_copies += 1
-                    for _ in range(n_copies):
-                        self._frame_map.append(entry)
+        for path in selected_paths:
+            self._frame_map.extend(self._build_entries(path))
 
-    def _build_entries_with_coverage(self, path):
-        """Load one trajectory pickle and return (base_entries, oracle_coverage).
-        Oracle coverage is mean(iou > iou_threshold) over non-occluded frames."""
+        self._gpu_features = None
+        self._gpu_labels = None
+        if self.load_on_gpu and torch.cuda.is_available():
+            self._preload_to_gpu()
+
+    def _build_entries(self, path):
+        """Load one trajectory pickle, cache its feature tensor in RAM (one read per
+        trajectory, so `__getitem__` never re-reads the pickle per frame), and return its
+        per-frame `(path, frame_idx, iou)` entries."""
 
         experiment = pickle.load(open(path, "rb"))
-        iou_array = np.asarray(experiment.iou_scores, dtype=np.float32)
-        occ_array = np.asarray(experiment.occlusions, dtype=np.float32)
-        not_occluded = occ_array < 0.5
-        if not_occluded.any():
-            oracle_coverage = float((iou_array[not_occluded] > self.iou_threshold).mean())
-        else:
-            oracle_coverage = float("nan")
-        entries = [(str(path), int(frame_idx), float(iou))
-                          for frame_idx, iou in enumerate(iou_array)]
-        return entries, oracle_coverage
+        self._feature_cache[str(path)] = np.asarray(experiment.features)
+        iou_scores = np.asarray(experiment.iou_scores, dtype=np.float32)
+        return [(str(path), int(frame_idx), float(iou)) for frame_idx, iou in enumerate(iou_scores)]
+
+    def _preload_to_gpu(self):
+        """Stack every frame in `_frame_map` into one GPU tensor (features + labels) and drop
+        the CPU cache. After this, `__getitem__`/`__getitems__` return GPU slices."""
+
+        sample_path, sample_frame, _ = self._frame_map[0]
+        sample = self._feature_cache[sample_path][sample_frame]
+
+        features = np.empty((len(self._frame_map), *sample.shape), dtype=np.float32)
+        labels = np.empty(len(self._frame_map), dtype=np.float32)
+        for index, (path, frame_idx, iou) in enumerate(self._frame_map):
+            features[index] = self._feature_cache[path][frame_idx]
+            labels[index] = 1.0 if iou > self.iou_threshold else 0.0
+
+        self._gpu_features = torch.from_numpy(features).cuda()
+        self._gpu_labels = torch.from_numpy(labels).cuda()
+        self._feature_cache = {}       # free CPU RAM; the data now lives on the GPU
 
     def _load_features(self, path):
-        """Load one trajectory's feature tensor from disk."""
+        """Return a trajectory's feature tensor from the in-RAM cache (populated in
+        `initialize`), falling back to a disk read if it isn't cached."""
 
+        cached = self._feature_cache.get(str(path))
+        if cached is not None:
+            return cached
         return pickle.load(open(path, "rb")).features
 
+    # -------------------------------------------------------------------------------
+    # Sampling
+    # -------------------------------------------------------------------------------
+
     def __len__(self):
-        """Reduces the number of samples per epoch to control the training and evaluation time."""
+        """Samples per epoch — divided down by `epoch_size_divisor` to bound epoch time."""
 
         return len(self._frame_map) // self.epoch_size_divisor
 
-    def __getitem__(self, idx):
-        """Load one frame's full precomputed feature tensor (all channels) from disk and its label."""
+    def _sample_index(self, idx):
+        """Map a DataLoader index to a `_frame_map` index (random when `random_sampling`)."""
 
         if self.random_sampling:
-            sample_idx = int(np.random.randint(0, len(self._frame_map)))
-        else:
-            sample_idx = idx * self.epoch_size_divisor
+            return int(np.random.randint(0, len(self._frame_map)))
+        return idx * self.epoch_size_divisor
+
+    def __getitem__(self, idx):
+        """Return one frame's feature tensor (all channels) and its label."""
+
+        sample_idx = self._sample_index(idx)
+        if self._gpu_features is not None:
+            return self._gpu_features[sample_idx], self._gpu_labels[sample_idx]
 
         path, frame_idx, iou = self._frame_map[sample_idx]
-
         feature = self._load_features(path)[frame_idx].astype(np.float32)
         label = 1.0 if iou > self.iou_threshold else 0.0
         return torch.from_numpy(feature), torch.tensor(label, dtype=torch.float32)
 
     def __getitems__(self, indices):
-        """Batched fetch hook for PyTorch's DataLoader."""
+        """Batched fetch hook for PyTorch's DataLoader.
 
-        return [self.__getitem__(i) for i in indices]
+        GPU-resident path: gather the WHOLE batch in a single indexing op and return a
+        pre-collated `(features, labels)` tuple (passed through by `collate_fn`), avoiding
+        one CUDA index kernel per sample — which otherwise dominates for this small model."""
+
+        if self._gpu_features is None:
+            return [self.__getitem__(i) for i in indices]
+
+        count = len(self._frame_map)
+        if self.random_sampling:
+            selection = torch.randint(0, count, (len(indices),), device=self._gpu_features.device)
+        else:
+            selection = torch.as_tensor([i * self.epoch_size_divisor for i in indices],
+                                        device=self._gpu_features.device)
+        return self._gpu_features[selection], self._gpu_labels[selection]

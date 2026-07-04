@@ -29,6 +29,4 @@ main_trainer:
   patience: 30
   n_folds: 5
   checkpointing_resume_if_exists: False
-  dataloader_args:
-    num_workers: 16
-    prefetch_factor: 4
+  

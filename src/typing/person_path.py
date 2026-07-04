@@ -14,7 +14,7 @@ def _frame_idx(entity: dict) -> int:
 
 
 def _bbox_area(bbox) -> float:
-    """Area of a `(x, y, w, h)` bbox, clamping negative extents to zero."""
+    """Area of a bounding bbox, clamping negative extents to zero."""
 
     _, _, width, height = bbox
     return max(0, width) * max(0, height)
@@ -56,7 +56,8 @@ class PersonPath:
         self.amodal_directory = main_directory / "amodal"
         self.visible_directory = main_directory / "visible"
 
-        video_names = os.listdir(self.video_directory)
+        video_names = sorted(name for name in os.listdir(self.video_directory)
+                             if name.endswith(".mp4"))
         video_person_ids = self.filter_targets(video_names)
 
         self.select_targets(video_names, video_person_ids)
@@ -166,9 +167,9 @@ class PersonPath:
 
         amodal_sorted = sorted(amodal_entities, key=_frame_idx)
         amodal_frames = np.array([_frame_idx(entity) for entity in amodal_sorted])
+        
         amodal_areas = np.array([_bbox_area(entity["bb"]) for entity in amodal_sorted], dtype=np.float64)
-        occluded_frames = {_frame_idx(entity) for entity in amodal_entities
-                           if "fully_occluded" in entity["labels"]}
+        occluded_frames = {_frame_idx(entity) for entity in amodal_entities if "fully_occluded" in entity["labels"]}
 
         for entity in sorted(visible_entities, key=_frame_idx):
             visible_frame = int(_frame_idx(entity))

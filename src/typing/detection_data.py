@@ -1,4 +1,6 @@
 import json
+import torch  # noqa: F401 -- import torch BEFORE decord so torch's DLLs load first
+               # (Windows: decord-first triggers c10.dll WinError 1114 in decord's torch bridge)
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass

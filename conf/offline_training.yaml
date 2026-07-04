@@ -1,5 +1,5 @@
 defaults:
-  - offline_trainers: cnn_fixed_samara
+  - offline_trainers: experiment_4/cnn_fixed_samara_memory_20
   - trackers@tracker: memory_oracle
   
 detection_data:
@@ -11,7 +11,7 @@ detection_data:
   num_threads: 32
   resize_resolution: 1024
 
-train_test_split: 0.3
+train_test_split: 0.2
 deploy_controller: True
-dataset_path: data/memory_oracle/memory/padding_0.10
+dataset_path: data/memory_oracle/memory/padding_0.25
 commit_threshold: 0.4

@@ -1,7 +1,6 @@
 import os
 import sys
 import gc
-import json
 import logging
 import pickle
 import warnings
@@ -22,44 +21,6 @@ from offline_training import build_trajectory_split
 logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["HYDRA_FULL_ERROR"] = "1"
-
-
-SAM_RESIZE = 1024
-VISIBLE_DIRECTORY = Path("data/person_path/visible")
-
-
-def _anchor_area_at_chosen_anchor(trajectory_path):
-    """Visible-bbox area at the chosen anchor frame for one trajectory pickle, scaled to
-    1024-resize. Returns `None` if missing."""
-
-    with open(trajectory_path, "rb") as handle:
-        trajectory = pickle.load(handle)
-    frame_indices = trajectory.frame_indices
-    if frame_indices is None or len(frame_indices) == 0:
-        return None
-    stem = Path(trajectory_path).stem
-    video_name, person_id_str = stem.rsplit("_", 1)
-    person_id = int(person_id_str)
-    anchor_video_frame = int(frame_indices[0])
-    visible_path = VISIBLE_DIRECTORY / f"{video_name}.json"
-    if not visible_path.exists():
-        return None
-    data = json.load(open(visible_path))
-    image_width = int(data["metadata"]["resolution"]["width"])
-    image_height = int(data["metadata"]["resolution"]["height"])
-    scale = SAM_RESIZE / max(image_width, image_height)
-    best_bbox, best_diff = None, None
-    for entity in data["entities"]:
-        if entity["id"] != person_id:
-            continue
-        diff = abs(int(entity["blob"]["frame_idx"]) - anchor_video_frame)
-        if best_diff is None or diff < best_diff:
-            best_diff = diff
-            best_bbox = entity["bb"]
-    if best_bbox is None:
-        return None
-    _, _, w, h = best_bbox
-    return max(0.0, w) * max(0.0, h) * scale * scale
 
 
 def run_tracker(tracker, trajectory_paths, test_indices, detection_data, output_path):
@@ -158,25 +119,6 @@ def main(config: DictConfig):
                 print(f"  train_fraction={train_fraction}: using {n_train}/{len(train_indices)} train trajectories")
             else:
                 effective_train_indices = train_indices
-
-            anchor_size_filter = trainer_config.get("anchor_size_filter", None)
-            if anchor_size_filter in ("small", "large"):
-                anchor_areas = {int(idx): _anchor_area_at_chosen_anchor(trajectory_paths[idx])
-                                    for idx in effective_train_indices}
-                valid_areas = np.array([a for a in anchor_areas.values() if a is not None])
-                if len(valid_areas) == 0:
-                    raise ValueError("no valid anchor areas computed for the training pool")
-                size_threshold = float(np.median(valid_areas))
-                if anchor_size_filter == "small":
-                    keep = [idx for idx, area in anchor_areas.items() if area is not None and area < size_threshold]
-                else:
-                    keep = [idx for idx, area in anchor_areas.items() if area is not None and area >= size_threshold]
-                effective_train_indices = np.sort(np.array(keep, dtype=np.int64))
-                print(f"  anchor_size_filter={anchor_size_filter}: "
-                        f"split at {size_threshold:.0f} px² (1024-resize), "
-                        f"kept {len(effective_train_indices)}/{len(anchor_areas)} train trajectories")
-            elif anchor_size_filter not in (None, "both"):
-                raise ValueError(f"anchor_size_filter must be 'small'/'large'/'both'/None, got {anchor_size_filter!r}")
 
             trainer = hydra.utils.instantiate(trainer_config.main_trainer)
             trainer.custom_train(x=trajectory_paths, y=trajectory_paths,
