@@ -1,7 +1,10 @@
 tracker:
   _target_: src.modules.baselines.samite.Samite
   checkpoint: tm/sam_large.pt
- 
+  model_config: SAM2/samite_hiera_large.yaml
 
 experiment:
   _target_: src.experiments.tracking_experiment.TrackingExperiment
+  resolution: 1024
+  experiment_name: samite_large
+  video_path: data/visualize/samite_large

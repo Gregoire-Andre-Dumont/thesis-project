@@ -1,10 +1,10 @@
 tracker:
   _target_: src.modules.baselines.samurai.Samurai
-  checkpoint: tm/sam_large.pt
- 
+  checkpoint: tm/sam_small.pt
+  model_config: SAM2/samurai_hiera_small.yaml
 
 experiment:
   _target_: src.experiments.tracking_experiment.TrackingExperiment
   resolution: 1024
-  experiment_name: sam original
-  video_path: data/visualize
+  experiment_name: samurai_small
+  video_path: data/visualize/samurai_small

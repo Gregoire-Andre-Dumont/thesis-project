@@ -3,11 +3,10 @@ tracker:
   iou_threshold: 0.30
   model:
     _target_: src.modules.samara_hiera_model.SamaraHieraModel
-    sam_model_path: tm/sam_large.pt
+    sam_model_path: tm/sam_small.pt
     crop_resize: 384
     pad_ratio: 1.0
-    
-  main_memory: 
+  main_memory:
     _target_: src.modules.memories.main_memory.MainMemory
     max_memory_history: 6
     max_pointer_history: 15
@@ -15,5 +14,5 @@ tracker:
 experiment:
   _target_: src.experiments.tracking_experiment.TrackingExperiment
   resolution: 1024
-  experiment_name: sam baseline
-  video_path: data/visualize
+  experiment_name: memory_oracle_small
+  video_path: data/visualize/memory_oracle_small

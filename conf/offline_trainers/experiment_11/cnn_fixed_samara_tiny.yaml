@@ -1,6 +1,6 @@
 main_trainer:
   _target_: src.offline_training.main_trainer.MainTrainer
-  model_name: experiment_4_cnn_fixed_samara_memory_padding_0.25_iou_0.40
+  model_name: size_sweep_cnn_fixed_samara_tiny
   model:
     _target_: src.offline_training.classifiers.cnn_fixed.CNNFixed
     n_channels: 64
@@ -12,9 +12,9 @@ main_trainer:
     _target_: src.offline_training.losses.bce_iou.BCEIouLoss
   dataset:
     _target_: src.offline_training.main_dataset.MainDataset
-    dataset_path: data/datasets/memory/padding_0.25
+    dataset_path: data/memory_oracle/tiny/memory/padding_0.25   # <-- PER-SIZE features; adjust
     epoch_size_divisor: 2
-    iou_threshold: 0.4
+    iou_threshold: 0.2
   collate_fn:
     _target_: hydra.utils.get_method
     path: src.offline_training.main_dataset.collate_fn
@@ -23,12 +23,11 @@ main_trainer:
     _args_:
       - _target_: hydra.utils.get_class
         path: torch.optim.Adam
-    lr: 0.000005003
+    lr: 0.000005002
   epochs: 15
   batch_size: 32
   patience: 30
   n_folds: 5
   checkpointing_resume_if_exists: False
   dataloader_args:
-    num_workers: 16
-    prefetch_factor: 4
+    num_workers: 0

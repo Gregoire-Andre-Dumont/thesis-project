@@ -9,5 +9,5 @@ tracker:
 experiment:
   _target_: src.experiments.tracking_experiment.TrackingExperiment
   resolution: 1024
-  experiment_name: sam2long
-  video_path: data/visualize/sam2long
+  experiment_name: sam2long_large
+  video_path: data/visualize/sam2long_large
