@@ -50,20 +50,16 @@ class SamaraHieraModel(SAMV2Model):
 
         candidate_masks = (candidate_masks_raw > 0.0).to(torch.float64).cpu().numpy()
         frames = np.repeat(np.asarray(current_frame)[None], len(candidate_masks), axis=0)
-        
+
         cropped_frames, cropped_masks = self.extract_crops(frames, candidate_masks)
         foreground, background = self.extract_patch_tokens(cropped_frames, cropped_masks)
 
+        n_masks = len(candidate_masks)
         side = int(round(foreground.shape[1] ** 0.5))
+        fg_fg = self.compute_patch_similarities(reference_foreground, foreground).reshape(n_masks, -1, side, side)
+        bg_fg = self.compute_patch_similarities(reference_foreground, background).reshape(n_masks, -1, side, side)
 
-        def similarity(reference, target):
-            return self.compute_patch_similarities(reference, target).reshape(len(candidate_masks), -1, side, side)
-
-        fg_fg = similarity(reference_foreground, foreground)
-        bg_fg = similarity(reference_foreground, background)
-        features = torch.from_numpy(
-            np.stack([fg_fg, bg_fg], axis=-1).astype(np.float32)).to("cuda")
-
+        features = torch.from_numpy(np.stack([fg_fg, bg_fg], axis=-1).astype(np.float32)).to("cuda")
         return self._run_controller(features), foreground, background, features
 
     def _run_controller(self, features):

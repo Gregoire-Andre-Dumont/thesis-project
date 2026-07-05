@@ -32,7 +32,15 @@ dataset_path: data/memory_oracle
 shard_index: 2
 num_shards: 3
 
-pad_ratios: [0.05, 0.1, 0.25, 0.5]
+# Fixed crop geometry (no pad-ratio sweep) — one dataset per encoder below.
+crop_resize: 512
+pad_ratio: 0.25
+encoders:
+  tiny: tm/sam_tiny.pt
+  small: tm/sam_small.pt
+  base_plus: tm/sam_base_plus.pt
+  large: tm/sam_large.pt
+
 commit_threshold: 0.4
 random_seed: 42
 coverage_threshold: 0.05

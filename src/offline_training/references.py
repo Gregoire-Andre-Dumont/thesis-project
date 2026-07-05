@@ -1,6 +1,13 @@
 import numpy as np
+import torch
 
 from src.utils.compute_iou import compute_iou
+from src.modules.samara_hiera_model import SamaraHieraModel
+
+
+# Token-source variants extracted in one encoder pass; patch similarities reduce with MAX
+# over the anchor's foreground patches.
+VARIANTS = ["hiera", "memory"]
 
 
 # ---------------------------------------------------------------------------------------
@@ -8,7 +15,8 @@ from src.utils.compute_iou import compute_iou
 # ---------------------------------------------------------------------------------------
 
 def _post_occlusion_coverage(iou_scores, occlusions, threshold):
-    """Fraction of visible post-first-occlusion frames with IoU > `threshold`."""
+    """Fraction of the visible frames after the first occlusion whose IoU beats the threshold.
+    Returns zero when the trajectory is never occluded."""
 
     occluded = np.where(occlusions > 0.5)[0]
     visible = np.where(occlusions < 0.5)[0]
@@ -19,8 +27,8 @@ def _post_occlusion_coverage(iou_scores, occlusions, threshold):
 
 
 def _extract_hiera_and_memory(model, cropped_frames, cropped_masks):
-    """Run the Hiera image encoder AND the memory encoder over the same crops, returning
-    `((hiera_fg, hiera_bg), (memory_fg, memory_bg))`."""
+    """Encode the same crops with both the image encoder and the memory encoder.
+    Returns each encoder's foreground and background token views."""
 
     hiera_tokens, hiera_patch_masks = model.extract_raw_patch_tokens(cropped_frames, cropped_masks)
     hiera_fg, hiera_bg = model.split_foreground_background(hiera_tokens, hiera_patch_masks)
@@ -36,15 +44,8 @@ def _extract_hiera_and_memory(model, cropped_frames, cropped_masks):
 # ---------------------------------------------------------------------------------------
 
 def compute_features(model, foreground, background, anchor_foreground, anchor_background=None):
-    """Pack per-frame patch similarities into the `(n_frames, 1, side, side, 2)` float16
-    features tensor consumed by `MainDataset`.
-
-    Channels (last axis):
-        0 — foreground patches' max cosine to anchor FG bank
-        1 — background patches' max cosine to anchor FG bank
-
-    (`anchor_background` is unused — the FG-vs-BG diff channels were removed from the
-    pipeline; kept in the signature for call-site compatibility.)"""
+    """Pack the per-frame anchor similarities into the feature array the dataset consumes.
+    Channel zero scores the foreground patches and channel one the background patches."""
 
     n_frames, n_patches, _ = foreground.shape
     side = int(round(n_patches ** 0.5))
@@ -60,12 +61,8 @@ def compute_features(model, foreground, background, anchor_foreground, anchor_ba
 
 def predict_and_filter_trajectory(tracker, detection_data, warmup_count,
                                           coverage_threshold, commit_threshold):
-    """Run the tracker ONCE, compute IoUs vs GT, apply the post-occlusion coverage
-    filter. Returns `(metadata_kwargs, frames, predicted_masks)` ready for cropping at
-    any pad_ratio, or `None` if the trajectory fails the coverage filter.
-
-    The expensive SAM 2 forward pass lives here — separated from cropping/encoding so
-    the same predictions can drive multiple pad_ratio datasets in a single sweep."""
+    """Track the trajectory once, score its masks against ground truth, and apply the coverage filter.
+    Returns the labels, frames and masks to encode, or None when the trajectory is too poor to keep."""
 
     predicted_masks = tracker.predict_masks(detection_data).numpy()
     iou_scores = compute_iou(detection_data.bboxes_norm, predicted_masks)
@@ -93,12 +90,43 @@ def predict_and_filter_trajectory(tracker, detection_data, warmup_count,
     return metadata_kwargs, frames, predicted_masks
 
 
-def extract_tokens_at_pad_ratio(model, frames, predicted_masks, pad_ratio):
-    """Re-crop the frames at the given `pad_ratio` and re-encode them with BOTH the
-    Hiera image encoder and the Memory encoder. Mutates `model.pad_ratio` to control
-    the crop side (cheaper than threading a kwarg through `extract_crops`). Returns
-    `((hiera_fg, hiera_bg), (memory_fg, memory_bg))`."""
+def extract_tokens(model, frames, predicted_masks):
+    """Crop the frames around their predicted masks and encode them with both encoders.
+    Returns each encoder's foreground and background token views."""
 
-    model.pad_ratio = pad_ratio
     cropped_frames, cropped_masks = model.extract_crops(frames, predicted_masks)
     return _extract_hiera_and_memory(model, cropped_frames, cropped_masks)
+
+
+# ---------------------------------------------------------------------------------------
+# multi-encoder feature extraction (one shared set of oracle masks -> per-encoder features)
+# ---------------------------------------------------------------------------------------
+
+def load_encoder_models(encoders, crop_resize, pad_ratio):
+    """Build one tracking model per encoder checkpoint, all cropping the same way.
+    Only the backbone weights differ, so their datasets stay comparable."""
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    return {name: SamaraHieraModel(sam_model_path=checkpoint, crop_resize=crop_resize, pad_ratio=pad_ratio)
+                  .to(device=device, dtype=dtype)
+            for name, checkpoint in encoders.items()}
+
+
+def encode_trajectory(model, frames, predicted_masks):
+    """Encode one trajectory with a single backbone into its hiera and memory features.
+    Returns the features keyed by variant name."""
+
+    (hiera_fg, hiera_bg), (memory_fg, memory_bg) = extract_tokens(model, frames, predicted_masks)
+    return {
+        "hiera":  compute_features(model, hiera_fg, hiera_bg, hiera_fg[0:1]),
+        "memory": compute_features(model, memory_fg, memory_bg, memory_fg[0:1]),
+    }
+
+
+def encode_with_encoders(encoder_models, frames, predicted_masks):
+    """Encode one trajectory with every backbone, reusing the shared oracle masks.
+    Returns the features keyed by encoder and then by variant."""
+
+    return {name: encode_trajectory(model, frames, predicted_masks)
+            for name, model in encoder_models.items()}

@@ -24,7 +24,8 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 
 
 def predict_on_dataset(model, dataset, batch_size=32):
-    """Run the trained calibrator on every sample of `dataset` and return predictions in order."""
+    """Run the trained calibrator over every sample of the dataset in order.
+    Returns the stacked raw predictions, one per frame."""
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
     device = next(model.parameters()).device
@@ -37,8 +38,8 @@ def predict_on_dataset(model, dataset, batch_size=32):
 
 
 def build_trajectory_split(dataset_path, test_size, random_seed=42):
-    """List the clean trajectories under `dataset_path` and split BY TRAJECTORY
-    (random `test_size` holdout, seeded for reproducibility)."""
+    """List the trajectories in the dataset and split them into train and test sets.
+    The split is by trajectory and seeded so it stays the same across runs."""
 
     trajectory_paths = np.array([str(Path(dataset_path) / filename) for filename in sorted(os.listdir(dataset_path))])
     indices = np.arange(len(trajectory_paths))
@@ -48,7 +49,8 @@ def build_trajectory_split(dataset_path, test_size, random_seed=42):
 
 
 def evaluate_calibrator(trainer, test_indices):
-    """Run the trained calibrator on the held-out validation split and log F1 / AUC."""
+    """Score the trained calibrator on the held-out validation trajectories.
+    Prints the F1 and AUC of its predictions against the true labels."""
 
     val_dataset = deepcopy(trainer.dataset)
     val_dataset.initialize(test_indices)
@@ -65,7 +67,8 @@ def evaluate_calibrator(trainer, test_indices):
 
 
 def stream_metrics(tracker, trajectory_paths, test_indices, detection_data):
-    """Log per-trajectory coverage-AUC to the terminal (AUC over the IoU threshold)."""
+    """Run the tracker on each test trajectory and measure its post-occlusion coverage.
+    Prints the running average coverage to the terminal."""
 
     coverages = []
     test_trajectories = [trajectory_paths[i] for i in test_indices]
@@ -87,7 +90,8 @@ def stream_metrics(tracker, trajectory_paths, test_indices, detection_data):
 
 @hydra.main(config_path="conf", config_name="offline_training", version_base=None)
 def train_models(config: DictConfig):
-    """Train and evaluate the calibrator, then optionally stream tracker coverage."""
+    """Train the calibrator on the trajectory split and report its validation scores.
+    Optionally deploys it into the tracker and streams coverage on the test set."""
 
     main_trainer = hydra.utils.instantiate(config.offline_trainers.main_trainer)
 
