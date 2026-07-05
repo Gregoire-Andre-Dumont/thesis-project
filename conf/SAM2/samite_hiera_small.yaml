@@ -1,5 +1,5 @@
-
 # @package _global_
+
 # Model
 model:
   _target_: sam2.modeling.sam2_base.SAM2Base
@@ -13,7 +13,6 @@ model:
       stages: [1, 2, 11, 2]
       global_att_blocks: [7, 10, 13]
       window_pos_embed_bkg_spatial_size: [7, 7]
-      window_spec: [8, 4, 14, 7]
     neck:
       _target_: sam2.modeling.backbones.image_encoder.FpnNeck
       position_encoding:
@@ -123,11 +122,10 @@ model:
   stable_frames_threshold: 15
   stable_ious_threshold: 0.3
   min_obj_score_logits: -1
-  kf_score_weight: 0.15  
+  kf_score_weight: 0.25
   memory_bank_iou_threshold: 0.5
   memory_bank_obj_score_threshold: 0.0
   memory_bank_kf_score_threshold: 0.0
   # SAMITE
   samite_mode: true
   non_overlap_masks: false
-  

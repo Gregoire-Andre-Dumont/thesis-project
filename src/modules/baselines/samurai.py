@@ -23,7 +23,7 @@ class Samurai:
     def __post_init__(self):
         """Load and initialize the SAM 2 model with quantization."""
 
-        model_config = "../conf/SAM2/samurai_hiera_large.yaml"
+        model_config = self.model_config or "../conf/SAM2/samurai_hiera_large.yaml"
         self.predictor = build_samurai_video_predictor(model_config, self.checkpoint, device="cuda")
 
     def predict_masks(self, detection_data: DetectionData):

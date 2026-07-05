@@ -44,7 +44,7 @@ def build_trajectory_split(dataset_path, test_size, random_seed=42):
     indices = np.arange(len(trajectory_paths))
     train_indices, test_indices = train_test_split(
         indices, test_size=test_size, random_state=random_seed, shuffle=True)
-    return trajectory_paths, np.sort(train_indices), np.sort(test_indices)
+    return trajectory_paths, train_indices, test_indices
 
 
 def evaluate_calibrator(trainer, test_indices):

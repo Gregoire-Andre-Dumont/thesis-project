@@ -1,5 +1,5 @@
-
 # @package _global_
+
 # Model
 model:
   _target_: sam2.modeling.sam2_base.SAM2Base
@@ -13,7 +13,6 @@ model:
       stages: [1, 2, 7, 2]
       global_att_blocks: [5, 7, 9]
       window_pos_embed_bkg_spatial_size: [7, 7]
-      window_spec: [8, 4, 14, 7]
     neck:
       _target_: sam2.modeling.backbones.image_encoder.FpnNeck
       position_encoding:
@@ -88,6 +87,7 @@ model:
   num_maskmem: 7
   image_size: 1024
   # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
+  # SAM decoder
   sigmoid_scale_for_mem_enc: 20.0
   sigmoid_bias_for_mem_enc: -10.0
   use_mask_input_as_output_without_sam: true
@@ -117,13 +117,14 @@ model:
   multimask_max_pt_num: 1
   use_mlp_for_obj_ptr_proj: true
   # Compilation flag
+  # HieraT does not currently support compilation, should always be set to False
   compile_image_encoder: False
   # SAMURAI
   samurai_mode: false
   stable_frames_threshold: 15
   stable_ious_threshold: 0.3
   min_obj_score_logits: -1
-  kf_score_weight: 0.15  
+  kf_score_weight: 0.25
   memory_bank_iou_threshold: 0.5
   memory_bank_obj_score_threshold: 0.0
   memory_bank_kf_score_threshold: 0.0

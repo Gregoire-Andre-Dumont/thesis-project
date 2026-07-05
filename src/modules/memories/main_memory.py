@@ -62,23 +62,7 @@ class MainMemory:
         self.fixed_reference_background = None
 
     def initialize_references(self, model, detection_data: DetectionData, anchor_index: int = 1):
-        """Bootstrap SAM 2's video-masking memory from the chosen anchor's GT bbox.
-
-        `anchor_index` selects which position in `detection_data` holds the anchor:
-          - `1` (default): used during DATASET CREATION, where `create_anchor_dataset.py`
-            puts the chosen anchor at sliced index 1 with a pre-anchor warmup frame at
-            index 0.
-          - `0`: used at DEPLOY TIME, where the saved trajectory pickle's
-            `frame_indices[0]` IS the chosen anchor (the warmup frame was dropped
-            post-tracking before saving).
-
-        Returns the raw mask SAM 2's mask decoder produces for the init prompt —
-        `initialize_calibrator_anchor` consumes it to seed the calibrator anchor
-        without a second SAM 2 forward pass.
-
-        Also sets `model.anchor_amodal_pixels` from the chosen anchor's amodal bbox so
-        every subsequent `extract_crops` call sizes its crop from
-        anchor amodal × (1 + 2 × pad_ratio) — SiamFC/STARK-style fixed search region."""
+        """Bootstrap SAM 2's video-masking memory from the chosen anchor's GT bbox."""
 
         reference = detection_data.frames[anchor_index]
         bbox_norm = convert_bbox(detection_data.bboxes_norm[anchor_index])
@@ -91,16 +75,8 @@ class MainMemory:
         self.update_reference(pointer, encoding)
         return init_mask
 
-    def initialize_calibrator_anchor(self, model, detection_data: DetectionData, init_mask,
-                                                            anchor_index: int = 1):
-        """Seed the calibrator anchor from SAM 2's initialization mask.
-
-        `anchor_index` selects the frame this method extracts patches from. It
-        MUST match the index used by `initialize_references` for the same call —
-        otherwise `init_mask` (computed FOR `frames[anchor_index_init]`) is applied
-        to a DIFFERENT frame here, and the patches are extracted from positions
-        the mask doesn't correspond to. Defaults to 1 to match the dataset-creation
-        warmup convention; deploy trackers pass `anchor_index=0`."""
+    def initialize_calibrator_anchor(self, model, detection_data: DetectionData, init_mask, anchor_index: int = 1):
+        """Seed the calibrator anchor from SAM 2's initialization mask."""
 
         frame = detection_data.frames[anchor_index]
         mask = (init_mask > 0.0).to(torch.float64).cpu().numpy().squeeze()

@@ -45,16 +45,21 @@ class SamuraiVideoPredictor(SAM2Base):
     ):
         """Initialize an inference state."""
         compute_device = self.device  # device of the model
-        images, video_height, video_width = load_video_frames(
-            video_path=video_path,
-            image_size=self.image_size,
-            offload_video_to_cpu=offload_video_to_cpu,
-            async_loading_frames=async_loading_frames,
-            compute_device=compute_device)
+        # Decode ONLY the trajectory's frames instead of the whole video (big speedup on long clips).
+        import decord
+        decord.bridge.set_bridge("torch")
+        _mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)[:, None, None]
+        _std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)[:, None, None]
+        video_height, video_width, _ = decord.VideoReader(video_path)[0].shape
+        _reader = decord.VideoReader(video_path, width=self.image_size, height=self.image_size)
+        images = _reader.get_batch([int(i) for i in frame_indices]).permute(0, 3, 1, 2).float() / 255.0
+        if not offload_video_to_cpu:
+            images = images.to(compute_device); _mean = _mean.to(compute_device); _std = _std.to(compute_device)
+        images = (images - _mean) / _std
         
         inference_state = {}
-        inference_state["images"] = images[frame_indices]
-        inference_state["num_frames"] = len(images[frame_indices])
+        inference_state["images"] = images
+        inference_state["num_frames"] = len(images)
         # whether to offload the video frames to CPU memory
         # turning on this option saves the GPU memory with only a very small overhead
         inference_state["offload_video_to_cpu"] = offload_video_to_cpu
