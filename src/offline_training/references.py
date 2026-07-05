@@ -35,36 +35,26 @@ def _extract_hiera_and_memory(model, cropped_frames, cropped_masks):
 # trajectory builder + per-variant feature packing
 # ---------------------------------------------------------------------------------------
 
-def compute_features(model, foreground, background, anchor_foreground, anchor_background):
-    """Pack per-frame patch similarities into the `(n_frames, 1, side, side, 4)` float16
+def compute_features(model, foreground, background, anchor_foreground, anchor_background=None):
+    """Pack per-frame patch similarities into the `(n_frames, 1, side, side, 2)` float16
     features tensor consumed by `MainDataset`.
 
     Channels (last axis):
         0 — foreground patches' max cosine to anchor FG bank
         1 — background patches' max cosine to anchor FG bank
-        2 — foreground patches' (max cos to anchor FG) − (max cos to anchor BG)
-        3 — background patches' (max cos to anchor FG) − (max cos to anchor BG)
 
-    Channels 0-1 are the legacy 2-channel set. Channels 2-3 are the per-patch
-    FG-vs-BG discriminative margin — same geometry the deploy-time diff heuristic
-    relies on. CNN opts into all four via `channel="all"`."""
+    (`anchor_background` is unused — the FG-vs-BG diff channels were removed from the
+    pipeline; kept in the signature for call-site compatibility.)"""
 
     n_frames, n_patches, _ = foreground.shape
     side = int(round(n_patches ** 0.5))
 
     foreground_to_anchor_fg = model.compute_patch_similarities(anchor_foreground, foreground)
     background_to_anchor_fg = model.compute_patch_similarities(anchor_foreground, background)
-    foreground_to_anchor_bg = model.compute_patch_similarities(anchor_background, foreground)
-    background_to_anchor_bg = model.compute_patch_similarities(anchor_background, background)
-
-    foreground_diff = foreground_to_anchor_fg - foreground_to_anchor_bg
-    background_diff = background_to_anchor_fg - background_to_anchor_bg
 
     return np.stack([
         foreground_to_anchor_fg.reshape(n_frames, 1, side, side),
         background_to_anchor_fg.reshape(n_frames, 1, side, side),
-        foreground_diff.reshape(n_frames, 1, side, side),
-        background_diff.reshape(n_frames, 1, side, side),
     ], axis=-1).astype(np.float16)
 
 

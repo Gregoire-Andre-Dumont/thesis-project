@@ -48,16 +48,13 @@ def build_trajectory_split(dataset_path, test_size, random_seed=42):
 
 
 def evaluate_calibrator(trainer, test_indices):
-    """Run the trained calibrator on the held-out validation split"""
+    """Run the trained calibrator on the held-out validation split and log F1 / AUC."""
 
     val_dataset = deepcopy(trainer.dataset)
     val_dataset.initialize(test_indices)
 
     predictions = predict_on_dataset(trainer.model, val_dataset)
-    stride = val_dataset.epoch_size_divisor
-    
-    true_iou = np.asarray([val_dataset._frame_map[i * stride][2] for i in range(len(predictions))], dtype=np.float32)
-    true_labels = (true_iou > val_dataset.iou_threshold).astype(np.int32)
+    true_labels = val_dataset._labels.cpu().numpy().astype(np.int32)
 
     probabilities = 1.0 / (1.0 + np.exp(-predictions[:, 0]))
     predicted_labels = (probabilities > 0.5).astype(np.int32)

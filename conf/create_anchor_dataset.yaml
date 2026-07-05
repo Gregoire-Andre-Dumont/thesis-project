@@ -1,5 +1,5 @@
 defaults:
-  - trackers@oracle: combined_oracle
+  - trackers@oracle: memory_oracle
 
 detection_data:
   _target_: src.typing.detection_data.DetectionData

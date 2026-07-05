@@ -68,14 +68,10 @@ class MainTrainer(TorchTrainer, Logger):
         return None
 
     def create_datasets(self, X, y, train_indices, val_indices):
-        """Create the torch datasets for training and validation. `X` and `y` are unused — the
-        dataset's clean trajectory paths are derived from `self.dataset.dataset_path`. Both
-        sub-sample to a fraction of the full frame list per epoch so the training loop and
-        per-epoch val loss are fast. The final eval (in `offline_training.py`) builds its own
-        val_dataset with `epoch_size_divisor=1` for an exact coverage number."""
+        """Create the torch train/validation datasets. `X` and `y` are unused — the dataset's
+        clean trajectory paths are derived from `self.dataset.dataset_path`."""
 
         train_dataset = deepcopy(self.dataset)
-        train_dataset.random_sampling = True
         train_dataset.initialize(train_indices)
 
         validation_dataset = deepcopy(self.dataset)

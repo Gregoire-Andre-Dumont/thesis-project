@@ -5,7 +5,7 @@ import torch.nn as nn
 class BCEIouLoss(nn.Module):
     """Binary cross-entropy on the mask-quality logit. Supports `pos_weight` to
     rebalance the positive class — useful when training labels are heavily
-    positive-skewed (e.g., the combined_oracle dataset has ~75% positive at
+    positive-skewed (e.g., the memory_oracle dataset has ~75% positive at
     IoU > 0.5). PyTorch convention: loss = -(pos_weight·y·log(p) + (1-y)·log(1-p)).
 
       - `pos_weight = 1.0` (default): standard BCE.

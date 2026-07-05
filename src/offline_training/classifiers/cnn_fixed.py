@@ -2,12 +2,9 @@ import torch.nn as nn
 
 
 _CHANNEL_SLICE = {
-    "both":         slice(0, 2),     # legacy: anchor-FG similarities only (channels 0, 1)
+    "both":         slice(0, 2),     # anchor-FG similarities: foreground + background (channels 0, 1)
     "foreground":   slice(0, 1),     # channel 0 only
     "background":   slice(1, 2),     # channel 1 only
-    "all":          slice(0, 4),     # channels 0-3: similarities + FG-vs-BG diffs
-    "diff":         slice(2, 4),     # channels 2-3: the FG-vs-BG diffs alone
-    "channels_1_2": slice(1, 3),     # background-FG sim + foreground FG-vs-BG diff
 }
 
 
