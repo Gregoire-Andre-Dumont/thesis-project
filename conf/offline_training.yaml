@@ -9,7 +9,6 @@ detection_data:
   video_directory: data/person_path/videos
   load_frames: True
   num_threads: 32
-  resize_resolution: 1024
 
 train_test_split: 0.20
 deploy_controller: True

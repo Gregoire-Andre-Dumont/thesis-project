@@ -1,7 +1,9 @@
+import cv2
 import numpy as np
 import torch
 
 from src.utils.compute_iou import compute_iou
+from src.utils.load_bboxes import convert_bbox
 from src.modules.samara_hiera_model import SamaraHieraModel
 
 
@@ -24,6 +26,32 @@ def _post_occlusion_coverage(iou_scores, occlusions, threshold):
         return 0.0
     post = visible[visible > occluded[0]]
     return (iou_scores[post] > threshold).mean() if len(post) else 0.0
+
+
+@torch.inference_mode()
+def mask_iou_scores(model, frames, predicted_masks, gt_bboxes, occlusions, chunk=4):
+    """Per-frame mask IoU of the predicted mask vs a pseudo-GT mask (SAM box-prompted on the full
+    frame with the GT box). The image encoder is run in batches; the box prompt is per frame.
+    Occluded / boxless frames score zero."""
+
+    out = np.zeros(len(frames), dtype=np.float32)
+    prepared = [model.image_encoder.prepare_image(cv2.cvtColor(f, cv2.COLOR_RGB2BGR), 1024, True) for f in frames]
+    for start in range(0, len(frames), chunk):
+        feats = model.image_encoder(torch.cat(prepared[start:start + chunk], dim=0))
+        for i in range(feats[0].shape[0]):
+            t = start + i
+            if occlusions[t] > 0.5 or float(gt_bboxes[t][2]) == 0.0:
+                continue
+            single = [f[i:i + 1] for f in feats]
+            mask, _, _ = model.initialize_video_masking(single, convert_bbox(np.asarray(gt_bboxes[t], np.float32)))
+            pseudo_gt = (mask.squeeze() > 0.0).cpu().numpy()
+            predicted = np.asarray(predicted_masks[t]) > 0
+            if predicted.shape != pseudo_gt.shape:
+                predicted = cv2.resize(predicted.astype(np.uint8), pseudo_gt.shape[::-1],
+                                       interpolation=cv2.INTER_NEAREST) > 0
+            union = (predicted | pseudo_gt).sum()
+            out[t] = float((predicted & pseudo_gt).sum() / union) if union > 0 else 0.0
+    return out
 
 
 def _extract_hiera_and_memory(model, cropped_frames, cropped_masks):
@@ -61,28 +89,34 @@ def compute_features(model, foreground, background, anchor_foreground, anchor_ba
 
 def predict_and_filter_trajectory(tracker, detection_data, warmup_count,
                                           coverage_threshold, commit_threshold):
-    """Track the trajectory once, score its masks against ground truth, and apply the coverage filter.
-    Returns the labels, frames and masks to encode, or None when the trajectory is too poor to keep."""
+    """Track the trajectory once, label its masks with pseudo-GT mask IoU, and apply the coverage
+    filter (on box IoU). Returns the labels, frames and masks to encode, or None when the trajectory
+    is too poor to keep. The stored `iou_scores` is mask IoU (the training label); box IoU is kept
+    for the coverage filter and as `box_iou`."""
 
     predicted_masks = tracker.predict_masks(detection_data).numpy()
-    iou_scores = compute_iou(detection_data.bboxes_norm, predicted_masks)
-    iou_scores[detection_data.occlusions > 0.5] = 0.0
+    box_iou = compute_iou(detection_data.bboxes_norm, predicted_masks)
+    box_iou[detection_data.occlusions > 0.5] = 0.0
+    mask_iou = mask_iou_scores(tracker.model, detection_data.frames, predicted_masks,
+                               detection_data.bboxes_norm, detection_data.occlusions)
 
     predicted_masks = predicted_masks[warmup_count:]
-    iou_scores = iou_scores[warmup_count:]
+    box_iou = box_iou[warmup_count:]
+    mask_iou = mask_iou[warmup_count:]
     occlusions = detection_data.occlusions[warmup_count:]
     bboxes_norm = detection_data.bboxes_norm[warmup_count:]
     frames = detection_data.frames[warmup_count:]
     frame_indices = detection_data.frame_indices[warmup_count:]
     tracker_iou_scores = tracker.iou_scores.numpy()[warmup_count:]
 
-    coverage = _post_occlusion_coverage(iou_scores, occlusions, commit_threshold)
+    coverage = _post_occlusion_coverage(box_iou, occlusions, commit_threshold)
     if coverage < coverage_threshold:
         return None
 
     metadata_kwargs = {
         "frame_indices": frame_indices.astype(np.int64),
-        "iou_scores":    iou_scores.astype(np.float32),
+        "iou_scores":    mask_iou.astype(np.float32),          # training label = pseudo-GT mask IoU
+        "box_iou":       box_iou.astype(np.float32),           # kept for tracking-eval reference
         "occlusions":    occlusions.astype(np.float32),
         "predicted_iou": tracker_iou_scores.astype(np.float32),
         "true_bboxes":   bboxes_norm.astype(np.float32),

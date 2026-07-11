@@ -26,7 +26,6 @@ class DetectionData:
     video_directory: str | None = None
 
     num_threads: int | None = None
-    resize_resolution: int | None = None
     load_frames: bool | None = None
 
     occlusions: NDArray[np.float32] | None = None

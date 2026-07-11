@@ -1,3 +1,4 @@
+import cv2
 import torch
 import numpy as np
 
@@ -6,14 +7,19 @@ from src.typing.detection_data import DetectionData
 from src.modules.memories.main_memory import MainMemory
 from src.modules.samara_hiera_model import SamaraHieraModel
 from src.utils.compute_iou import compute_iou
+from src.utils.load_bboxes import convert_bbox
 
 @dataclass
 class MemoryOracle:
-    """VOS with SAM 2 where the oracle updates the memory during the whole sequence."""
+    """VOS with SAM 2 where the oracle updates the memory during the whole sequence.
+
+    The commit gate uses box IoU (mask bbox vs GT box) by default; set `use_mask_iou` to gate on
+    mask IoU against a pseudo-GT mask (SAM box-prompted on the GT box) instead."""
 
     iou_threshold: float | None = None
     model: SamaraHieraModel | None = None
     main_memory: MainMemory | None = None
+    use_mask_iou: bool = False
 
     def __post_init__(self):
         """Load and initialize the SAM 2 model with quantization."""
@@ -32,22 +38,49 @@ class MemoryOracle:
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)
         self.object_scores = torch.zeros(n_frames, dtype=torch.float64)
         self.iou_scores = torch.zeros(n_frames, dtype=torch.float64)
+        self.iou_tokens = []
 
         for current_idx, current_frame in enumerate(detection_data.frames):
-            chosen_mask, pointer, encoding, object_score, iou_score, _, _ = self.model.select_best_mask(
+            chosen_mask, pointer, encoding, object_score, iou_score, iou_token_out, _ = self.model.select_best_mask(
                 main_memory=self.main_memory,
                 current_frame=current_frame)
 
             self.predicted_masks[current_idx] = chosen_mask
             self.iou_scores[current_idx] = iou_score
             self.object_scores[current_idx] = object_score
+            self.iou_tokens.append(iou_token_out.reshape(-1).float().cpu().numpy())
 
             bboxes_norm = detection_data.bboxes_norm[current_idx]
-            chosen_true_iou = compute_iou(bboxes_norm[None, :], chosen_mask[None, :].numpy())
+            quality = self._commit_quality(current_frame, bboxes_norm, chosen_mask)
 
-            if chosen_true_iou > self.iou_threshold and detection_data.occlusions[current_idx] < 0.05:
+            if quality > self.iou_threshold and detection_data.occlusions[current_idx] < 0.05:
                 self.main_memory.update_memory(pointer, encoding)
 
+        self.iou_tokens = np.stack(self.iou_tokens)
         return self.predicted_masks
+
+    def _commit_quality(self, frame, gt_xywh_norm, chosen_mask):
+        """Mask quality used to gate a memory commit: box IoU by default, else mask IoU vs the
+        pseudo-GT mask (SAM box-prompted on the GT box)."""
+
+        if not self.use_mask_iou:
+            return float(compute_iou(gt_xywh_norm[None, :], chosen_mask[None, :].numpy())[0])
+
+        pseudo_gt = self._pseudo_gt_mask(frame, gt_xywh_norm)
+        if pseudo_gt is None:
+            return 0.0
+        predicted, target = chosen_mask.numpy() > 0, pseudo_gt > 0
+        union = (predicted | target).sum()
+        return float((predicted & target).sum() / union) if union > 0 else 0.0
+
+    def _pseudo_gt_mask(self, frame, gt_xywh_norm):
+        """Box-prompt SAM on the whole frame with the GT box to get a pseudo-GT mask (or None)."""
+
+        if float(gt_xywh_norm[2]) == 0.0:
+            return None
+        box_tlbr = convert_bbox(np.asarray(gt_xywh_norm, dtype=np.float32))
+        encoded, _, _ = self.model.encode_image(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        mask, _, _ = self.model.initialize_video_masking(encoded, box_tlbr)
+        return (mask.squeeze() > 0.0).to(torch.float64).cpu().numpy()
 
     

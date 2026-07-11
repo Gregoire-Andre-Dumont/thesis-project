@@ -98,14 +98,15 @@ def save_encoder_features(dataset_path, stem, video_name, person_id, metadata_kw
     for encoder_name, variants in features_by_encoder.items():
         for variant_name, features in variants.items():
             output_path = variant_path(dataset_path, encoder_name, variant_name, stem)
+            if output_path.exists():
+                continue
             output_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with open(output_path, "wb") as handle:
-                pickle.dump(DatasetExperiment(
-                    video_name=video_name, 
-                    person_id=person_id,
-                    features=features, 
-                    **metadata_kwargs), handle)
+            dataset = DatasetExperiment(
+                video_name=video_name, 
+                person_id=person_id,
+                features=features, 
+                **metadata_kwargs)
+            output_path.write_bytes(pickle.dumps(dataset))
 
 
 @hydra.main(config_path="conf", config_name="create_anchor_dataset", version_base=None)
@@ -131,8 +132,7 @@ def create_anchor_dataset(config: DictConfig):
         if result is not None:
             metadata_kwargs, frames, predicted_masks = result
             features_by_encoder = encode_with_encoders(encoder_models, frames, predicted_masks)
-            save_encoder_features(dataset_path, stem, video_name, person_id,
-                                  metadata_kwargs, features_by_encoder)
+            save_encoder_features(dataset_path, stem, video_name, person_id, metadata_kwargs, features_by_encoder)
 
 
 if __name__ == "__main__":

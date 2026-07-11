@@ -15,8 +15,10 @@ class DatasetExperiment:
     # Original video frame indices for each saved frame — lets experiments reload
     frame_indices: npt.NDArray[np.int64] | None = None
 
-    # Per-frame labels / SAM 2 outputs.
+    # Per-frame labels / SAM 2 outputs. `iou_scores` is the training label (pseudo-GT mask IoU);
+    # `box_iou` is kept for tracking-eval reference.
     iou_scores: npt.NDArray[np.float32] | None = None
+    box_iou: npt.NDArray[np.float32] | None = None
     occlusions: npt.NDArray[np.float32] | None = None
     predicted_iou: npt.NDArray[np.float32] | None = None
     true_bboxes: npt.NDArray[np.float32] | None = None
