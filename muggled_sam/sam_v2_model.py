@@ -370,7 +370,7 @@ class SAMV2Model(nn.Module):
                 object_score = object_score,
                 lowres_image_encoding = lowres_imgenc)
 
-        chosen_mask = (chosen_mask > 0.0).squeeze().to(torch.float64).cpu()
+        chosen_mask = chosen_mask.squeeze().to(torch.float64).cpu()      # logits; thresholded (>0) downstream
         iou_score = iou_scores.max(1).values.squeeze().to(torch.float64).cpu()
         object_score = torch.sigmoid(object_score.squeeze().to(torch.float64).cpu())
 

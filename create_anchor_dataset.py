@@ -54,7 +54,6 @@ def slice_detection_data_for_tracker(detection_data, anchor_index):
     start = anchor_index - warmup_count
     detection_data.frames = detection_data.frames[start:]
     detection_data.bboxes_norm = detection_data.bboxes_norm[start:]
-    detection_data.amodal_norm = detection_data.amodal_norm[start:]
     detection_data.occlusions = detection_data.occlusions[start:]
     detection_data.frame_indices = detection_data.frame_indices[start:]
     return warmup_count

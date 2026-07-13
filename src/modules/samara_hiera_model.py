@@ -37,7 +37,7 @@ class SamaraHieraModel(SAMV2Model):
         self.crop_resize = crop_resize
         self.pad_ratio = pad_ratio
         self.token_source = token_source
-        self.anchor_amodal_pixels = 0
+        self.anchor_size_pixels = 0
         self.eval()
 
     # -------------------------------------------------------------------------------
@@ -48,7 +48,7 @@ class SamaraHieraModel(SAMV2Model):
         """Crop each candidate mask and build its anchor-similarity features.
         Returns the calibrator's IoU predictions plus the tokens and features."""
 
-        candidate_masks = (candidate_masks_raw > 0.0).to(torch.float64).cpu().numpy()
+        candidate_masks = candidate_masks_raw.to(torch.float64).cpu().numpy()   # keep logits; extract_crops thresholds
         frames = np.repeat(np.asarray(current_frame)[None], len(candidate_masks), axis=0)
 
         cropped_frames, cropped_masks = self.extract_crops(frames, candidate_masks)
@@ -97,15 +97,20 @@ class SamaraHieraModel(SAMV2Model):
 
     def extract_crops(self, frames: NDArray[np.uint8], masks: NDArray[np.uint8]):
         """Crop each frame to a square window around its mask, padded by pad_ratio and
-        resized to crop_resize. Frames whose mask is empty are returned as zeros."""
+        resized to crop_resize. Frames whose mask is empty are returned as zeros.
+
+        The mask arrives as continuous SAM logits: every resize is bilinear and the binary
+        threshold (logit > 0) is applied AFTER rescaling, so the crop mask keeps a smooth
+        boundary instead of the blocky staircase of a threshold-then-nearest-resize."""
 
         crop_size = self.crop_resize
         cropped_frames = np.zeros((masks.shape[0], crop_size, crop_size, 3), dtype=np.float32)
         cropped_masks = np.zeros((masks.shape[0], crop_size, crop_size), dtype=np.float32)
 
         for index, (frame, mask) in enumerate(zip(frames, masks)):
-            mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-            coordinates = cv2.findNonZero(mask.astype(np.uint8))
+            mask = cv2.resize(mask.astype(np.float32), (frame.shape[1], frame.shape[0]),
+                              interpolation=cv2.INTER_LINEAR)
+            coordinates = cv2.findNonZero((mask > 0.0).astype(np.uint8))
             if coordinates is None:
                 continue
 
@@ -115,25 +120,27 @@ class SamaraHieraModel(SAMV2Model):
             crop_frame = frame[y_min:y_max, x_min:x_max]
             crop_mask = mask[y_min:y_max, x_min:x_max]
             cropped_frames[index] = cv2.resize(crop_frame, (crop_size, crop_size), interpolation=cv2.INTER_CUBIC)
-            cropped_masks[index] = cv2.resize(crop_mask, (crop_size, crop_size), interpolation=cv2.INTER_NEAREST)
+            crop_mask = cv2.resize(crop_mask, (crop_size, crop_size), interpolation=cv2.INTER_CUBIC)
+            cropped_masks[index] = (crop_mask > 0.0).astype(np.float32)      # threshold AFTER rescaling
 
         return cropped_frames, cropped_masks
 
-    def set_anchor_amodal_from_normalized(self, amodal_bbox_norm, frame_shape):
-        """Store the anchor's amodal size in pixels, used as a floor for later crop windows.
+    def set_anchor_size_from_normalized(self, anchor_bbox_norm, frame_shape):
+        """Store the anchor's (visible) box size in pixels, used as a floor for later crop
+        windows so a crop doesn't collapse when the mask shrinks under partial occlusion.
         Pass a zero box to disable it and fall back to mask-derived crop sizing."""
 
         frame_height, frame_width = frame_shape
-        amodal_width_pixels = amodal_bbox_norm[2] * frame_width
-        amodal_height_pixels = amodal_bbox_norm[3] * frame_height
-        self.anchor_amodal_pixels = int(round(max(amodal_width_pixels, amodal_height_pixels)))
+        width_pixels = anchor_bbox_norm[2] * frame_width
+        height_pixels = anchor_bbox_norm[3] * frame_height
+        self.anchor_size_pixels = int(round(max(width_pixels, height_pixels)))
 
     def _padding_ratio_window(self, x, y, width, height, frame_shape):
         """Compute the square crop box centered on the mask, sized by the mask and the
-        anchor amodal extent and clamped to fit inside the frame."""
+        anchor's (visible) size floor and clamped to fit inside the frame."""
 
         frame_height, frame_width = frame_shape
-        base_side = max(width, height, 1, self.anchor_amodal_pixels)
+        base_side = max(width, height, 1, self.anchor_size_pixels)
         crop_side = min(int(round(base_side * (1 + 2 * self.pad_ratio))), frame_width, frame_height)
 
         half = crop_side / 2
@@ -247,7 +254,6 @@ class SamaraHieraModel(SAMV2Model):
             if all_ref_invalid.any():
                 vectors_chunk[all_ref_invalid] = 0.0
             vectors_chunk = vectors_chunk * target_valid[None, :, :].to(vectors_chunk.dtype)
-
             chunks.append(vectors_chunk)
 
         return torch.cat(chunks, dim=1).float().cpu().numpy().transpose(1, 0, 2)

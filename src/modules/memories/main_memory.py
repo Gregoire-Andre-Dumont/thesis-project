@@ -66,7 +66,7 @@ class MainMemory:
 
         reference = detection_data.frames[anchor_index]
         bbox_norm = convert_bbox(detection_data.bboxes_norm[anchor_index])
-        model.set_anchor_amodal_from_normalized(detection_data.amodal_norm[anchor_index], reference.shape[:2])
+        model.set_anchor_size_from_normalized(detection_data.bboxes_norm[anchor_index], reference.shape[:2])
 
         bgr_reference = cv2.cvtColor(reference, cv2.COLOR_RGB2BGR)
         init_encoded, _, _ = model.encode_image(bgr_reference)
@@ -79,7 +79,7 @@ class MainMemory:
         """Seed the calibrator anchor from SAM 2's initialization mask."""
 
         frame = detection_data.frames[anchor_index]
-        mask = (init_mask > 0.0).to(torch.float64).cpu().numpy().squeeze()
+        mask = init_mask.to(torch.float64).cpu().numpy().squeeze()      # keep logits; extract_crops thresholds
 
         foreground, background = model.extract_patch_tokens(
             *model.extract_crops(frame[np.newaxis], mask[np.newaxis]))
