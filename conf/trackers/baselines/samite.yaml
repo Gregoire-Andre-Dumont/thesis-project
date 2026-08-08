@@ -1,10 +1,10 @@
 tracker:
   _target_: src.modules.baselines.samite.Samite
-  checkpoint: tm/sam_tiny.pt
-  model_config: SAM2/samite_hiera_tiny.yaml
+  checkpoint: tm/sam_base_plus.pt
+  model_config: SAM2/samite_hiera_base_plus.yaml
 
 experiment:
   _target_: src.experiments.tracking_experiment.TrackingExperiment
   resolution: 1024
-  experiment_name: samite_tiny
-  video_path: data/visualize/samite_tiny
+  experiment_name: samite
+  video_path: data/visualize/samite

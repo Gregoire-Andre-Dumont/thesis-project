@@ -45,12 +45,14 @@ def _nearest_index(sorted_values: np.ndarray, target: int) -> int:
 
 
 def _anchor_video_frame(amodal: list[dict], visible: list[dict], boxes_by_frame: dict, person_id: int,
-                        min_visible_ratio: float, min_area: float, max_overlap: float):
-    """First visible frame that makes a clean reference: box of at least `min_area` pixels, covering
+                        min_visible_ratio: float, min_area: float, max_overlap: float,
+                        min_overlap: float = 0.0, max_area: float = float("inf")):
+    """First visible frame that makes a clean reference: box of between `min_area` and `max_area` pixels, covering
     at least `min_visible_ratio` of the nearest amodal box on BOTH sides (width and height), and with
-    no other person's box covering more than `max_overlap` of it — so the box prompt is unambiguous.
-    Requiring each side rather than area stops a target occluded along one dimension from qualifying
-    by being oversized on the other. `None` if no frame qualifies."""
+    the closest other person's box covering between `min_overlap` and `max_overlap` of it. The upper
+    bound keeps the box prompt unambiguous; the lower bound (default 0) can instead REQUIRE a nearby
+    distractor, to study the confident-drift regime. Requiring each side rather than area stops a target
+    occluded along one dimension from qualifying by being oversized on the other. `None` if none qualify."""
 
     if not amodal or not visible:
         return None
@@ -64,15 +66,17 @@ def _anchor_video_frame(amodal: list[dict], visible: list[dict], boxes_by_frame:
     for entity in sorted(visible, key=frame_of):
         frame = int(frame_of(entity))
         visible_wh = np.array(entity["bb"][2:4], dtype=np.float64)
-        if frame in occluded or np.any(visible_wh <= 0) or np.prod(visible_wh) < min_area:
+        if frame in occluded or np.any(visible_wh <= 0) or not (min_area <= np.prod(visible_wh) <= max_area):
             continue
         amodal_wh_here = amodal_wh[_nearest_index(amodal_frames, frame)]
         if np.any(amodal_wh_here <= 0):
             continue
         if not np.all(visible_wh / amodal_wh_here >= min_visible_ratio):
             continue
-        if any(_covered_fraction(entity["bb"], other) > max_overlap
-               for other_id, other in boxes_by_frame.get(frame, []) if other_id != person_id):
+        covers = [_covered_fraction(entity["bb"], other)
+                  for other_id, other in boxes_by_frame.get(frame, []) if other_id != person_id]
+        closest = max(covers) if covers else 0.0
+        if closest > max_overlap or closest < min_overlap:
             continue
         return frame
     return None
@@ -94,8 +98,10 @@ class PersonPath:
     n_experiments: int | None = None
     min_visible_ratio: float = 0.9
     resize_resolution: int = 1024          # working resolution the min-area threshold is measured at
-    min_visible_area: float = 0.0          # min anchor box area in px² at `resize_resolution` (COCO small = 32²)
-    max_distractor_overlap: float = 1.0    # max fraction of the anchor box another person may cover
+    min_visible_area: float = 1024         # min anchor box area in px² at `resize_resolution` (COCO small = 32²)
+    max_visible_area: float | None = None  # max anchor box area in px² at `resize_resolution` (None = no upper cap)
+    max_distractor_overlap: float = 0.5    # max fraction of the anchor box another person may cover
+    min_distractor_overlap: float = 0.0    # min such fraction — require a nearby distractor at the anchor
 
     # Chosen targets
     total_experiments: int | None = None
@@ -144,7 +150,8 @@ class PersonPath:
 
             resolution = visible_json["metadata"]["resolution"]
             scale = self.resize_resolution / max(resolution["width"], resolution["height"])
-            min_area = self.min_visible_area / scale ** 2      # threshold back in raw annotation pixels
+            min_area = self.min_visible_area / scale ** 2      # thresholds back in raw annotation pixels
+            max_area = self.max_visible_area / scale ** 2 if self.max_visible_area else float("inf")
 
             boxes_by_frame = {}                                # every annotated box, to spot distractors
             for entity in visible:
@@ -154,7 +161,8 @@ class PersonPath:
             for person_id in list(amodal_ids & visible_ids):
                 entities = (amodal_by_id.get(person_id, []), visible_by_id.get(person_id, []))
                 anchor = _anchor_video_frame(*entities, boxes_by_frame, person_id, self.min_visible_ratio,
-                                             min_area, self.max_distractor_overlap)
+                                             min_area, self.max_distractor_overlap,
+                                             self.min_distractor_overlap, max_area)
                 if anchor is None:
                     continue
                 # Occlusion conditions apply to the tracked segment, which starts at the anchor.

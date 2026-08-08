@@ -1,5 +1,5 @@
 defaults:
-  - trackers@oracle: memory_oracle
+  - trackers@tracker: baselines/memory_oracle
 
 detection_data:
   _target_: src.typing.detection_data.DetectionData
@@ -12,14 +12,16 @@ detection_data:
 person_path:
   _target_: src.typing.person_path.PersonPath
   main_directory: data/person_path
-  occlusion_ranges: [2, 75]
+  occlusion_ranges: [2, 150]
   n_experiments: 1200
-  n_after_occlusion: 25
+  n_after_occlusion: 50
   random_seed: 44
-  min_visible_ratio: 0.80
+  min_visible_ratio: 0.7
   resize_resolution: 1024
-  min_visible_area: 1764
-  max_distractor_overlap: 0.25 
+  min_visible_area: 400
+  max_visible_area: null
+  max_distractor_overlap: 0.70
+  min_distractor_overlap: 0.00
   non_targets:
     - "crowd"
     - "person_in_vehicle"
@@ -28,17 +30,12 @@ person_path:
     - "severly_occluded_person"
 
 dataset_path: data/memory_oracle
-shard_index: 2
-num_shards: 3
+shard_index: 0
+num_shards: 1
 
 crop_resize: 512
 pad_ratio: 0.25
-encoders:
-  tiny: tm/sam_tiny.pt
-  small: tm/sam_small.pt
-  base_plus: tm/sam_base_plus.pt
-  large: tm/sam_large.pt
 
 commit_threshold: 0.4
 random_seed: 42
-coverage_threshold: 0.05
+coverage_threshold: 0.00

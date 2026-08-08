@@ -97,8 +97,13 @@ def predict_and_filter_trajectory(tracker, detection_data, warmup_count,
     predicted_masks = tracker.predict_masks(detection_data).numpy()
     box_iou = compute_iou(detection_data.bboxes_norm, predicted_masks)
     box_iou[detection_data.occlusions > 0.5] = 0.0
-    mask_iou = mask_iou_scores(tracker.model, detection_data.frames, predicted_masks,
-                               detection_data.bboxes_norm, detection_data.occlusions)
+    # The oracle labels each frame with pseudo-GT mask IoU inline, reusing the image encoding it already
+    # computed while tracking (see MemoryOracle.predict_masks); fall back to a re-encoding pass otherwise.
+    if getattr(tracker, "mask_iou_scores", None) is not None:
+        mask_iou = tracker.mask_iou_scores.numpy()
+    else:
+        mask_iou = mask_iou_scores(tracker.model, detection_data.frames, predicted_masks,
+                                   detection_data.bboxes_norm, detection_data.occlusions)
 
     predicted_masks = predicted_masks[warmup_count:]
     box_iou = box_iou[warmup_count:]

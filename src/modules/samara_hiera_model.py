@@ -20,6 +20,7 @@ class SamaraHieraModel(SAMV2Model):
         crop_resize: int | None = None,
         pad_ratio: float = 0.25,
         token_source: str = "hiera",
+        feature_encoder: str | None = None,
     ):
         if token_source not in {"hiera", "memory"}:
             raise ValueError(f"token_source must be 'hiera' or 'memory', got {token_source!r}")
@@ -38,6 +39,17 @@ class SamaraHieraModel(SAMV2Model):
         self.pad_ratio = pad_ratio
         self.token_source = token_source
         self.anchor_size_pixels = 0
+
+        # Calibrator features come from an external ~80M backbone (perception/dino/hiera_sam/hiera_mae)
+        # when `feature_encoder` is set, so deployment matches the dataset the controller trained on.
+        # SAM's own Hiera still drives tracking/mask selection. None -> use SAM Hiera/memory tokens.
+        self.feature_encoder = feature_encoder
+        self._feature_token_fn = None
+        if feature_encoder is not None:
+            from src.offline_training.dataset_encoders import load_dataset_encoders
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+            self._feature_token_fn = load_dataset_encoders([feature_encoder], device, dtype)[feature_encoder]
         self.eval()
 
     # -------------------------------------------------------------------------------
@@ -75,7 +87,7 @@ class SamaraHieraModel(SAMV2Model):
         """Pick SAM 2's highest-IoU candidate and score it with the calibrator for the
         memory-commit gate. Selection is plain SAM argmax, with no SAMARA re-ranking."""
 
-        chosen_mask, chosen_pointer, chosen_encoding, object_score, iou_score, _, _ = self.select_best_mask(
+        chosen_mask, chosen_pointer, chosen_encoding, object_score, iou_score, _, _, _ = self.select_best_mask(
             current_frame, main_memory)
         samara_ious, foreground, background, calibrator_features = self._score_masks(
             current_frame, chosen_mask[None], reference_foreground, reference_background)
@@ -221,8 +233,15 @@ class SamaraHieraModel(SAMV2Model):
         return foreground, background
 
     def extract_patch_tokens(self, cropped_frames, cropped_masks, encoder_chunk_size=16):
-        """Extract patch tokens with the Hiera or memory encoder depending on token_source.
-        Returns the foreground and background token views for the crops."""
+        """Extract the calibrator's patch tokens for the crops and return their foreground/background
+        views. Uses the external ~80M `feature_encoder` (32x32 grid) when set -- the same tokens the
+        dataset was built with -- otherwise SAM's Hiera or memory encoder per `token_source`."""
+
+        if self._feature_token_fn is not None:
+            from src.offline_training.dataset_encoders import encode_tokens, _patch_masks
+            tokens = encode_tokens(self._feature_token_fn, np.asarray(cropped_frames), encoder_chunk_size)
+            patch_masks = _patch_masks(np.asarray(cropped_masks, dtype=np.float32), tokens.device)
+            return self.split_foreground_background(tokens, patch_masks)
 
         if self.token_source == "memory":
             patch_tokens, patch_masks = self.extract_memory_patch_tokens(cropped_frames, cropped_masks)

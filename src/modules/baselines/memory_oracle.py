@@ -38,21 +38,40 @@ class MemoryOracle:
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)
         self.object_scores = torch.zeros(n_frames, dtype=torch.float64)
         self.iou_scores = torch.zeros(n_frames, dtype=torch.float64)
+        self.mask_iou_scores = torch.zeros(n_frames, dtype=torch.float64)   # pseudo-GT mask IoU = label
         self.iou_tokens = []
 
+        # Optional per-frame embedding cache: the full-frame image encoding is target- and
+        # tracker-independent, so a second tracker over the same frames can reuse it instead of
+        # re-encoding. Populated on the first pass, read on later ones. Keyed by loop index.
+        cache = getattr(self, "frame_cache", None)
+
         for current_idx, current_frame in enumerate(detection_data.frames):
-            chosen_mask, pointer, encoding, object_score, iou_score, iou_token_out, _ = self.model.select_best_mask(
+            reuse = [e.to(self.device) for e in cache[current_idx]] \
+                if cache is not None and current_idx in cache else None
+            (chosen_mask, pointer, encoding, object_score, iou_score,
+             iou_token_out, _, image_features) = self.model.select_best_mask(
                 main_memory=self.main_memory,
-                current_frame=current_frame)
+                current_frame=current_frame,
+                encoded_image_features_list=reuse)
+            if cache is not None and current_idx not in cache:
+                cache[current_idx] = [e.detach().cpu() for e in image_features]
 
             self.predicted_masks[current_idx] = chosen_mask
             self.iou_scores[current_idx] = iou_score
             self.object_scores[current_idx] = object_score
             self.iou_tokens.append(iou_token_out.reshape(-1).float().cpu().numpy())
 
+            # Label the frame with pseudo-GT mask IoU, reusing the image encoding the tracker just
+            # computed instead of re-encoding the frame (occluded / boxless frames stay 0).
             bboxes_norm = detection_data.bboxes_norm[current_idx]
-            quality = self._commit_quality(current_frame, bboxes_norm, chosen_mask)
+            if detection_data.occlusions[current_idx] <= 0.5 and float(bboxes_norm[2]) != 0.0:
+                self.mask_iou_scores[current_idx] = self._mask_iou(bboxes_norm, chosen_mask, image_features)
 
+            # Commit gate. With use_mask_iou, reuse the pseudo-GT mask IoU just computed above (no second
+            # encode); otherwise fall back to box IoU. Occluded/boxless frames left it at 0 -> never commit.
+            quality = (float(self.mask_iou_scores[current_idx]) if self.use_mask_iou
+                       else self._commit_quality(current_frame, bboxes_norm, chosen_mask))
             if quality > self.iou_threshold and detection_data.occlusions[current_idx] < 0.05:
                 self.main_memory.update_memory(pointer, encoding)
 
@@ -70,6 +89,16 @@ class MemoryOracle:
         if pseudo_gt is None:
             return 0.0
         predicted, target = chosen_mask.numpy() > 0, pseudo_gt > 0
+        union = (predicted | target).sum()
+        return float((predicted & target).sum() / union) if union > 0 else 0.0
+
+    def _mask_iou(self, gt_xywh_norm, chosen_mask, image_features):
+        """Pseudo-GT mask IoU, reusing the image encoding from tracking (no re-encode)."""
+
+        box_tlbr = convert_bbox(np.asarray(gt_xywh_norm, dtype=np.float32))
+        mask, _, _ = self.model.initialize_video_masking(image_features, box_tlbr)
+        target = (mask.squeeze() > 0.0).cpu().numpy()
+        predicted = chosen_mask.numpy() > 0
         union = (predicted | target).sum()
         return float((predicted & target).sum() / union) if union > 0 else 0.0
 

@@ -1,6 +1,6 @@
 defaults:
   - offline_trainers: experiment_2/cnn_fixed_samara_large
-  - trackers@tracker: memory_oracle
+  - trackers@tracker: baselines/memory_oracle
   
 detection_data:
   _target_: src.typing.detection_data.DetectionData

@@ -11,17 +11,19 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from src.experiments.dataset_experiment import DatasetExperiment
-from src.offline_training.references import (
-    VARIANTS,
-    encode_with_encoders,
-    load_encoder_models,
-    predict_and_filter_trajectory,
-)
+from src.utils.compute_iou import compute_iou
+from src.offline_training.references import _post_occlusion_coverage
+from src.offline_training.dataset_encoders import (
+    load_dataset_encoders, crop_around_masks, encode_trajectory, anchor_size_pixels)
+from src.offline_training.dataset_labels import load_clean_boxes_by_frame, pseudo_iou_labels
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["HYDRA_FULL_ERROR"] = "1"
+
+# The four ~80M backbones the calibrator dataset is built for (one token set each, no variants).
+ENCODER_NAMES = ("perception", "dino", "hiera_sam", "hiera_mae")
 
 
 def shard_by_video(person_path, shard_index, num_shards):
@@ -59,79 +61,107 @@ def slice_detection_data_for_tracker(detection_data, anchor_index):
     return warmup_count
 
 
-def variant_path(dataset_path, encoder_name, variant_name, stem):
-    """Build the output file path for one encoder and variant of a trajectory.
-    The folder name is the dataset name with the encoder appended."""
+def encoder_path(dataset_path, encoder_name, stem):
+    """Output file path for one encoder's features of a trajectory: <dataset_path>/<encoder>/<stem>.pkl."""
 
-    return Path(f"{dataset_path}_{encoder_name}") / variant_name / f"{stem}.pkl"
-
-
-def trajectory_is_complete(dataset_path, encoders, stem):
-    """Check whether every encoder and variant file for this trajectory already exists.
-    Used to skip trajectories that were fully written on a previous run."""
-
-    return all(variant_path(dataset_path, encoder, variant, stem).exists()
-               for encoder in encoders for variant in VARIANTS)
+    return Path(dataset_path) / encoder_name / f"{stem}.pkl"
 
 
-def track_trajectory(tracker, detection_data, video_name, person_id, anchor_video_frame, config):
-    """Initialize the target, find its anchor, and run the oracle tracker once.
-    Returns the tracking result, or None when the trajectory has no anchor or fails the filter."""
+def trajectory_is_complete(dataset_path, stem):
+    """True when every encoder file for this trajectory already exists (skip on resume)."""
+
+    return all(encoder_path(dataset_path, name, stem).exists() for name in ENCODER_NAMES)
+
+
+def process_trajectory(tracker, label_model, encoders, detection_data, video_name, person_id,
+                       anchor_video_frame, visible_directory, config):
+    """Track the trajectory once, then per frame build the four encoders' anchor-similarity maps and
+    the target + 3-nearest-distractor pseudo-IoU labels. Returns (metadata, features_by_encoder) or
+    None when the anchor is missing or the trajectory fails the coverage filter."""
 
     detection_data.initialize_target(video_name, person_id)
     anchor_index = anchor_trajectory_index(detection_data, anchor_video_frame)
     if anchor_index is None:
         return None
+    warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
 
-    warmup_count = slice_detection_data_for_tracker(detection_data, anchor_index)
-    return predict_and_filter_trajectory(
-        tracker, detection_data, warmup_count,
-        coverage_threshold=config.coverage_threshold,
-        commit_threshold=config.commit_threshold)
+    predicted_masks = tracker.predict_masks(detection_data).numpy()
+    box_iou = compute_iou(detection_data.bboxes_norm, predicted_masks)
+    box_iou[detection_data.occlusions > 0.5] = 0.0
+    predicted_iou = tracker.iou_scores.numpy()
+
+    keep = slice(warmup, None)
+    predicted_masks = predicted_masks[keep]
+    frames = detection_data.frames[keep]
+    occlusions = detection_data.occlusions[keep]
+    bboxes = detection_data.bboxes_norm[keep]
+    frame_indices = detection_data.frame_indices[keep]
+    box_iou = box_iou[keep]
+    predicted_iou = predicted_iou[keep]
+
+    if _post_occlusion_coverage(box_iou, occlusions, config.commit_threshold) < config.coverage_threshold:
+        return None
+
+    # Labels: proposal-mask pseudo-IoU vs the target and its 3 nearest clean distractors (box-prompted).
+    clean_boxes = load_clean_boxes_by_frame(Path(visible_directory) / f"{video_name}.json", person_id)
+    target_iou, distractor_iou = pseudo_iou_labels(
+        label_model, frames, predicted_masks, bboxes, clean_boxes, frame_indices, occlusions)
+
+    # Features: crop once around each proposal (floored at the anchor box size, matching deployment),
+    # then re-encode with every backbone at the shared 32x32 grid. frames[0]/bboxes[0] are the anchor.
+    size_floor = anchor_size_pixels(bboxes[0], frames[0].shape)
+    crop_frames, crop_masks = crop_around_masks(
+        frames, predicted_masks, config.crop_resize, config.pad_ratio, size_floor)
+    features_by_encoder = encode_trajectory(encoders, crop_frames, crop_masks)
+
+    metadata = {
+        "frame_indices": frame_indices.astype(np.int64),
+        "iou_scores":    target_iou.astype(np.float32),        # target pseudo-GT mask IoU (main label)
+        "distractor_iou": distractor_iou.astype(np.float32),   # (n, 3) nearest-distractor pseudo IoU
+        "box_iou":       box_iou.astype(np.float32),
+        "occlusions":    occlusions.astype(np.float32),
+        "predicted_iou": predicted_iou.astype(np.float32),
+        "true_bboxes":   bboxes.astype(np.float32),
+    }
+    return metadata, features_by_encoder
 
 
-def save_encoder_features(dataset_path, stem, video_name, person_id, metadata_kwargs, features_by_encoder):
-    """Write each encoder and variant feature set to disk.
-    Files that already exist are left untouched."""
+def save_encoder_features(dataset_path, stem, video_name, person_id, metadata, features_by_encoder):
+    """Write one DatasetExperiment per encoder; existing files are left untouched."""
 
-    for encoder_name, variants in features_by_encoder.items():
-        for variant_name, features in variants.items():
-            output_path = variant_path(dataset_path, encoder_name, variant_name, stem)
-            if output_path.exists():
-                continue
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            dataset = DatasetExperiment(
-                video_name=video_name, 
-                person_id=person_id,
-                features=features, 
-                **metadata_kwargs)
-            output_path.write_bytes(pickle.dumps(dataset))
+    for encoder_name, features in features_by_encoder.items():
+        output_path = encoder_path(dataset_path, encoder_name, stem)
+        if output_path.exists():
+            continue
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        dataset = DatasetExperiment(video_name=video_name, person_id=person_id, features=features, **metadata)
+        output_path.write_bytes(pickle.dumps(dataset))
 
 
 @hydra.main(config_path="conf", config_name="create_anchor_dataset", version_base=None)
 def create_anchor_dataset(config: DictConfig):
-    """Build one calibrator dataset per backbone encoder from a single oracle tracking pass.
-    Each encoder re-encodes the shared masks at the fixed crop size and padding."""
+    """Build one calibrator dataset per backbone from a single tracking pass (oracle or baseline).
+    Each encoder re-encodes the shared proposal masks at the fixed 32x32 grid; labels are the target
+    and 3-nearest-distractor pseudo-IoU, box-prompted with the tracker's SAM model."""
 
     detection_data = hydra.utils.instantiate(config.detection_data)
     person_path = hydra.utils.instantiate(config.person_path)
-    tracker = hydra.utils.instantiate(config.oracle.tracker)
-    encoder_models = load_encoder_models(config.encoders, config.crop_resize, config.pad_ratio)
+    tracker = hydra.utils.instantiate(config.tracker.tracker)
+    encoders = load_dataset_encoders()
 
     dataset_path = config.dataset_path
+    visible_directory = config.detection_data.visible_directory
     _, pairs = shard_by_video(person_path, config.shard_index, config.num_shards)
 
     for video_name, person_id, anchor_video_frame in tqdm(pairs, desc=f"shard {config.shard_index}"):
         stem = f"{video_name}_{person_id}"
-        if trajectory_is_complete(dataset_path, encoder_models, stem):
+        if trajectory_is_complete(dataset_path, stem):
             continue
-
-        # Track ONCE with the oracle, then re-encode the shared masks with every backbone.
-        result = track_trajectory(tracker, detection_data, video_name, person_id, anchor_video_frame, config)
+        result = process_trajectory(tracker, tracker.model, encoders, detection_data,
+                                    video_name, person_id, anchor_video_frame, visible_directory, config)
         if result is not None:
-            metadata_kwargs, frames, predicted_masks = result
-            features_by_encoder = encode_with_encoders(encoder_models, frames, predicted_masks)
-            save_encoder_features(dataset_path, stem, video_name, person_id, metadata_kwargs, features_by_encoder)
+            metadata, features_by_encoder = result
+            save_encoder_features(dataset_path, stem, video_name, person_id, metadata, features_by_encoder)
 
 
 if __name__ == "__main__":
