@@ -1,6 +1,5 @@
 
 import numpy as np
-import ipdb
 
 
 def compute_auc_mask(bboxes_norm, mask_preds, n_thresholds=1000):
