@@ -1,0 +1,335 @@
+"""Long-range re-identification benchmark for frozen image backbones.
+
+Question: as time passes after an anchor frame, how well does each backbone still recognise the
+target person against nearby distractors -- using only foreground patch similarity, no tracker?
+
+Protocol (tracker-free, ground-truth boxes):
+  * Query      -- the target at its anchor frame: SAM box-prompt -> mask -> crop -> foreground tokens.
+  * Gallery    -- at each later visible frame: the target + its N nearest clean distractors, encoded
+                  the same way.
+  * Score      -- foreground chamfer similarity of each candidate's tokens to the query's.
+  * Rank-1     -- the target is the most similar of the (1 + N) candidates.
+  * Long range -- rank-1 is binned by dt = frames elapsed since the anchor.
+
+The result plot is rank-1 accuracy (y) versus temporal bin (x), one line per backbone.
+
+Backbones share a common ~512px input (a 32x32 token grid) so none runs off its native resolution:
+  hiera_mae, hiera_sam (SAM 2), pe_core, pe_spatial   -- base tier, as used by the dataset
+  pe_sam3                                              -- SAM 3's vision encoder (only exists at ~L)
+
+Usage (prepend PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True on a small GPU):
+  python pe_reid_longrange.py                 # full held-out test split
+  python pe_reid_longrange.py +n_traj=60 +stride=2
+"""
+import json
+import logging
+import warnings
+from collections import defaultdict
+from pathlib import Path
+from typing import Callable, NamedTuple
+
+import cv2
+import hydra
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import timm
+import torch
+import torch.nn.functional as F
+from omegaconf import DictConfig, OmegaConf
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+from src.offline_training.dataset_encoders import (
+    load_dataset_encoders, crop_around_masks, anchor_size_pixels, _norm, HALF)
+from src.offline_training.dataset_labels import load_clean_boxes_by_frame
+from src.utils.load_bboxes import convert_bbox
+from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
+
+logging.getLogger("timm").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore")
+
+# --------------------------------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+SAM_BASELINE_CONFIG = "conf/trackers/baselines/sam_baseline.yaml"  # SAM 2 model used as the box->mask prompter
+CROP_SIZE = 512                     # crop resolution fed to every backbone (-> ~32x32 tokens)
+SAM3_INPUT = 448                    # SAM 3's ViT input (patch-14 aligned to a 32x32 grid)
+N_DISTRACTORS = 2                   # gallery = target + this many nearest distractors
+CHANCE = 1.0 / (1 + N_DISTRACTORS)  # rank-1 accuracy of random guessing
+MIN_BIN_SAMPLES = 20                # a temporal bin needs this many samples to be plotted
+
+DT_EDGES = np.arange(0, 301, 30)    # temporal-bin edges, in frames since the anchor
+PLOT_PATH = "data/pe_reid_longrange.png"
+NPY_PATH = "data/pe_reid_longrange.npy"
+COLORS = {"pe_core": "#cc4444", "pe_spatial": "#22aa77", "pe_sam3": "#3377cc",
+          "hiera_mae": "#dd9933", "hiera_sam": "#9944bb"}
+
+TokenFn = Callable[[np.ndarray], torch.Tensor]  # crops (n, H, W, 3) -> patch tokens (n, num_patches, dim)
+
+
+class Trajectory(NamedTuple):
+    video: str
+    person: int
+    anchor_frame: int
+
+
+# --------------------------------------------------------------------------------------------------
+# Trajectory selection
+# --------------------------------------------------------------------------------------------------
+def test_trajectories(person_path, test_size: float = 0.20, seed: int = 42) -> list[Trajectory]:
+    """The held-out test split of the create_anchor selection, reproduced exactly from
+    build_trajectory_split (sorted trajectory stems, sklearn split)."""
+    triples = [Trajectory(v, int(p), int(a)) for v, p, a in zip(
+        person_path.selected_video_names.tolist(),
+        person_path.selected_person_ids.tolist(),
+        person_path.selected_anchor_video_frames.tolist())]
+    order = sorted(range(len(triples)), key=lambda i: f"{triples[i].video}_{triples[i].person}")
+    _, test_idx = train_test_split(np.array(order), test_size=test_size, random_state=seed, shuffle=True)
+    return [triples[i] for i in sorted(test_idx)]
+
+
+# --------------------------------------------------------------------------------------------------
+# Backbones -- each is a TokenFn
+# --------------------------------------------------------------------------------------------------
+def load_sam3_encoder() -> TokenFn | None:
+    """SAM 3's frozen vision encoder as a TokenFn, or None if it can't be fetched.
+
+    Built from the ungated facebook/sam3 config plus the ungated 1038lab/sam3 mirror weights via
+    transformers' Sam3VisionModel, run at SAM3_INPUT (pos-embed / RoPE interpolated to that grid)."""
+    try:
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+        from transformers import Sam3VisionModel, Sam3VisionConfig
+
+        config = json.load(open(hf_hub_download("facebook/sam3", "config.json")))["detector_config"]["vision_config"]
+        model = Sam3VisionModel(Sam3VisionConfig(**{**config, "image_size": SAM3_INPUT}))
+        weights = load_file(hf_hub_download("1038lab/sam3", "sam3.safetensors"))
+        prefix = "detector_model.vision_encoder."
+        model.load_state_dict({k[len(prefix):]: v for k, v in weights.items() if k.startswith(prefix)})
+        model = model.eval().to(DEVICE).to(DTYPE)
+    except Exception as error:
+        print(f"pe_sam3 unavailable ({str(error)[:80]}) -- running without it")
+        return None
+
+    @torch.inference_mode()
+    def tokens(crops: np.ndarray) -> torch.Tensor:
+        output = model(_norm(crops, SAM3_INPUT, HALF, HALF, DEVICE, DTYPE))
+        hidden = output.last_hidden_state if hasattr(output, "last_hidden_state") else output[0]
+        return hidden.float()
+
+    return tokens
+
+
+def load_backbones() -> dict[str, TokenFn]:
+    """The backbones keyed by name. pe_spatial / hiera_* reuse the dataset encoders (32x32 @ 512),
+    pe_core is added here, and pe_sam3 joins when its weights are reachable."""
+    encoders = load_dataset_encoders(["perception", "hiera_sam", "hiera_mae"], DEVICE, DTYPE)  # perception == pe_spatial
+    pe_core = timm.create_model("vit_pe_core_base_patch16_224.fb", pretrained=True,
+                                num_classes=0, img_size=CROP_SIZE).eval().to(DEVICE).to(DTYPE)
+
+    @torch.inference_mode()
+    def pe_core_tokens(crops: np.ndarray) -> torch.Tensor:
+        features = pe_core.forward_features(_norm(crops, CROP_SIZE, HALF, HALF, DEVICE, DTYPE))
+        return features[:, pe_core.num_prefix_tokens:].float()
+
+    backbones = {
+        "pe_core": pe_core_tokens,
+        "pe_spatial": encoders["perception"],
+        "hiera_mae": encoders["hiera_mae"],
+        "hiera_sam": encoders["hiera_sam"],
+    }
+    sam3 = load_sam3_encoder()
+    if sam3 is not None:
+        backbones["pe_sam3"] = sam3
+    return backbones
+
+
+# --------------------------------------------------------------------------------------------------
+# Foreground extraction and similarity
+# --------------------------------------------------------------------------------------------------
+@torch.inference_mode()
+def box_prompt_masks(sam, frame: np.ndarray, boxes: list) -> list[np.ndarray]:
+    """One binary mask per box, prompting SAM with each box after a single frame encode."""
+    image = sam.image_encoder.prepare_image(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), 1024, True)
+    features = sam.image_encoder(image)
+    masks = []
+    for box in boxes:
+        mask, _, _ = sam.initialize_video_masking(features, convert_bbox(np.asarray(box, np.float32)))
+        masks.append((mask.squeeze() > 0.0).cpu().numpy())
+    return masks
+
+
+def _grid_foreground(crop_mask: np.ndarray, grid_side: int) -> torch.Tensor:
+    """Downsample a crop's binary mask to the token grid and flatten it to a per-patch foreground mask."""
+    mask = torch.from_numpy(crop_mask[None, None].astype(np.float32))
+    return (F.interpolate(mask, size=(grid_side, grid_side), mode="nearest") > 0.5).flatten()
+
+
+def foreground_tokens(sam, backbones: dict[str, TokenFn], frame: np.ndarray, boxes: list):
+    """Foreground tokens for several entities in one frame.
+
+    Each box becomes a SAM mask (single frame encode), is cropped around that mask, and is encoded by
+    every backbone in one batched pass. Returns a list aligned to `boxes`, each entry a dict
+    {backbone: (num_foreground_patches, dim)} -- or None if any box yields an empty mask."""
+    masks = box_prompt_masks(sam, frame, boxes)
+    if any(mask.sum() == 0 for mask in masks):
+        return None
+
+    crops, crop_masks = [], []
+    for mask, box in zip(masks, boxes):
+        floor = anchor_size_pixels(box, frame.shape)
+        crop, crop_mask = crop_around_masks(frame[None], mask[None].astype(np.float32), CROP_SIZE, 0.25, floor)
+        crops.append(crop[0])
+        crop_masks.append(crop_mask[0])
+    crops = np.stack(crops)
+
+    entities = [{} for _ in boxes]
+    for name, tokens in backbones.items():
+        patches = tokens(crops)                         # (num_entities, num_patches, dim), one batched pass
+        grid_side = round(patches.shape[1] ** 0.5)
+        for entity, patch_tokens, crop_mask in zip(entities, patches, crop_masks):
+            foreground = _grid_foreground(crop_mask, grid_side).to(patch_tokens.device)
+            entity[name] = patch_tokens[foreground]
+    return entities
+
+
+def chamfer_similarity(query_fg: torch.Tensor, candidate_fg: torch.Tensor) -> float:
+    """Mean best-cosine of each candidate foreground patch to any query foreground patch."""
+    if query_fg.shape[0] == 0 or candidate_fg.shape[0] == 0:
+        return float("nan")
+    query = F.normalize(query_fg, dim=-1)
+    candidate = F.normalize(candidate_fg, dim=-1)
+    return float((candidate @ query.T).max(dim=1).values.mean())
+
+
+# --------------------------------------------------------------------------------------------------
+# Per-trajectory evaluation
+# --------------------------------------------------------------------------------------------------
+def _box_center(box):
+    return box[0] + box[2] / 2, box[1] + box[3] / 2
+
+
+def nearest_distractors(target_box, clean_boxes: list, k: int = N_DISTRACTORS) -> list:
+    """The k clean-person boxes whose centre is closest to the target box centre."""
+    cx, cy = _box_center(target_box)
+    return sorted(clean_boxes, key=lambda b: (_box_center(b)[0] - cx) ** 2 + (_box_center(b)[1] - cy) ** 2)[:k]
+
+
+def rank1_per_backbone(query: dict, candidates: list[dict]) -> dict[str, bool]:
+    """For each backbone, whether the target (candidates[0]) is the most similar candidate to the query.
+    Backbones whose similarities are undefined (empty foreground) are omitted for this frame."""
+    hits = {}
+    for name in query:
+        sims = [chamfer_similarity(query[name], candidate[name]) for candidate in candidates]
+        if not any(np.isnan(sims)):
+            hits[name] = bool(sims[0] > max(sims[1:]))
+    return hits
+
+
+def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, visible_dir, stride):
+    """Yield (backbone, dt, is_rank1) for each visible frame of one trajectory."""
+    detection_data.initialize_target(trajectory.video, trajectory.person)
+    anchor_index = anchor_trajectory_index(detection_data, trajectory.anchor_frame)
+    if anchor_index is None:
+        return
+
+    warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
+    kept = slice(warmup, None)                 # drop the tracker warmup frame; index 0 is now the anchor
+    frames = detection_data.frames[kept]
+    occlusions = detection_data.occlusions[kept]
+    boxes = detection_data.bboxes_norm[kept]
+    frame_indices = detection_data.frame_indices[kept]
+    if len(frames) < 2 or float(boxes[0][2]) <= 0:
+        return
+
+    anchor = foreground_tokens(sam, backbones, frames[0], [boxes[0]])
+    if anchor is None:
+        return
+    query = anchor[0]
+    clean_boxes = load_clean_boxes_by_frame(Path(visible_dir) / f"{trajectory.video}.json", trajectory.person)
+
+    for t in range(1, len(frames), stride):
+        if occlusions[t] > 0.5 or float(boxes[t][2]) <= 0:
+            continue
+        distractors = nearest_distractors(boxes[t], clean_boxes.get(int(frame_indices[t]), []))
+        if not distractors:
+            continue
+        candidates = foreground_tokens(sam, backbones, frames[t], [boxes[t], *distractors])  # index 0 = target
+        if candidates is None:
+            continue
+
+        dt = int(frame_indices[t]) - int(frame_indices[0])
+        for name, hit in rank1_per_backbone(query, candidates).items():
+            yield name, dt, hit
+
+
+# --------------------------------------------------------------------------------------------------
+# Plotting
+# --------------------------------------------------------------------------------------------------
+def _binned_rank1(samples: list[tuple[int, bool]]) -> list[float]:
+    """Mean rank-1 accuracy per temporal bin (NaN where a bin has too few samples)."""
+    dt = np.array([dt for dt, _ in samples])
+    hit = np.array([hit for _, hit in samples], dtype=float)
+    return [hit[(dt >= lo) & (dt < hi)].mean() if ((dt >= lo) & (dt < hi)).sum() >= MIN_BIN_SAMPLES else np.nan
+            for lo, hi in zip(DT_EDGES[:-1], DT_EDGES[1:])]
+
+
+def plot_rank1_vs_time(results: dict[str, list], n_traj: int):
+    """Rank-1 accuracy versus temporal bin, one line per backbone. Saves the figure and its raw curves."""
+    bin_centers = (DT_EDGES[:-1] + DT_EDGES[1:]) / 2
+    curves = {name: _binned_rank1(samples) for name, samples in results.items()}
+
+    figure, axis = plt.subplots(figsize=(8.5, 5.4))
+    for name, curve in curves.items():
+        axis.plot(bin_centers, curve, marker="o", markersize=5, color=COLORS.get(name), label=name)
+    axis.axhline(CHANCE, color="gray", linestyle=":", linewidth=1, label=f"chance ({CHANCE:.2f})")
+    axis.set_xlabel("frames since anchor")
+    axis.set_ylabel(f"rank-1 re-ID accuracy (target vs {N_DISTRACTORS} distractors)")
+    axis.set_title(f"Long-range re-ID via foreground similarity  |  {n_traj} trajectories\n"
+                   f"pe_sam3 is ~L, the others are base tier", fontsize=10)
+    axis.set_ylim(0.2, 1.02)
+    axis.grid(alpha=0.3)
+    axis.legend(loc="lower left", fontsize=8)
+    figure.tight_layout()
+    figure.savefig(PLOT_PATH, dpi=120)
+    plt.close(figure)
+    np.save(NPY_PATH, {"edges": DT_EDGES, "curves": curves, "n_traj": n_traj}, allow_pickle=True)
+
+
+# --------------------------------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------------------------------
+@hydra.main(config_path="conf", config_name="create_anchor_dataset", version_base=None)
+def main(config: DictConfig):
+    n_traj = config.get("n_traj", None)     # None -> the full test split
+    stride = int(config.get("stride", 2))
+    visible_dir = config.detection_data.visible_directory
+
+    detection_data = hydra.utils.instantiate(config.detection_data)
+    person_path = hydra.utils.instantiate(config.person_path)
+    sam = hydra.utils.instantiate(OmegaConf.load(SAM_BASELINE_CONFIG).tracker).model
+    backbones = load_backbones()
+    print(f"backbones: {list(backbones)}")
+
+    trajectories = test_trajectories(person_path)
+    results = defaultdict(list)             # backbone -> [(dt, is_rank1), ...]
+    
+    for completed, trajectory in enumerate(tqdm(trajectories, desc="re-id"), start=1):
+        for name, dt, hit in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, stride):
+            results[name].append((dt, hit))
+        plot_rank1_vs_time(results, completed)
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+
+    for name, samples in results.items():
+        hits = [hit for _, hit in samples]
+        print(f"  {name:11s} {np.mean(hits):.3f}   (n={len(hits)})")
+
+
+if __name__ == "__main__":
+    main()

@@ -12,7 +12,6 @@ from tqdm import tqdm
 
 from src.experiments.dataset_experiment import DatasetExperiment
 from src.utils.compute_iou import compute_iou
-from src.offline_training.references import _post_occlusion_coverage
 from src.offline_training.dataset_encoders import (
     load_dataset_encoders, crop_around_masks, encode_trajectory, anchor_size_pixels)
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame, pseudo_iou_labels
@@ -77,7 +76,7 @@ def process_trajectory(tracker, label_model, encoders, detection_data, video_nam
                        anchor_video_frame, visible_directory, config):
     """Track the trajectory once, then per frame build the four encoders' anchor-similarity maps and
     the target + 3-nearest-distractor pseudo-IoU labels. Returns (metadata, features_by_encoder) or
-    None when the anchor is missing or the trajectory fails the coverage filter."""
+    None when the anchor is missing."""
 
     detection_data.initialize_target(video_name, person_id)
     anchor_index = anchor_trajectory_index(detection_data, anchor_video_frame)
@@ -98,9 +97,6 @@ def process_trajectory(tracker, label_model, encoders, detection_data, video_nam
     frame_indices = detection_data.frame_indices[keep]
     box_iou = box_iou[keep]
     predicted_iou = predicted_iou[keep]
-
-    if _post_occlusion_coverage(box_iou, occlusions, config.commit_threshold) < config.coverage_threshold:
-        return None
 
     # Labels: proposal-mask pseudo-IoU vs the target and its 3 nearest clean distractors (box-prompted).
     clean_boxes = load_clean_boxes_by_frame(Path(visible_directory) / f"{video_name}.json", person_id)
