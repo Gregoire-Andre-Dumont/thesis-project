@@ -199,6 +199,7 @@ def _grid_foreground(crop_mask: np.ndarray, grid_side: int) -> torch.Tensor:
     return (F.interpolate(mask, size=(grid_side, grid_side), mode="nearest") > 0.5).flatten()
 
 
+@torch.inference_mode()
 def foreground_tokens(sam, backbones: dict[str, TokenFn], frame: np.ndarray, boxes: list, floor: int):
     """Foreground tokens for several entities in one frame.
 
@@ -233,6 +234,7 @@ def foreground_tokens(sam, backbones: dict[str, TokenFn], frame: np.ndarray, box
     return entities
 
 
+@torch.inference_mode()
 def chamfer_similarity(query_fg: torch.Tensor, candidate_fg: torch.Tensor) -> float:
     """Symmetric chamfer between anchor (query) and candidate foreground tokens: the mean of
       * each candidate patch's best cosine to any anchor patch  (candidate -> anchor), and
@@ -303,6 +305,10 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
         candidates = foreground_tokens(sam, backbones, frames[t], [boxes[t], *distractors], floor)  # index 0 = target
         if candidates is None:
             continue
+
+        if DEVICE == "cuda" and t % 30 == 1:   # TEMP memory probe -- remove once leak is found
+            print(f"    [{trajectory.video} f{t}] GPU alloc {torch.cuda.memory_allocated()/1e9:.2f} GB "
+                  f"reserved {torch.cuda.memory_reserved()/1e9:.2f} GB", flush=True)
 
         dt = int(frame_indices[t]) - int(frame_indices[0])
         cx, cy = _box_center(boxes[t])                     # how far the target has moved from the anchor
