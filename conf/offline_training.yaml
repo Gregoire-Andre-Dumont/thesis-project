@@ -10,7 +10,7 @@ detection_data:
   load_frames: True
   num_threads: 32
 
-train_test_split: 0.20
+train_test_split: 0.25
 deploy_controller: True
 dataset_path: data/memory_oracle_large/memory
 commit_threshold: 0.4

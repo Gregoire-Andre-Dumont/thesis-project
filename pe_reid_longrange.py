@@ -1,7 +1,7 @@
-"""Long-range re-identification benchmark for frozen image backbones.
+"""Re-identification benchmark for frozen image backbones.
 
-Question: as time passes after an anchor frame, how well does each backbone still recognise the
-target person against nearby distractors -- using only foreground patch similarity, no tracker?
+Question: how well does each backbone recognise the target person against nearby distractors, as a
+function of the distractor's spatial distance from the anchor -- foreground patch similarity, no tracker.
 
 Protocol (tracker-free, ground-truth boxes):
   * Query      -- the target at its anchor frame: SAM box-prompt -> mask -> crop -> foreground tokens.
@@ -9,9 +9,11 @@ Protocol (tracker-free, ground-truth boxes):
                   from the anchor centre is spread uniformly over DISTRACTOR_DIST_RANGE (not the nearest).
   * Score      -- unidirectional foreground chamfer of each candidate's tokens to the anchor query's.
   * Metric     -- ROC-AUC of separating the target (label 1) from distractors (label 0), binned by each
-                  candidate's own distance from the anchor (physical) and, secondarily, by frames elapsed.
+                  candidate's own spatial distance from the anchor.
 
-Two plots: AUC vs physical distance from the anchor (primary) and AUC vs temporal bin, one line/backbone.
+Two figures, both AUC vs spatial distance from the anchor (pe_spatial is the shared reference):
+  * group A -- hiera_sam, hiera_mae, pe_sam3, pe_spatial   (large backbones of different lineage)
+  * group B -- pe_spatial, pe_core                         (the perception-encoder ablation)
 
 Backbones are all LARGE scale (~212-454M params) so capacity is comparable, and each emits a 32x32
 token grid (PE-L at 448, Hiera-L stage-2 at 512, SAM3 at 448):
@@ -63,17 +65,20 @@ CROP_SIZE = 512                     # crop resolution fed to every backbone (-> 
 SAM3_INPUT = 448                    # SAM 3's ViT input (patch-14 aligned to a 32x32 grid)
 N_DISTRACTORS = 2                   # gallery = target + this many nearest distractors
 MAX_FRAMES = 250                    # cap each trajectory to this many frames from the anchor
-MIN_BIN_SAMPLES = 20                # a temporal bin needs this many candidate scores to be plotted
+MIN_BIN_SAMPLES = 20                # a spatial bin needs this many candidate scores to be plotted
 
-DT_EDGES = np.arange(0, 301, 60)    # temporal-bin edges, in frames since the anchor (5 bins of 60)
 SPATIAL_EDGES = np.round(np.arange(0, 0.61, 0.1), 2)   # spatial bins: candidate distance from anchor, normalized (6 bins)
 DISTRACTOR_DIST_RANGE = (0.0, 0.6)  # distractors are sampled uniformly over this distance-from-anchor range
-PLOT_PATH = "data/pe_reid_longrange.png"
-NPY_PATH = "data/pe_reid_longrange.npy"
-SPATIAL_PLOT_PATH = "data/pe_reid_longrange_spatial.png"
-SPATIAL_NPY_PATH = "data/pe_reid_longrange_spatial.npy"
-RANK1_PLOT_PATH = "data/pe_reid_longrange_rank1.png"
-RANK1_NPY_PATH = "data/pe_reid_longrange_rank1.npy"
+
+# The backbones are compared in two separate spatial-AUC figures (pe_spatial is the shared reference):
+#   group A  -- the four large backbones of different lineage
+#   group B  -- perception spatial vs perception core (the PE ablation)
+GROUP_A = ("hiera_sam", "hiera_mae", "pe_sam3", "pe_spatial")
+GROUP_B = ("pe_spatial", "pe_core")
+GROUP_A_PLOT_PATH = "data/pe_reid_spatial_backbones.png"
+GROUP_A_NPY_PATH = "data/pe_reid_spatial_backbones.npy"
+GROUP_B_PLOT_PATH = "data/pe_reid_spatial_pe.png"
+GROUP_B_NPY_PATH = "data/pe_reid_spatial_pe.npy"
 COLORS = {"pe_core": "#cc4444", "pe_spatial": "#22aa77", "pe_sam3": "#3377cc",
           "hiera_mae": "#dd9933", "hiera_sam": "#9944bb"}
 
@@ -336,42 +341,35 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
 # --------------------------------------------------------------------------------------------------
 def dataset_auc(samples: list) -> float:
     """Overall target-vs-distractor AUC across a backbone's samples (NaN if only one class).
-    Sample = (dt, spatial_dist, label, score)."""
-    label = np.array([s[2] for s in samples])
-    score = np.array([s[3] for s in samples])
+    Sample = (spatial_dist, label, score)."""
+    label = np.array([s[1] for s in samples])
+    score = np.array([s[2] for s in samples])
     return roc_auc_score(label, score) if 0 < label.sum() < len(label) else float("nan")
 
 
-def _binned_auc(samples: list, edges: np.ndarray, key: int) -> list[float]:
-    """Target-vs-distractor AUC per bin along axis `key` of the sample tuple
-    (key=0 -> frames since anchor, key=1 -> spatial distance). NaN for under-filled bins."""
-    axis = np.array([s[key] for s in samples])
+def _binned_auc(samples: list, edges: np.ndarray) -> list[float]:
+    """Target-vs-distractor AUC per spatial-distance bin (candidate distance from anchor).
+    NaN for under-filled bins. Sample = (spatial_dist, label, score)."""
+    dist = np.array([s[0] for s in samples])
     curve = []
     for lo, hi in zip(edges[:-1], edges[1:]):
-        in_bin = [s for s, a in zip(samples, axis) if lo <= a < hi]
+        in_bin = [s for s, d in zip(samples, dist) if lo <= d < hi]
         curve.append(dataset_auc(in_bin) if len(in_bin) >= MIN_BIN_SAMPLES else np.nan)
     return curve
 
 
-def _binned_rank1(samples: list, edges: np.ndarray) -> list[float]:
-    """Mean rank-1 (target beats the distractor) per distractor-distance bin. Sample = (dist, hit)."""
-    dist = np.array([s[0] for s in samples])
-    hit = np.array([s[1] for s in samples], dtype=float)
-    return [hit[(dist >= lo) & (dist < hi)].mean() if ((dist >= lo) & (dist < hi)).sum() >= MIN_BIN_SAMPLES else np.nan
-            for lo, hi in zip(edges[:-1], edges[1:])]
-
-
-def _draw_curves(curves: dict[str, list], edges: np.ndarray, xlabel: str, ylabel: str,
-                 title: str, path: str, npy_path: str, n_traj: int):
-    """Shared line-plot: one curve per backbone over the bin centres, plus the chance line at 0.5."""
+def plot_auc(results: dict[str, list], group: tuple, edges: np.ndarray,
+             path: str, npy_path: str, n_traj: int):
+    """Target-vs-distractor AUC versus spatial distance from the anchor, one line per backbone in `group`."""
+    curves = {name: _binned_auc(results[name], edges) for name in group if name in results}
     centers = (edges[:-1] + edges[1:]) / 2
     figure, axis = plt.subplots(figsize=(8.5, 5.4))
     for name, curve in curves.items():
         axis.plot(centers, curve, marker="o", markersize=5, color=COLORS.get(name), label=name)
     axis.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="chance (0.50)")
-    axis.set_xlabel(xlabel)
-    axis.set_ylabel(ylabel)
-    axis.set_title(f"{title}  |  {n_traj} trajectories\nall large-scale (~212-454M params)", fontsize=10)
+    axis.set_xlabel("spatial distance from anchor (normalized)")
+    axis.set_ylabel(f"target-vs-distractor AUC (vs {N_DISTRACTORS} distractors)")
+    axis.set_title(f"Re-ID via foreground similarity  |  {n_traj} trajectories", fontsize=10)
     axis.set_ylim(0.45, 1.02)
     axis.grid(alpha=0.3)
     axis.legend(loc="lower left", fontsize=8)
@@ -379,22 +377,6 @@ def _draw_curves(curves: dict[str, list], edges: np.ndarray, xlabel: str, ylabel
     figure.savefig(path, dpi=120)
     plt.close(figure)
     np.save(npy_path, {"edges": edges, "curves": curves, "n_traj": n_traj}, allow_pickle=True)
-
-
-def plot_auc(results: dict[str, list], edges: np.ndarray, key: int, xlabel: str,
-             path: str, npy_path: str, n_traj: int):
-    """Target-vs-distractor AUC versus a binning axis, one line per backbone."""
-    curves = {name: _binned_auc(samples, edges, key) for name, samples in results.items()}
-    _draw_curves(curves, edges, xlabel, f"target-vs-distractor AUC (vs {N_DISTRACTORS} distractors)",
-                 "Long-range re-ID via foreground similarity", path, npy_path, n_traj)
-
-
-def plot_rank1(results: dict[str, list], edges: np.ndarray, xlabel: str,
-               path: str, npy_path: str, n_traj: int):
-    """Rank-1 (target beats the distractor) versus distractor distance from the anchor, one line/backbone."""
-    curves = {name: _binned_rank1(samples, edges) for name, samples in results.items()}
-    _draw_curves(curves, edges, xlabel, "rank-1: P(target beats distractor)",
-                 "Long-range re-ID rank-1 via foreground similarity", path, npy_path, n_traj)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -414,26 +396,21 @@ def main(config: DictConfig):
     print(f"backbones: {list(backbones)}")
 
     trajectories = test_trajectories(person_path)
-    results_auc = defaultdict(list)         # per candidate: (dt, spatial_dist, label, score)
-    results_rank1 = defaultdict(list)       # per (target, distractor) pair: (distractor_dist, target_wins)
+    print(f"test trajectories: {len(trajectories)}")
+    results = defaultdict(list)             # per candidate: (spatial_dist, label, score)
     rng = np.random.RandomState(0)          # reproducible uniform distractor-distance sampling
 
     for completed, trajectory in enumerate(tqdm(trajectories, desc="re-id"), start=1):
         for name, dt, dists, scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, amodal_dir, stride, rng):
             for dist, label, score in zip(dists, (1, *([0] * (len(scores) - 1))), scores):
-                results_auc[name].append((dt, dist, label, score))
-            for dist, score in zip(dists[1:], scores[1:]):          # target (index 0) vs each distractor
-                results_rank1[name].append((dist, int(scores[0] > score)))
-        plot_auc(results_auc, DT_EDGES, 0, "frames since anchor", PLOT_PATH, NPY_PATH, completed)
-        plot_auc(results_auc, SPATIAL_EDGES, 1, "spatial distance from anchor (normalized)",
-                 SPATIAL_PLOT_PATH, SPATIAL_NPY_PATH, completed)
-        plot_rank1(results_rank1, SPATIAL_EDGES, "distractor distance from anchor (normalized)",
-                   RANK1_PLOT_PATH, RANK1_NPY_PATH, completed)
+                results[name].append((dist, label, score))
+        plot_auc(results, GROUP_A, SPATIAL_EDGES, GROUP_A_PLOT_PATH, GROUP_A_NPY_PATH, completed)
+        plot_auc(results, GROUP_B, SPATIAL_EDGES, GROUP_B_PLOT_PATH, GROUP_B_NPY_PATH, completed)
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
     print("\noverall target-vs-distractor AUC (whole dataset):")
-    for name, samples in results_auc.items():
+    for name, samples in results.items():
         print(f"  {name:11s} {dataset_auc(samples):.3f}   (n={len(samples)})")
 
 
