@@ -57,6 +57,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
 SAM_BASELINE_CONFIG = "conf/trackers/baselines/sam_baseline.yaml"  # SAM 2 model used as the box->mask prompter
+SAM3_VISION_CONFIG = "conf/sam3_vision_config.json"                # bundled so we avoid the gated facebook/sam3 repo
 CROP_SIZE = 512                     # crop resolution fed to every backbone (-> ~32x32 tokens)
 SAM3_INPUT = 448                    # SAM 3's ViT input (patch-14 aligned to a 32x32 grid)
 N_DISTRACTORS = 2                   # gallery = target + this many nearest distractors
@@ -106,9 +107,9 @@ def load_sam3_encoder() -> TokenFn | None:
         from safetensors.torch import load_file
         from transformers import Sam3VisionModel, Sam3VisionConfig
 
-        config = json.load(open(hf_hub_download("facebook/sam3", "config.json")))["detector_config"]["vision_config"]
+        config = json.load(open(SAM3_VISION_CONFIG))
         model = Sam3VisionModel(Sam3VisionConfig(**{**config, "image_size": SAM3_INPUT}))
-        weights = load_file(hf_hub_download("1038lab/sam3", "sam3.safetensors"))
+        weights = load_file(hf_hub_download("1038lab/sam3", "sam3.safetensors"))  # ungated mirror
         prefix = "detector_model.vision_encoder."
         model.load_state_dict({k[len(prefix):]: v for k, v in weights.items() if k.startswith(prefix)})
         model = model.eval().to(DEVICE).to(DTYPE)
