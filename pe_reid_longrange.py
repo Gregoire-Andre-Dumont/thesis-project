@@ -157,13 +157,15 @@ def load_backbones() -> dict[str, TokenFn]:
 # --------------------------------------------------------------------------------------------------
 @torch.inference_mode()
 def box_prompt_masks(sam, frame: np.ndarray, boxes: list) -> list[np.ndarray]:
-    """One binary mask per box, prompting SAM with each box after a single frame encode."""
+    """One SAM mask LOGIT map per box, prompting SAM with each box after a single frame encode.
+    Logits (not a binary mask) are returned so crop_around_masks thresholds after resizing, exactly
+    as create_anchor_dataset does. bf16 is cast to float32 for numpy."""
     image = sam.image_encoder.prepare_image(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), 1024, True)
     features = sam.image_encoder(image)
     masks = []
     for box in boxes:
         mask, _, _ = sam.initialize_video_masking(features, convert_bbox(np.asarray(box, np.float32)))
-        masks.append(mask.squeeze().cpu().numpy())
+        masks.append(mask.squeeze().float().cpu().numpy())
     return masks
 
 
@@ -182,7 +184,7 @@ def foreground_tokens(sam, backbones: dict[str, TokenFn], frame: np.ndarray, box
     scale rather than zoomed to fill its own box. Returns a list aligned to `boxes`, each entry a dict
     {backbone: (num_foreground_patches, dim)} -- or None if any box yields an empty mask."""
     masks = box_prompt_masks(sam, frame, boxes)
-    if any(mask.sum() == 0 for mask in masks):
+    if any((mask > 0).sum() == 0 for mask in masks):   # empty mask (logits: foreground is logit > 0)
         return None
 
     crops, crop_masks = [], []
