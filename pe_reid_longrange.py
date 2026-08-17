@@ -46,7 +46,7 @@ from tqdm import tqdm
 from src.offline_training.dataset_encoders import (
     load_dataset_encoders, crop_around_masks, anchor_size_pixels, _norm, HALF)
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame
-from src.utils.load_bboxes import convert_bbox
+from src.utils.load_bboxes import convert_bbox, load_bboxes
 from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
 
 logging.getLogger("timm").setLevel(logging.ERROR)
@@ -63,6 +63,7 @@ SAM3_VISION_CONFIG = "conf/sam3_vision_config.json"                # bundled so 
 CROP_SIZE = 512                     # crop resolution fed to every backbone (-> ~32x32 tokens)
 SAM3_INPUT = 448                    # SAM 3's ViT input (patch-14 aligned to a 32x32 grid)
 N_DISTRACTORS = 2                   # gallery = target + this many nearest distractors
+MAX_FRAMES = 250                    # cap each trajectory to this many frames from the anchor
 MIN_BIN_SAMPLES = 20                # a temporal bin needs this many candidate scores to be plotted
 
 DT_EDGES = np.arange(0, 301, 60)    # temporal-bin edges, in frames since the anchor (5 bins of 60)
@@ -223,7 +224,7 @@ def nearest_distractors(target_box, clean_boxes: list, k: int = N_DISTRACTORS) -
     return sorted(clean_boxes, key=lambda b: (_box_center(b)[0] - cx) ** 2 + (_box_center(b)[1] - cy) ** 2)[:k]
 
 
-def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, visible_dir, stride):
+def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, visible_dir, amodal_dir, stride):
     """Yield (backbone, dt, label, score) for every candidate at every visible frame of one trajectory.
     label is 1 for the target (candidates[0]) and 0 for a distractor; score is the chamfer similarity
     to the anchor query."""
@@ -232,8 +233,15 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
     if anchor_index is None:
         return
 
+    # Amodal box of the anchor (full extent, incl. occluded parts) -> crop-size floor, as in the old
+    # pipeline. load_bboxes is aligned with the full frame union, i.e. the same axis as anchor_index.
+    amodal_boxes = load_bboxes(str(Path(amodal_dir) / f"{trajectory.video}.json"),
+                               str(Path(visible_dir) / f"{trajectory.video}.json"),
+                               trajectory.person, use_amodal=True)
+    anchor_amodal = amodal_boxes[anchor_index]
+
     warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
-    kept = slice(warmup, None)                 # drop the tracker warmup frame; index 0 is now the anchor
+    kept = slice(warmup, warmup + MAX_FRAMES)  # anchor is now index 0; cap the trajectory length
     frames = detection_data.frames[kept]
     occlusions = detection_data.occlusions[kept]
     boxes = detection_data.bboxes_norm[kept]
@@ -241,7 +249,8 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
     if len(frames) < 2 or float(boxes[0][2]) <= 0:
         return
 
-    floor = anchor_size_pixels(boxes[0], frames[0].shape)   # anchor box size -> crop scale for the whole trajectory
+    anchor_box = anchor_amodal if float(anchor_amodal[2]) > 0 else boxes[0]
+    floor = anchor_size_pixels(anchor_box, frames[0].shape)   # anchor amodal box size -> crop scale for the trajectory
     anchor = foreground_tokens(sam, backbones, frames[0], [boxes[0]], floor)
     if anchor is None:
         return
@@ -313,9 +322,9 @@ def plot_auc_vs_time(results: dict[str, list], n_traj: int):
 # --------------------------------------------------------------------------------------------------
 @hydra.main(config_path="conf", config_name="create_anchor_dataset", version_base=None)
 def main(config: DictConfig):
-    n_traj = config.get("n_traj", None)     # None -> the full test split
     stride = int(config.get("stride", 2))
     visible_dir = config.detection_data.visible_directory
+    amodal_dir = config.detection_data.amodal_directory
 
     detection_data = hydra.utils.instantiate(config.detection_data)
     person_path = hydra.utils.instantiate(config.person_path)
@@ -324,23 +333,15 @@ def main(config: DictConfig):
     print(f"backbones: {list(backbones)}")
 
     trajectories = test_trajectories(person_path)
-    if n_traj is not None:
-        trajectories = trajectories[:int(n_traj)]
-    print(f"trajectories: {len(trajectories)}")
-
-    results = defaultdict(list)             # backbone -> [(dt, label, score), ...]
+    results = defaultdict(list)
 
     for completed, trajectory in enumerate(tqdm(trajectories, desc="re-id"), start=1):
-        for name, dt, label, score in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, stride):
+        for name, dt, label, score in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, amodal_dir, stride):
             results[name].append((dt, label, score))
         plot_auc_vs_time(results, completed)
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-    print(f"\nsaved {PLOT_PATH}")
-    print("overall target-vs-distractor AUC (whole dataset):")
-    for name, samples in results.items():
-        print(f"  {name:11s} {dataset_auc(samples):.3f}   (n={len(samples)})")
 
 
 if __name__ == "__main__":
