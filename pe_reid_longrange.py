@@ -8,10 +8,11 @@ Protocol (tracker-free, ground-truth boxes):
   * Gallery    -- at each later visible frame: the target + its N nearest clean distractors, encoded
                   the same way.
   * Score      -- foreground chamfer similarity of each candidate's tokens to the query's.
-  * Rank-1     -- the target is the most similar of the (1 + N) candidates.
-  * Long range -- rank-1 is binned by dt = frames elapsed since the anchor.
+  * Metric     -- ROC-AUC of separating the target (label 1) from the distractors (label 0) by that
+                  score, computed over the whole dataset and per temporal bin.
+  * Long range -- AUC is binned by dt = frames elapsed since the anchor.
 
-The result plot is rank-1 accuracy (y) versus temporal bin (x), one line per backbone.
+The result plot is target-vs-distractor AUC (y) versus temporal bin (x), one line per backbone.
 
 Backbones share a common ~512px input (a 32x32 token grid) so none runs off its native resolution:
   hiera_mae, hiera_sam (SAM 2), pe_core, pe_spatial   -- base tier, as used by the dataset
@@ -38,6 +39,7 @@ import timm
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
@@ -61,10 +63,9 @@ SAM3_VISION_CONFIG = "conf/sam3_vision_config.json"                # bundled so 
 CROP_SIZE = 512                     # crop resolution fed to every backbone (-> ~32x32 tokens)
 SAM3_INPUT = 448                    # SAM 3's ViT input (patch-14 aligned to a 32x32 grid)
 N_DISTRACTORS = 2                   # gallery = target + this many nearest distractors
-CHANCE = 1.0 / (1 + N_DISTRACTORS)  # rank-1 accuracy of random guessing
-MIN_BIN_SAMPLES = 20                # a temporal bin needs this many samples to be plotted
+MIN_BIN_SAMPLES = 20                # a temporal bin needs this many candidate scores to be plotted
 
-DT_EDGES = np.arange(0, 301, 30)    # temporal-bin edges, in frames since the anchor
+DT_EDGES = np.arange(0, 301, 60)    # temporal-bin edges, in frames since the anchor (5 bins of 60)
 PLOT_PATH = "data/pe_reid_longrange.png"
 NPY_PATH = "data/pe_reid_longrange.npy"
 COLORS = {"pe_core": "#cc4444", "pe_spatial": "#22aa77", "pe_sam3": "#3377cc",
@@ -221,19 +222,10 @@ def nearest_distractors(target_box, clean_boxes: list, k: int = N_DISTRACTORS) -
     return sorted(clean_boxes, key=lambda b: (_box_center(b)[0] - cx) ** 2 + (_box_center(b)[1] - cy) ** 2)[:k]
 
 
-def rank1_per_backbone(query: dict, candidates: list[dict]) -> dict[str, bool]:
-    """For each backbone, whether the target (candidates[0]) is the most similar candidate to the query.
-    Backbones whose similarities are undefined (empty foreground) are omitted for this frame."""
-    hits = {}
-    for name in query:
-        sims = [chamfer_similarity(query[name], candidate[name]) for candidate in candidates]
-        if not any(np.isnan(sims)):
-            hits[name] = bool(sims[0] > max(sims[1:]))
-    return hits
-
-
 def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, visible_dir, stride):
-    """Yield (backbone, dt, is_rank1) for each visible frame of one trajectory."""
+    """Yield (backbone, dt, label, score) for every candidate at every visible frame of one trajectory.
+    label is 1 for the target (candidates[0]) and 0 for a distractor; score is the chamfer similarity
+    to the anchor query."""
     detection_data.initialize_target(trajectory.video, trajectory.person)
     anchor_index = anchor_trajectory_index(detection_data, trajectory.anchor_frame)
     if anchor_index is None:
@@ -265,35 +257,47 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
             continue
 
         dt = int(frame_indices[t]) - int(frame_indices[0])
-        for name, hit in rank1_per_backbone(query, candidates).items():
-            yield name, dt, hit
+        for name in backbones:
+            for i, candidate in enumerate(candidates):
+                score = chamfer_similarity(query[name], candidate[name])
+                if not np.isnan(score):
+                    yield name, dt, int(i == 0), score      # label 1 = target, 0 = distractor
 
 
 # --------------------------------------------------------------------------------------------------
 # Plotting
 # --------------------------------------------------------------------------------------------------
-def _binned_rank1(samples: list[tuple[int, bool]]) -> list[float]:
-    """Mean rank-1 accuracy per temporal bin (NaN where a bin has too few samples)."""
-    dt = np.array([dt for dt, _ in samples])
-    hit = np.array([hit for _, hit in samples], dtype=float)
-    return [hit[(dt >= lo) & (dt < hi)].mean() if ((dt >= lo) & (dt < hi)).sum() >= MIN_BIN_SAMPLES else np.nan
-            for lo, hi in zip(DT_EDGES[:-1], DT_EDGES[1:])]
+def dataset_auc(samples: list[tuple[int, int, float]]) -> float:
+    """Overall target-vs-distractor AUC across a backbone's samples (NaN if only one class)."""
+    label = np.array([s[1] for s in samples])
+    score = np.array([s[2] for s in samples])
+    return roc_auc_score(label, score) if 0 < label.sum() < len(label) else float("nan")
 
 
-def plot_rank1_vs_time(results: dict[str, list], n_traj: int):
-    """Rank-1 accuracy versus temporal bin, one line per backbone. Saves the figure and its raw curves."""
+def _binned_auc(samples: list[tuple[int, int, float]]) -> list[float]:
+    """Target-vs-distractor AUC per temporal bin (NaN where a bin has too few samples or one class)."""
+    dt = np.array([s[0] for s in samples])
+    curve = []
+    for lo, hi in zip(DT_EDGES[:-1], DT_EDGES[1:]):
+        in_bin = [s for s, d in zip(samples, dt) if lo <= d < hi]
+        curve.append(dataset_auc(in_bin) if len(in_bin) >= MIN_BIN_SAMPLES else np.nan)
+    return curve
+
+
+def plot_auc_vs_time(results: dict[str, list], n_traj: int):
+    """Target-vs-distractor AUC versus temporal bin, one line per backbone. Saves the figure and curves."""
     bin_centers = (DT_EDGES[:-1] + DT_EDGES[1:]) / 2
-    curves = {name: _binned_rank1(samples) for name, samples in results.items()}
+    curves = {name: _binned_auc(samples) for name, samples in results.items()}
 
     figure, axis = plt.subplots(figsize=(8.5, 5.4))
     for name, curve in curves.items():
         axis.plot(bin_centers, curve, marker="o", markersize=5, color=COLORS.get(name), label=name)
-    axis.axhline(CHANCE, color="gray", linestyle=":", linewidth=1, label=f"chance ({CHANCE:.2f})")
+    axis.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="chance (0.50)")
     axis.set_xlabel("frames since anchor")
-    axis.set_ylabel(f"rank-1 re-ID accuracy (target vs {N_DISTRACTORS} distractors)")
+    axis.set_ylabel(f"target-vs-distractor AUC (vs {N_DISTRACTORS} distractors)")
     axis.set_title(f"Long-range re-ID via foreground similarity  |  {n_traj} trajectories\n"
                    f"pe_sam3 is ~L, the others are base tier", fontsize=10)
-    axis.set_ylim(0.2, 1.02)
+    axis.set_ylim(0.45, 1.02)
     axis.grid(alpha=0.3)
     axis.legend(loc="lower left", fontsize=8)
     figure.tight_layout()
@@ -318,18 +322,23 @@ def main(config: DictConfig):
     print(f"backbones: {list(backbones)}")
 
     trajectories = test_trajectories(person_path)
-    results = defaultdict(list)             # backbone -> [(dt, is_rank1), ...]
-    
+    if n_traj is not None:
+        trajectories = trajectories[:int(n_traj)]
+    print(f"trajectories: {len(trajectories)}")
+
+    results = defaultdict(list)             # backbone -> [(dt, label, score), ...]
+
     for completed, trajectory in enumerate(tqdm(trajectories, desc="re-id"), start=1):
-        for name, dt, hit in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, stride):
-            results[name].append((dt, hit))
-        plot_rank1_vs_time(results, completed)
+        for name, dt, label, score in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, stride):
+            results[name].append((dt, label, score))
+        plot_auc_vs_time(results, completed)
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
+    print(f"\nsaved {PLOT_PATH}")
+    print("overall target-vs-distractor AUC (whole dataset):")
     for name, samples in results.items():
-        hits = [hit for _, hit in samples]
-        print(f"  {name:11s} {np.mean(hits):.3f}   (n={len(hits)})")
+        print(f"  {name:11s} {dataset_auc(samples):.3f}   (n={len(samples)})")
 
 
 if __name__ == "__main__":
