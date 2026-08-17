@@ -163,7 +163,7 @@ def box_prompt_masks(sam, frame: np.ndarray, boxes: list) -> list[np.ndarray]:
     masks = []
     for box in boxes:
         mask, _, _ = sam.initialize_video_masking(features, convert_bbox(np.asarray(box, np.float32)))
-        masks.append((mask.squeeze() > 0.0).cpu().numpy())
+        masks.append(mask.squeeze().cpu().numpy())
     return masks
 
 
@@ -334,6 +334,7 @@ def main(config: DictConfig):
     detection_data = hydra.utils.instantiate(config.detection_data)
     person_path = hydra.utils.instantiate(config.person_path)
     sam = hydra.utils.instantiate(OmegaConf.load(SAM_BASELINE_CONFIG).tracker).model
+
     backbones = load_backbones()
     print(f"backbones: {list(backbones)}")
 
