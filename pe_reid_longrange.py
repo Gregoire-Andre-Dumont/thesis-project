@@ -93,7 +93,7 @@ def test_trajectories(person_path, test_size: float = 0.20, seed: int = 42) -> l
         person_path.selected_anchor_video_frames.tolist())]
     order = sorted(range(len(triples)), key=lambda i: f"{triples[i].video}_{triples[i].person}")
     _, test_idx = train_test_split(np.array(order), test_size=test_size, random_state=seed, shuffle=True)
-    return [triples[i] for i in sorted(test_idx)]
+    return [triples[i] for i in test_idx]
 
 
 # --------------------------------------------------------------------------------------------------
