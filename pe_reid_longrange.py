@@ -275,10 +275,10 @@ def uniform_distractors(anchor_center, clean_boxes: list, rng, k: int = N_DISTRA
 
 
 def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, visible_dir, amodal_dir, stride, rng):
-    """Yield (backbone, dt, dist, label, score) for every candidate at every visible frame.
-    label is 1 for the target (candidates[0]) and 0 for a distractor; `dist` is the candidate's own
-    distance from the anchor centre (the target's uncontrolled movement; the distractors are sampled
-    uniformly over DISTRACTOR_DIST_RANGE); score is the chamfer similarity to the anchor query."""
+    """Yield (backbone, dt, dists, scores) once per visible frame per backbone. `dists`/`scores` are
+    lists aligned to the candidates (index 0 = target, then the distractors): `dists[i]` is candidate i's
+    distance from the anchor centre (target = its uncontrolled movement, distractors = sampled uniformly
+    over DISTRACTOR_DIST_RANGE), `scores[i]` its chamfer similarity to the anchor query."""
     detection_data.initialize_target(trajectory.video, trajectory.person)
     anchor_index = anchor_trajectory_index(detection_data, trajectory.anchor_frame)
     if anchor_index is None:
