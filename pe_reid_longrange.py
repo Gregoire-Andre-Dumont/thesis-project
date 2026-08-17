@@ -224,7 +224,12 @@ def foreground_tokens(sam, backbones: dict[str, TokenFn], frame: np.ndarray, box
         grid_side = round(patches.shape[1] ** 0.5)
         for entity, patch_tokens, crop_mask in zip(entities, patches, crop_masks):
             foreground = _grid_foreground(crop_mask, grid_side).to(patch_tokens.device)
-            entity[name] = patch_tokens[foreground]
+            entity[name] = patch_tokens[foreground].clone()   # copy the FG subset so `patches` can be freed
+        # free this backbone's full-token tensor + cached activations before the next large model runs,
+        # so peak memory is one backbone at a time rather than all five at once.
+        del patches
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
     return entities
 
 
