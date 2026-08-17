@@ -172,19 +172,20 @@ def _grid_foreground(crop_mask: np.ndarray, grid_side: int) -> torch.Tensor:
     return (F.interpolate(mask, size=(grid_side, grid_side), mode="nearest") > 0.5).flatten()
 
 
-def foreground_tokens(sam, backbones: dict[str, TokenFn], frame: np.ndarray, boxes: list):
+def foreground_tokens(sam, backbones: dict[str, TokenFn], frame: np.ndarray, boxes: list, floor: int):
     """Foreground tokens for several entities in one frame.
 
     Each box becomes a SAM mask (single frame encode), is cropped around that mask, and is encoded by
-    every backbone in one batched pass. Returns a list aligned to `boxes`, each entry a dict
+    every backbone in one batched pass. `floor` is the crop-size floor in pixels -- always the ANCHOR
+    box size (as in create_anchor_dataset), so every entity at every frame is cropped at the anchor's
+    scale rather than zoomed to fill its own box. Returns a list aligned to `boxes`, each entry a dict
     {backbone: (num_foreground_patches, dim)} -- or None if any box yields an empty mask."""
     masks = box_prompt_masks(sam, frame, boxes)
     if any(mask.sum() == 0 for mask in masks):
         return None
 
     crops, crop_masks = [], []
-    for mask, box in zip(masks, boxes):
-        floor = anchor_size_pixels(box, frame.shape)
+    for mask in masks:
         crop, crop_mask = crop_around_masks(frame[None], mask[None].astype(np.float32), CROP_SIZE, 0.25, floor)
         crops.append(crop[0])
         crop_masks.append(crop_mask[0])
@@ -240,7 +241,8 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
     if len(frames) < 2 or float(boxes[0][2]) <= 0:
         return
 
-    anchor = foreground_tokens(sam, backbones, frames[0], [boxes[0]])
+    floor = anchor_size_pixels(boxes[0], frames[0].shape)   # anchor box size -> crop scale for the whole trajectory
+    anchor = foreground_tokens(sam, backbones, frames[0], [boxes[0]], floor)
     if anchor is None:
         return
     query = anchor[0]
@@ -252,7 +254,7 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
         distractors = nearest_distractors(boxes[t], clean_boxes.get(int(frame_indices[t]), []))
         if not distractors:
             continue
-        candidates = foreground_tokens(sam, backbones, frames[t], [boxes[t], *distractors])  # index 0 = target
+        candidates = foreground_tokens(sam, backbones, frames[t], [boxes[t], *distractors], floor)  # index 0 = target
         if candidates is None:
             continue
 
