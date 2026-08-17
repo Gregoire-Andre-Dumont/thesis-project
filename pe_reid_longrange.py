@@ -14,9 +14,9 @@ Protocol (tracker-free, ground-truth boxes):
 
 The result plot is target-vs-distractor AUC (y) versus temporal bin (x), one line per backbone.
 
-Backbones share a common ~512px input (a 32x32 token grid) so none runs off its native resolution:
-  hiera_mae, hiera_sam (SAM 2), pe_core, pe_spatial   -- base tier, as used by the dataset
-  pe_sam3                                              -- SAM 3's vision encoder (only exists at ~L)
+Backbones are all LARGE scale (~212-454M params) so capacity is comparable, and each emits a 32x32
+token grid (PE-L at 448, Hiera-L stage-2 at 512, SAM3 at 448):
+  pe_core, pe_spatial (PE-L ~310M), hiera_mae, hiera_sam (Hiera-L ~212M), pe_sam3 (SAM3 ~454M)
 
 Usage (prepend PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True on a small GPU):
   python pe_reid_longrange.py                 # full held-out test split
@@ -44,7 +44,7 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from src.offline_training.dataset_encoders import (
-    load_dataset_encoders, crop_around_masks, anchor_size_pixels, _norm, HALF)
+    crop_around_masks, anchor_size_pixels, _hiera_stage2, _norm, HALF)
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame
 from src.utils.load_bboxes import convert_bbox, load_bboxes
 from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
@@ -67,8 +67,11 @@ MAX_FRAMES = 250                    # cap each trajectory to this many frames fr
 MIN_BIN_SAMPLES = 20                # a temporal bin needs this many candidate scores to be plotted
 
 DT_EDGES = np.arange(0, 301, 60)    # temporal-bin edges, in frames since the anchor (5 bins of 60)
+SPATIAL_EDGES = np.round(np.arange(0, 0.51, 0.1), 2)   # spatial bins: |centroid_t - centroid_anchor|, normalized
 PLOT_PATH = "data/pe_reid_longrange.png"
 NPY_PATH = "data/pe_reid_longrange.npy"
+SPATIAL_PLOT_PATH = "data/pe_reid_longrange_spatial.png"
+SPATIAL_NPY_PATH = "data/pe_reid_longrange_spatial.npy"
 COLORS = {"pe_core": "#cc4444", "pe_spatial": "#22aa77", "pe_sam3": "#3377cc",
           "hiera_mae": "#dd9933", "hiera_sam": "#9944bb"}
 
@@ -128,23 +131,44 @@ def load_sam3_encoder() -> TokenFn | None:
     return tokens
 
 
+def _load_hiera_mae_large() -> torch.nn.Module:
+    """Hiera-L MAE backbone at 512 (features_only). Bicubic-resizes the pretrained 56x56 stage-0
+    pos_embed to the 128x128 grid (512/4), mirroring dataset_encoders._load_hiera_mae for the base."""
+    src = timm.create_model("hiera_large_224.mae", pretrained=True).state_dict()
+    pe = src["pos_embed"]
+    side, dim = int(pe.shape[1] ** 0.5), pe.shape[2]
+    src["pos_embed"] = F.interpolate(pe.reshape(1, side, side, dim).permute(0, 3, 1, 2).float(),
+                                     size=(128, 128), mode="bicubic", align_corners=False
+                                     ).permute(0, 2, 3, 1).reshape(1, 128 * 128, dim)
+    model = timm.create_model("hiera_large_224.mae", pretrained=False, img_size=512, features_only=True)
+    model.load_state_dict({"model." + k: v for k, v in src.items()}, strict=False)
+    return model.eval().to(DEVICE).to(DTYPE)
+
+
 def load_backbones() -> dict[str, TokenFn]:
-    """The backbones keyed by name. pe_spatial / hiera_* reuse the dataset encoders (32x32 @ 512),
-    pe_core is added here, and pe_sam3 joins when its weights are reachable."""
-    encoders = load_dataset_encoders(["perception", "hiera_sam", "hiera_mae"], DEVICE, DTYPE)  # perception == pe_spatial
-    pe_core = timm.create_model("vit_pe_core_base_patch16_224.fb", pretrained=True,
-                                num_classes=0, img_size=CROP_SIZE).eval().to(DEVICE).to(DTYPE)
+    """The five backbones keyed by name, all at LARGE scale (~212-454M params) so capacity is comparable.
+    Every one emits a 32x32 token grid: PE-L (patch14) at 448, Hiera-L (stage-2) at 512, SAM3 at 448."""
+    pe_core = timm.create_model("vit_pe_core_large_patch14_336.fb", pretrained=True,
+                                num_classes=0, img_size=448).eval().to(DEVICE).to(DTYPE)
+    pe_spatial = timm.create_model("vit_pe_spatial_large_patch14_448.fb", pretrained=True,
+                                   num_classes=0).eval().to(DEVICE).to(DTYPE)
+    hiera_sam = timm.create_model("sam2_hiera_large.fb_r1024_2pt1", pretrained=True,
+                                  features_only=True).eval().to(DEVICE).to(DTYPE)
+    hiera_mae = _load_hiera_mae_large()
 
     @torch.inference_mode()
     def pe_core_tokens(crops: np.ndarray) -> torch.Tensor:
-        features = pe_core.forward_features(_norm(crops, CROP_SIZE, HALF, HALF, DEVICE, DTYPE))
-        return features[:, pe_core.num_prefix_tokens:].float()
+        return pe_core.forward_features(_norm(crops, 448, HALF, HALF, DEVICE, DTYPE))[:, pe_core.num_prefix_tokens:].float()
+
+    @torch.inference_mode()
+    def pe_spatial_tokens(crops: np.ndarray) -> torch.Tensor:
+        return pe_spatial.forward_features(_norm(crops, 448, HALF, HALF, DEVICE, DTYPE))[:, pe_spatial.num_prefix_tokens:].float()
 
     backbones = {
         "pe_core": pe_core_tokens,
-        "pe_spatial": encoders["perception"],
-        "hiera_mae": encoders["hiera_mae"],
-        "hiera_sam": encoders["hiera_sam"],
+        "pe_spatial": pe_spatial_tokens,
+        "hiera_mae": lambda crops: _hiera_stage2(hiera_mae, crops, DEVICE, DTYPE),
+        "hiera_sam": lambda crops: _hiera_stage2(hiera_sam, crops, DEVICE, DTYPE),
     }
     sam3 = load_sam3_encoder()
     if sam3 is not None:
@@ -262,6 +286,7 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
     if anchor is None:
         return
     query = anchor[0]
+    anchor_center = _box_center(boxes[0])                  # for the spatial-distance axis
     clean_boxes = load_clean_boxes_by_frame(Path(visible_dir) / f"{trajectory.video}.json", trajectory.person)
 
     for t in range(1, len(frames), stride):
@@ -275,53 +300,58 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
             continue
 
         dt = int(frame_indices[t]) - int(frame_indices[0])
+        cx, cy = _box_center(boxes[t])                     # how far the target has moved from the anchor
+        dist = float(((cx - anchor_center[0]) ** 2 + (cy - anchor_center[1]) ** 2) ** 0.5)
         for name in backbones:
             for i, candidate in enumerate(candidates):
                 score = chamfer_similarity(query[name], candidate[name])
                 if not np.isnan(score):
-                    yield name, dt, int(i == 0), score      # label 1 = target, 0 = distractor
+                    yield name, dt, dist, int(i == 0), score   # label 1 = target, 0 = distractor
 
 
 # --------------------------------------------------------------------------------------------------
 # Plotting
 # --------------------------------------------------------------------------------------------------
-def dataset_auc(samples: list[tuple[int, int, float]]) -> float:
-    """Overall target-vs-distractor AUC across a backbone's samples (NaN if only one class)."""
-    label = np.array([s[1] for s in samples])
-    score = np.array([s[2] for s in samples])
+def dataset_auc(samples: list) -> float:
+    """Overall target-vs-distractor AUC across a backbone's samples (NaN if only one class).
+    Sample = (dt, spatial_dist, label, score)."""
+    label = np.array([s[2] for s in samples])
+    score = np.array([s[3] for s in samples])
     return roc_auc_score(label, score) if 0 < label.sum() < len(label) else float("nan")
 
 
-def _binned_auc(samples: list[tuple[int, int, float]]) -> list[float]:
-    """Target-vs-distractor AUC per temporal bin (NaN where a bin has too few samples or one class)."""
-    dt = np.array([s[0] for s in samples])
+def _binned_auc(samples: list, edges: np.ndarray, key: int) -> list[float]:
+    """Target-vs-distractor AUC per bin along axis `key` of the sample tuple
+    (key=0 -> frames since anchor, key=1 -> spatial distance). NaN for under-filled bins."""
+    axis = np.array([s[key] for s in samples])
     curve = []
-    for lo, hi in zip(DT_EDGES[:-1], DT_EDGES[1:]):
-        in_bin = [s for s, d in zip(samples, dt) if lo <= d < hi]
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        in_bin = [s for s, a in zip(samples, axis) if lo <= a < hi]
         curve.append(dataset_auc(in_bin) if len(in_bin) >= MIN_BIN_SAMPLES else np.nan)
     return curve
 
 
-def plot_auc_vs_time(results: dict[str, list], n_traj: int):
-    """Target-vs-distractor AUC versus temporal bin, one line per backbone. Saves the figure and curves."""
-    bin_centers = (DT_EDGES[:-1] + DT_EDGES[1:]) / 2
-    curves = {name: _binned_auc(samples) for name, samples in results.items()}
+def plot_auc(results: dict[str, list], edges: np.ndarray, key: int, xlabel: str,
+             path: str, npy_path: str, n_traj: int):
+    """Target-vs-distractor AUC versus a binning axis, one line per backbone. Saves the figure + curves."""
+    centers = (edges[:-1] + edges[1:]) / 2
+    curves = {name: _binned_auc(samples, edges, key) for name, samples in results.items()}
 
     figure, axis = plt.subplots(figsize=(8.5, 5.4))
     for name, curve in curves.items():
-        axis.plot(bin_centers, curve, marker="o", markersize=5, color=COLORS.get(name), label=name)
+        axis.plot(centers, curve, marker="o", markersize=5, color=COLORS.get(name), label=name)
     axis.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="chance (0.50)")
-    axis.set_xlabel("frames since anchor")
+    axis.set_xlabel(xlabel)
     axis.set_ylabel(f"target-vs-distractor AUC (vs {N_DISTRACTORS} distractors)")
     axis.set_title(f"Long-range re-ID via foreground similarity  |  {n_traj} trajectories\n"
-                   f"pe_sam3 is ~L, the others are base tier", fontsize=10)
+                   f"all large-scale (~212-454M params)", fontsize=10)
     axis.set_ylim(0.45, 1.02)
     axis.grid(alpha=0.3)
     axis.legend(loc="lower left", fontsize=8)
     figure.tight_layout()
-    figure.savefig(PLOT_PATH, dpi=120)
+    figure.savefig(path, dpi=120)
     plt.close(figure)
-    np.save(NPY_PATH, {"edges": DT_EDGES, "curves": curves, "n_traj": n_traj}, allow_pickle=True)
+    np.save(npy_path, {"edges": edges, "curves": curves, "n_traj": n_traj}, allow_pickle=True)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -344,11 +374,17 @@ def main(config: DictConfig):
     results = defaultdict(list)
 
     for completed, trajectory in enumerate(tqdm(trajectories, desc="re-id"), start=1):
-        for name, dt, label, score in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, amodal_dir, stride):
-            results[name].append((dt, label, score))
-        plot_auc_vs_time(results, completed)
+        for name, dt, dist, label, score in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, amodal_dir, stride):
+            results[name].append((dt, dist, label, score))
+        plot_auc(results, DT_EDGES, 0, "frames since anchor", PLOT_PATH, NPY_PATH, completed)
+        plot_auc(results, SPATIAL_EDGES, 1, "spatial distance from anchor (normalized)",
+                 SPATIAL_PLOT_PATH, SPATIAL_NPY_PATH, completed)
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
+
+    print("\noverall target-vs-distractor AUC (whole dataset):")
+    for name, samples in results.items():
+        print(f"  {name:11s} {dataset_auc(samples):.3f}   (n={len(samples)})")
 
 
 
