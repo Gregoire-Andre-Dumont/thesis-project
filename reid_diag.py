@@ -24,8 +24,9 @@ def main(config: DictConfig):
     print(f"backbones: {list(backbones)}", flush=True)
 
     samples = {name: [] for name in backbones}
+    rng = np.random.RandomState(0)
     for i, trajectory in enumerate(test_trajectories(person_path)[:n_diag], start=1):
-        for name, dt, dist, label, score in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, amodal_dir, stride):
+        for name, dt, dist, label, score in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, amodal_dir, stride, rng):
             samples[name].append((label, score))
         print(f"traj {i}/{n_diag}", flush=True)
 

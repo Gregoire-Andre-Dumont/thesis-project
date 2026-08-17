@@ -5,14 +5,13 @@ target person against nearby distractors -- using only foreground patch similari
 
 Protocol (tracker-free, ground-truth boxes):
   * Query      -- the target at its anchor frame: SAM box-prompt -> mask -> crop -> foreground tokens.
-  * Gallery    -- at each later visible frame: the target + its N nearest clean distractors, encoded
-                  the same way.
-  * Score      -- foreground chamfer similarity of each candidate's tokens to the query's.
-  * Metric     -- ROC-AUC of separating the target (label 1) from the distractors (label 0) by that
-                  score, computed over the whole dataset and per temporal bin.
-  * Long range -- AUC is binned by dt = frames elapsed since the anchor.
+  * Gallery    -- at each later visible frame: the target, plus N distractors sampled so their distance
+                  from the anchor centre is spread uniformly over DISTRACTOR_DIST_RANGE (not the nearest).
+  * Score      -- unidirectional foreground chamfer of each candidate's tokens to the anchor query's.
+  * Metric     -- ROC-AUC of separating the target (label 1) from distractors (label 0), binned by each
+                  candidate's own distance from the anchor (physical) and, secondarily, by frames elapsed.
 
-The result plot is target-vs-distractor AUC (y) versus temporal bin (x), one line per backbone.
+Two plots: AUC vs physical distance from the anchor (primary) and AUC vs temporal bin, one line/backbone.
 
 Backbones are all LARGE scale (~212-454M params) so capacity is comparable, and each emits a 32x32
 token grid (PE-L at 448, Hiera-L stage-2 at 512, SAM3 at 448):
@@ -67,7 +66,8 @@ MAX_FRAMES = 250                    # cap each trajectory to this many frames fr
 MIN_BIN_SAMPLES = 20                # a temporal bin needs this many candidate scores to be plotted
 
 DT_EDGES = np.arange(0, 301, 60)    # temporal-bin edges, in frames since the anchor (5 bins of 60)
-SPATIAL_EDGES = np.round(np.arange(0, 0.51, 0.1), 2)   # spatial bins: |centroid_t - centroid_anchor|, normalized
+SPATIAL_EDGES = np.round(np.arange(0, 0.61, 0.1), 2)   # spatial bins: candidate distance from anchor, normalized (6 bins)
+DISTRACTOR_DIST_RANGE = (0.0, 0.6)  # distractors are sampled uniformly over this distance-from-anchor range
 PLOT_PATH = "data/pe_reid_longrange.png"
 NPY_PATH = "data/pe_reid_longrange.npy"
 SPATIAL_PLOT_PATH = "data/pe_reid_longrange_spatial.png"
@@ -236,17 +236,13 @@ def foreground_tokens(sam, backbones: dict[str, TokenFn], frame: np.ndarray, box
 
 @torch.inference_mode()
 def chamfer_similarity(query_fg: torch.Tensor, candidate_fg: torch.Tensor) -> float:
-    """Symmetric chamfer between anchor (query) and candidate foreground tokens: the mean of
-      * each candidate patch's best cosine to any anchor patch  (candidate -> anchor), and
-      * each anchor patch's best cosine to any candidate patch  (anchor -> candidate).
-    The anchor->candidate direction penalizes candidates that lack the anchor's distinctive parts,
-    which the one-directional version misses."""
+    """Unidirectional chamfer: mean over candidate foreground patches of their best cosine to any
+    anchor foreground patch (candidate -> anchor)."""
     if query_fg.shape[0] == 0 or candidate_fg.shape[0] == 0:
         return float("nan")
     query = F.normalize(query_fg, dim=-1)
     candidate = F.normalize(candidate_fg, dim=-1)
-    sim = candidate @ query.T                          # (num_candidate_patches, num_anchor_patches)
-    return float(0.5 * (sim.max(dim=1).values.mean() + sim.max(dim=0).values.mean()))
+    return float((candidate @ query.T).max(dim=1).values.mean())
 
 
 # --------------------------------------------------------------------------------------------------
@@ -256,16 +252,33 @@ def _box_center(box):
     return box[0] + box[2] / 2, box[1] + box[3] / 2
 
 
-def nearest_distractors(target_box, clean_boxes: list, k: int = N_DISTRACTORS) -> list:
-    """The k clean-person boxes whose centre is closest to the target box centre."""
-    cx, cy = _box_center(target_box)
-    return sorted(clean_boxes, key=lambda b: (_box_center(b)[0] - cx) ** 2 + (_box_center(b)[1] - cy) ** 2)[:k]
+def _dist(a, b):
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
 
-def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, visible_dir, amodal_dir, stride):
-    """Yield (backbone, dt, label, score) for every candidate at every visible frame of one trajectory.
-    label is 1 for the target (candidates[0]) and 0 for a distractor; score is the chamfer similarity
-    to the anchor query."""
+def uniform_distractors(anchor_center, clean_boxes: list, rng, k: int = N_DISTRACTORS) -> list:
+    """k clean-person boxes whose centre-distance from the ANCHOR centre is spread uniformly over
+    DISTRACTOR_DIST_RANGE. For each slot, sample a target distance ~U(lo, hi) and take the nearest
+    still-available distractor to it. Returns [(box, distance_from_anchor), ...] (fewer than k if the
+    pool of in-range distractors runs out)."""
+    lo, hi = DISTRACTOR_DIST_RANGE
+    pool = [(b, _dist(_box_center(b), anchor_center)) for b in clean_boxes]
+    pool = [(b, d) for b, d in pool if lo <= d <= hi]
+    chosen = []
+    for _ in range(k):
+        if not pool:
+            break
+        target = rng.uniform(lo, hi)
+        j = min(range(len(pool)), key=lambda i: abs(pool[i][1] - target))
+        chosen.append(pool.pop(j))
+    return chosen
+
+
+def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, visible_dir, amodal_dir, stride, rng):
+    """Yield (backbone, dt, dist, label, score) for every candidate at every visible frame.
+    label is 1 for the target (candidates[0]) and 0 for a distractor; `dist` is the candidate's own
+    distance from the anchor centre (the target's uncontrolled movement; the distractors are sampled
+    uniformly over DISTRACTOR_DIST_RANGE); score is the chamfer similarity to the anchor query."""
     detection_data.initialize_target(trajectory.video, trajectory.person)
     anchor_index = anchor_trajectory_index(detection_data, trajectory.anchor_frame)
     if anchor_index is None:
@@ -299,25 +312,22 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory: Trajectory, 
     for t in range(1, len(frames), stride):
         if occlusions[t] > 0.5 or float(boxes[t][2]) <= 0:
             continue
-        distractors = nearest_distractors(boxes[t], clean_boxes.get(int(frame_indices[t]), []))
+        distractors = uniform_distractors(anchor_center, clean_boxes.get(int(frame_indices[t]), []), rng)
         if not distractors:
             continue
-        candidates = foreground_tokens(sam, backbones, frames[t], [boxes[t], *distractors], floor)  # index 0 = target
+        cand_boxes = [boxes[t]] + [box for box, _ in distractors]                 # index 0 = target
+        # each candidate's own distance from the anchor: target = its movement, distractors = sampled
+        cand_dists = [_dist(_box_center(boxes[t]), anchor_center)] + [d for _, d in distractors]
+        candidates = foreground_tokens(sam, backbones, frames[t], cand_boxes, floor)
         if candidates is None:
             continue
 
-        if DEVICE == "cuda" and t % 30 == 1:   # TEMP memory probe -- remove once leak is found
-            print(f"    [{trajectory.video} f{t}] GPU alloc {torch.cuda.memory_allocated()/1e9:.2f} GB "
-                  f"reserved {torch.cuda.memory_reserved()/1e9:.2f} GB", flush=True)
-
         dt = int(frame_indices[t]) - int(frame_indices[0])
-        cx, cy = _box_center(boxes[t])                     # how far the target has moved from the anchor
-        dist = float(((cx - anchor_center[0]) ** 2 + (cy - anchor_center[1]) ** 2) ** 0.5)
         for name in backbones:
             for i, candidate in enumerate(candidates):
                 score = chamfer_similarity(query[name], candidate[name])
                 if not np.isnan(score):
-                    yield name, dt, dist, int(i == 0), score   # label 1 = target, 0 = distractor
+                    yield name, dt, cand_dists[i], int(i == 0), score   # label 1 = target, 0 = distractor
 
 
 # --------------------------------------------------------------------------------------------------
@@ -383,9 +393,10 @@ def main(config: DictConfig):
 
     trajectories = test_trajectories(person_path)
     results = defaultdict(list)
+    rng = np.random.RandomState(0)          # reproducible uniform distractor-distance sampling
 
     for completed, trajectory in enumerate(tqdm(trajectories, desc="re-id"), start=1):
-        for name, dt, dist, label, score in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, amodal_dir, stride):
+        for name, dt, dist, label, score in evaluate_trajectory(sam, backbones, detection_data, trajectory, visible_dir, amodal_dir, stride, rng):
             results[name].append((dt, dist, label, score))
         plot_auc(results, DT_EDGES, 0, "frames since anchor", PLOT_PATH, NPY_PATH, completed)
         plot_auc(results, SPATIAL_EDGES, 1, "spatial distance from anchor (normalized)",
