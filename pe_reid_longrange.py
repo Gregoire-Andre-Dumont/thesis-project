@@ -93,7 +93,7 @@ def test_trajectories(person_path, test_size: float = 0.20, seed: int = 42) -> l
         person_path.selected_anchor_video_frames.tolist())]
     order = sorted(range(len(triples)), key=lambda i: f"{triples[i].video}_{triples[i].person}")
     _, test_idx = train_test_split(np.array(order), test_size=test_size, random_state=seed, shuffle=True)
-    return [triples[i] for i in test_idx]
+    return [triples[i] for i in sorted(test_idx)]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -203,12 +203,17 @@ def foreground_tokens(sam, backbones: dict[str, TokenFn], frame: np.ndarray, box
 
 
 def chamfer_similarity(query_fg: torch.Tensor, candidate_fg: torch.Tensor) -> float:
-    """Mean best-cosine of each candidate foreground patch to any query foreground patch."""
+    """Symmetric chamfer between anchor (query) and candidate foreground tokens: the mean of
+      * each candidate patch's best cosine to any anchor patch  (candidate -> anchor), and
+      * each anchor patch's best cosine to any candidate patch  (anchor -> candidate).
+    The anchor->candidate direction penalizes candidates that lack the anchor's distinctive parts,
+    which the one-directional version misses."""
     if query_fg.shape[0] == 0 or candidate_fg.shape[0] == 0:
         return float("nan")
     query = F.normalize(query_fg, dim=-1)
     candidate = F.normalize(candidate_fg, dim=-1)
-    return float((candidate @ query.T).max(dim=1).values.mean())
+    sim = candidate @ query.T                          # (num_candidate_patches, num_anchor_patches)
+    return float(0.5 * (sim.max(dim=1).values.mean() + sim.max(dim=0).values.mean()))
 
 
 # --------------------------------------------------------------------------------------------------
