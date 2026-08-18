@@ -39,13 +39,10 @@ max_frames: 250
 min_bin_samples: 20
 checkpoint_every: 5 
 
-distractor_dist_range: [0.0, 0.5]                         # distractors sampled uniformly over their distance from the anchor
-spatial_edges: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]   # candidate-distance-from-anchor bin edges (normalized)
-sam3_vision_config: conf/sam3_vision_config.json   # bundled to avoid the gated facebook/sam3 repo
-
+spatial_edges: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+sam3_vision_config: conf/sam3_vision_config.json
 checkpoint: data/pe_reid_checkpoint.pkl
 
-# One figure per entry; pe_spatial appears in both as the shared reference.
 figures:
   - group: [hiera_sam, hiera_mae, pe_sam3, pe_spatial]
     plot: data/pe_reid_spatial_backbones.png

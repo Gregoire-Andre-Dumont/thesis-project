@@ -147,23 +147,14 @@ def distance(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
 
-def uniform_distractors(anchor_center, clean_boxes, rng, n_distractors, dist_range):
-    """Pick n_distractors clean-person boxes whose distance from the anchor is spread uniformly over dist_range.
-    For each slot, sample a target distance and take the nearest still-available box to it."""
+def nearest_distractors(target_center, clean_boxes, n_distractors):
+    """The n_distractors clean-person boxes closest to the target this frame -- hard negatives that
+    share the target's local background and scale, so the comparison isolates appearance."""
 
-    lo, hi = dist_range
-    pool = [(box, distance(box_center(box), anchor_center)) for box in clean_boxes]
-    pool = [(box, dist) for box, dist in pool if lo <= dist <= hi]
-
-    chosen = []
-    while pool and len(chosen) < n_distractors:
-        target = rng.uniform(lo, hi)
-        nearest = min(range(len(pool)), key=lambda i: abs(pool[i][1] - target))
-        chosen.append(pool.pop(nearest))
-    return chosen
+    return sorted(clean_boxes, key=lambda box: distance(box_center(box), target_center))[:n_distractors]
 
 
-def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng):
+def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
     """Yield (backbone, dists, scores) per visible frame; index 0 is the target, the rest distractors.
     dists[i] is candidate i's distance from the anchor centre, scores[i] its chamfer to the anchor query."""
 
@@ -198,14 +189,14 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng)
     clean_boxes = load_clean_boxes_by_frame(visible_json, person)
 
     for t in range(1, len(frames), config.stride):
-        distractors = uniform_distractors(anchor_center, clean_boxes.get(int(frame_indices[t]), []),
-                                          rng, config.n_distractors, config.distractor_dist_range)
+        target_center = box_center(boxes[t])
+        distractors = nearest_distractors(target_center, clean_boxes.get(int(frame_indices[t]), []), config.n_distractors)
         if occlusions[t] > 0.5 or float(boxes[t][2]) <= 0 or not distractors:
             continue
 
-        # Candidates are the target (index 0) then the distractors, each with its distance from the anchor.
-        candidate_boxes = [boxes[t]] + [box for box, _ in distractors]
-        candidate_dists = [distance(box_center(boxes[t]), anchor_center)] + [dist for _, dist in distractors]
+        # Candidates are the target (index 0) then its nearest distractors, each binned by its distance from the anchor.
+        candidate_boxes = [boxes[t]] + distractors
+        candidate_dists = [distance(box_center(box), anchor_center) for box in candidate_boxes]
         candidates = foreground_tokens(sam, backbones, frames[t], candidate_boxes, floor, config.crop_size)
         if candidates is None:
             continue
@@ -292,13 +283,12 @@ def run_reid(config: DictConfig):
     results, done = load_checkpoint(config.checkpoint)
     print(f"benchmarking {len(trajectories)} trajectories; resuming with {len(done)} done")
 
-    rng = np.random.RandomState(0)
     for completed, trajectory in enumerate(tqdm(trajectories, desc="re-id"), start=1):
         key = f"{trajectory[0]}_{trajectory[1]}_{trajectory[2]}"
         if key in done:
             continue
 
-        for name, dists, scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng):
+        for name, dists, scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
             for index, (candidate_distance, score) in enumerate(zip(dists, scores)):
                 label = 1 if index == 0 else 0               # index 0 is the target, the rest are distractors
                 results[name].append((candidate_distance, label, score))
