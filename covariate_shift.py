@@ -92,21 +92,6 @@ def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_dir
     return target_iou, distractor_iou.max(axis=1), predicted_iou, pe_chamfer
 
 
-def collect_policy(tracker, pe_encode, detection_data, trajectories, visible_directory, crop_size):
-    """Concatenate per-frame (target_iou, distractor_iou, predicted_iou, pe_fg_chamfer) over all trajectories."""
-
-    columns = [[], [], [], []]
-    for trajectory in tqdm(trajectories, desc="tracking"):
-        result = track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_directory, crop_size)
-        if result is None:
-            continue
-        for column, values in zip(columns, result):
-            column.append(values)
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
-    return [np.concatenate(column) for column in columns]
-
-
 def auc_vs_threshold(target_iou, distractor_iou, score, target_threshold, t_values):
     """AUC of `score` separating target frames (target_iou > target_threshold, label 1) from distractor
     frames (distractor_iou > t and not on target, label 0), for each t. NaN scores/empty classes -> NaN."""
@@ -152,21 +137,32 @@ def run(config: DictConfig):
     pe_encode = load_dataset_encoders(["perception"], DEVICE, DTYPE)["perception"]
     print(f"evaluating {len(trajectories)} trajectories over {len(t_values)} distractor thresholds")
 
+    def curves_from(columns):
+        target_iou, distractor_iou, predicted_iou, pe_chamfer = [np.concatenate(c) for c in columns]
+        return {"predicted_iou": auc_vs_threshold(target_iou, distractor_iou, predicted_iou, config.target_threshold, t_values),
+                "pe_fg_chamfer": auc_vs_threshold(target_iou, distractor_iou, pe_chamfer, config.target_threshold, t_values)}
+
     policy_config = {"oracle": config.oracle_config, "baseline": config.baseline_config}
     all_curves = {}
     for policy in POLICIES:
         tracker = hydra.utils.instantiate(OmegaConf.load(policy_config[policy]).tracker)
-        target_iou, distractor_iou, predicted_iou, pe_chamfer = collect_policy(
-            tracker, pe_encode, detection_data, trajectories, config.detection_data.visible_directory, config.crop_size)
+        columns = [[], [], [], []]                       # target_iou, distractor_iou, predicted_iou, pe_fg_chamfer
+        for completed, trajectory in enumerate(tqdm(trajectories, desc=policy), start=1):
+            result = track_trajectory(tracker, pe_encode, detection_data, trajectory, config.detection_data.visible_directory, config.crop_size)
+            if result is not None:
+                for column, values in zip(columns, result):
+                    column.append(values)
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
+            if completed % config.plot_every == 0 and columns[0]:     # refresh the figure as it builds
+                plot_policy(policy, curves_from(columns), t_values, config.target_threshold, completed, f"{config.plot_prefix}_{policy}.png")
 
-        curves = {"predicted_iou": auc_vs_threshold(target_iou, distractor_iou, predicted_iou, config.target_threshold, t_values),
-                  "pe_fg_chamfer": auc_vs_threshold(target_iou, distractor_iou, pe_chamfer, config.target_threshold, t_values)}
-        all_curves[policy] = curves
-
+        all_curves[policy] = curves_from(columns)
+        target_iou, distractor_iou = np.concatenate(columns[0]), np.concatenate(columns[1])
         n_target = int((target_iou > config.target_threshold).sum())
         n_distractor = int(((distractor_iou > config.t_min) & (target_iou <= config.target_threshold)).sum())
         print(f"{policy:9s} frames: target={n_target}  distractor(>{config.t_min})={n_distractor}")
-        plot_policy(policy, curves, t_values, config.target_threshold, len(trajectories), f"{config.plot_prefix}_{policy}.png")
+        plot_policy(policy, all_curves[policy], t_values, config.target_threshold, len(trajectories), f"{config.plot_prefix}_{policy}.png")
 
     np.save(f"{config.plot_prefix}.npy", {"t_values": t_values, "curves": all_curves, "n_traj": len(trajectories)}, allow_pickle=True)
     print("\nAUC vs distractor threshold t  (predicted_iou | pe_fg_chamfer):")

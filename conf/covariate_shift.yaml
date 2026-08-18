@@ -27,10 +27,10 @@ target_threshold: 0.2    # a frame is a TARGET frame when the proposal's target 
 t_min: 0.1               # sweep of the distractor threshold t (a frame is a DISTRACTOR frame when distractor IoU > t)
 t_max: 0.8
 t_steps: 11
-crop_size: 512           # crop resolution for the PE foreground tokens
+plot_every: 3          # refresh each policy figure every this many trajectories
 
 # the two memory-gating policies
 oracle_config: conf/trackers/baselines/memory_oracle.yaml     # commits on TRUE IoU
 baseline_config: conf/trackers/baselines/sam_baseline.yaml    # commits on SAM's own predicted IoU
-
-plot_prefix: data/covariate_shift    # writes {prefix}_oracle.png, {prefix}_baseline.png, {prefix}.npy
+plot: data/covariate_shift.png
+npy: data/covariate_shift.npy
