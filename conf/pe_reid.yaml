@@ -20,7 +20,7 @@ person_path:
   resize_resolution: 1024
   min_visible_area: 500
   max_visible_area: null
-  max_distractor_overlap: 0.25
+  max_distractor_overlap: 0.30
   min_distractor_overlap: 0.00
   non_targets:
     - "crowd"

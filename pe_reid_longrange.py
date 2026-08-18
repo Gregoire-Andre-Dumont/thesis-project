@@ -20,9 +20,9 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-from src.offline_training.dataset_encoders import crop_around_masks, load_dataset_encoders, _norm, _patch_masks, HALF
+from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, load_dataset_encoders, _norm, _patch_masks, HALF
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame, _box_center as box_center
-from src.utils.load_bboxes import convert_bbox
+from src.utils.load_bboxes import convert_bbox, load_bboxes
 from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
 
 
@@ -104,17 +104,17 @@ def box_prompt_masks(sam, frame, boxes):
 
 
 @torch.inference_mode()
-def entity_tokens(sam, backbones, frame, boxes, crop_size):
-    """Return each box's (foreground, background) tokens for every backbone, cropped tightly around its
-    own mask. Returns a list aligned to boxes (each entry {backbone: (fg, bg)}), or None if any mask is empty."""
+def entity_tokens(sam, backbones, frame, boxes, floor, crop_size):
+    """Return each box's (foreground, background) tokens for every backbone, cropped around its own mask
+    but floored at the anchor scale. Returns a list aligned to boxes ({backbone: (fg, bg)}), or None if any mask is empty."""
 
     box_masks = box_prompt_masks(sam, frame, boxes)
     if any((box_mask > 0).sum() == 0 for box_mask in box_masks):
         return None
 
-    # Crop every box out of the (repeated) frame in one call, each at its own mask's natural scale.
+    # Crop every box out of the (repeated) frame in one call, floored at the anchor scale.
     frame_per_box = np.repeat(frame[None], len(box_masks), axis=0)
-    box_crops, box_crop_masks = crop_around_masks(frame_per_box, np.stack(box_masks).astype(np.float32), crop_size, 0.25)
+    box_crops, box_crop_masks = crop_around_masks(frame_per_box, np.stack(box_masks).astype(np.float32), crop_size, 0.5, floor)
 
     tokens_by_box = [{} for _ in boxes]
     for backbone_name, encode in backbones.items():
@@ -131,13 +131,17 @@ def entity_tokens(sam, backbones, frame, boxes, crop_size):
 
 @torch.inference_mode()
 def chamfer_similarity(reference_fg, tokens):
-    """Unidirectional chamfer: mean best cosine of each token to any anchor-foreground patch. NaN if either is empty."""
+    """Bidirectional (symmetric) chamfer: average of tokens->anchor and anchor->tokens mean best cosine.
+    NaN if either side is empty."""
 
     if reference_fg.shape[0] == 0 or tokens.shape[0] == 0:
         return float("nan")
     reference = F.normalize(reference_fg, dim=-1)
     tokens = F.normalize(tokens, dim=-1)
-    return float((tokens @ reference.T).max(dim=1).values.mean())
+    similarity = tokens @ reference.T                        # (n_tokens, n_anchor_fg)
+    tokens_to_anchor = similarity.max(dim=1).values.mean()   # each candidate token -> best anchor patch
+    anchor_to_tokens = similarity.max(dim=0).values.mean()   # each anchor patch -> best candidate token
+    return float(0.5 * (tokens_to_anchor + anchor_to_tokens))
 
 
 def distance(a, b):
@@ -171,7 +175,11 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
     if anchor_index is None:
         return
 
+    # The anchor's amodal box (full extent, incl. occluded parts) sets the crop-size floor for the trajectory.
     visible_json = Path(config.detection_data.visible_directory) / f"{video}.json"
+    amodal_json = Path(config.detection_data.amodal_directory) / f"{video}.json"
+    anchor_amodal = load_bboxes(str(amodal_json), str(visible_json), person, use_amodal=True)[anchor_index]
+
     warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
     window = slice(warmup, warmup + config.max_frames)
     frames = detection_data.frames[window]
@@ -181,8 +189,10 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
     if len(frames) < 2 or float(boxes[0][2]) <= 0:
         return
 
-    # Anchor query: the target's foreground tokens at frame 0, cropped tightly around its own mask.
-    anchor = entity_tokens(sam, backbones, frames[0], [boxes[0]], config.crop_size)
+    # Anchor query: the target's foreground tokens at frame 0, cropped at the anchor's amodal scale.
+    anchor_box = anchor_amodal if float(anchor_amodal[2]) > 0 else boxes[0]
+    floor = anchor_size_pixels(anchor_box, frames[0].shape)
+    anchor = entity_tokens(sam, backbones, frames[0], [boxes[0]], floor, config.crop_size)
     if anchor is None:
         return
     query = anchor[0]
@@ -203,7 +213,7 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
         # Candidates are the target (index 0) then its nearest distractors, each binned by its distance from the anchor.
         candidate_boxes = [boxes[t]] + distractors
         candidate_dists = [distance(to_pixel(box, width, height, px_scale), anchor_center) for box in candidate_boxes]
-        candidates = entity_tokens(sam, backbones, frames[t], candidate_boxes, config.crop_size)
+        candidates = entity_tokens(sam, backbones, frames[t], candidate_boxes, floor, config.crop_size)
         if candidates is None:
             continue
 
