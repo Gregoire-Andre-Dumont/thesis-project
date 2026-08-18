@@ -217,7 +217,7 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng)
 
 
 def auc(pairs):
-    """Target-vs-distractor AUC over pairs (distractor_dist, target_score, distractor_score); NaN if empty."""
+    """Target-vs-distractor AUC over pairs (target_distance, target_score, distractor_score); NaN if empty."""
 
     if not pairs:
         return float("nan")
@@ -228,14 +228,14 @@ def auc(pairs):
 
 
 def binned_auc(pairs, edges, min_bin_samples):
-    """Target-vs-distractor AUC per bin of the distractor's distance from the anchor; NaN for thin bins."""
+    """Target-vs-distractor AUC per bin of the target's distance from the anchor; NaN for thin bins."""
 
     bins = [[p for p in pairs if lo <= p[0] < hi] for lo, hi in zip(edges[:-1], edges[1:])]
     return [auc(b) if len(b) >= min_bin_samples else np.nan for b in bins]
 
 
 def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj):
-    """Plot one figure spec (its backbones' AUC vs distractor distance) and save the figure and curves."""
+    """Plot one figure spec (its backbones' AUC vs target distance from anchor) and save the figure and curves."""
 
     curves = {name: binned_auc(results[name], edges, min_bin_samples) for name in spec.group if name in results}
     centers = (edges[:-1] + edges[1:]) / 2
@@ -245,7 +245,7 @@ def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj):
         axis.plot(centers, curve, marker="o", markersize=5, color=colors.get(name), label=name)
     axis.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="chance (0.50)")
 
-    axis.set_xlabel("distractor distance from anchor (normalized)")
+    axis.set_xlabel("target distance from anchor (normalized)")
     axis.set_ylabel("target-vs-distractor AUC")
     axis.set_title(f"Re-ID via foreground similarity  |  {n_traj} trajectories", fontsize=10)
     axis.set_ylim(0.45, 1.02)
@@ -299,8 +299,9 @@ def run_reid(config: DictConfig):
             continue
 
         for name, dists, scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng):
-            for dist, score in zip(dists[1:], scores[1:]):
-                results[name].append((dist, scores[0], score))
+            target_distance = dists[0]                       # how far the target has drifted from the anchor
+            for distractor_score in scores[1:]:
+                results[name].append((target_distance, scores[0], distractor_score))
         done.add(key)
 
         for spec in config.figures:
