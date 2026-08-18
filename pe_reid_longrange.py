@@ -132,13 +132,16 @@ def foreground_tokens(sam, backbones, frame, boxes, floor, crop_size):
 
 @torch.inference_mode()
 def chamfer_similarity(query_fg, candidate_fg):
-    """Unidirectional chamfer: mean best cosine of each candidate foreground patch to the anchor's."""
+    """Bidirectional (symmetric) chamfer: average of candidate->anchor and anchor->candidate mean best cosine."""
 
     if query_fg.shape[0] == 0 or candidate_fg.shape[0] == 0:
         return float("nan")
     query = F.normalize(query_fg, dim=-1)
     candidate = F.normalize(candidate_fg, dim=-1)
-    return float((candidate @ query.T).max(dim=1).values.mean())
+    similarity = candidate @ query.T                        # (n_candidate_patches, n_anchor_patches)
+    candidate_to_anchor = similarity.max(dim=1).values.mean()
+    anchor_to_candidate = similarity.max(dim=0).values.mean()
+    return float(0.5 * (candidate_to_anchor + anchor_to_candidate))
 
 
 def distance(a, b):
@@ -225,6 +228,23 @@ def binned_auc(samples, edges, min_bin_samples):
     return [auc(b) if len(b) >= min_bin_samples else np.nan for b in bins]
 
 
+def diagnose(results, edges):
+    """Print, per backbone and bin, the target/distractor counts and mean similarity, so the AUC shape
+    can be read off directly: a dip is either the gap collapsing (dis_sim rising to tgt_sim) or the bin
+    being target-starved (tiny n_tgt)."""
+
+    for name, samples in results.items():
+        print(f"\n{name}")
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            in_bin = [s for s in samples if lo <= s[0] < hi]
+            target_sims = [s[2] for s in in_bin if s[1] == 1]
+            distractor_sims = [s[2] for s in in_bin if s[1] == 0]
+            if target_sims and distractor_sims:
+                tgt, dis = np.mean(target_sims), np.mean(distractor_sims)
+                print(f"  d[{lo:.1f},{hi:.1f}) n_tgt={len(target_sims):4d} n_dis={len(distractor_sims):5d} "
+                      f"tgt_sim={tgt:.3f} dis_sim={dis:.3f} gap={tgt - dis:+.3f}")
+
+
 def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj):
     """Plot one figure spec (its backbones' AUC vs candidate distance from anchor) and save the figure and curves."""
 
@@ -298,10 +318,12 @@ def run_reid(config: DictConfig):
             plot_auc(results, spec, edges, colors, config.min_bin_samples, len(done))
         if completed % config.checkpoint_every == 0:
             save_checkpoint(config.checkpoint, results, done)
+            diagnose(results, edges)
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
     save_checkpoint(config.checkpoint, results, done)
+    diagnose(results, edges)
 
 
 if __name__ == "__main__":

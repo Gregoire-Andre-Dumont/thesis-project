@@ -20,7 +20,7 @@ person_path:
   resize_resolution: 1024
   min_visible_area: 500
   max_visible_area: null
-  max_distractor_overlap: 0.50
+  max_distractor_overlap: 0.25
   min_distractor_overlap: 0.00
   non_targets:
     - "crowd"
@@ -31,7 +31,7 @@ person_path:
 
 # re-id parameters
 n_traj: 300
-stride: 1   
+stride: 2   
 crop_size: 512  
 sam3_input: 448   
 n_distractors: 2 
