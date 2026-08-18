@@ -1,0 +1,36 @@
+detection_data:
+  _target_: src.typing.detection_data.DetectionData
+  amodal_directory: data/person_path/amodal
+  visible_directory: data/person_path/visible
+  video_directory: data/person_path/videos
+  load_frames: True
+  num_threads: 32
+
+person_path:
+  _target_: src.typing.person_path.PersonPath
+  main_directory: data/person_path
+  occlusion_ranges: [2, 150]
+  n_experiments: 1200
+  n_after_occlusion: 50
+  random_seed: 44
+  min_visible_ratio: 0.7
+  resize_resolution: 1024
+  min_visible_area: 600
+  max_visible_area: null
+  max_distractor_overlap: 0.30
+  min_distractor_overlap: 0.00
+  non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person]
+
+# experiment parameters
+n_traj: 300              # test trajectories to evaluate
+target_threshold: 0.2    # a frame is a TARGET frame when the proposal's target mask-IoU exceeds this
+t_min: 0.1               # sweep of the distractor threshold t (a frame is a DISTRACTOR frame when distractor IoU > t)
+t_max: 0.6
+t_steps: 11
+
+# the two memory-gating policies
+oracle_config: conf/trackers/baselines/memory_oracle.yaml     # commits on TRUE IoU
+baseline_config: conf/trackers/baselines/sam_baseline.yaml    # commits on SAM's own predicted IoU
+
+plot: data/covariate_shift.png
+npy: data/covariate_shift.npy
