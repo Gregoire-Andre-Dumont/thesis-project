@@ -39,7 +39,7 @@ max_frames: 250
 min_bin_samples: 20
 checkpoint_every: 5 
 
-spatial_edges: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+n_bins: 5                # equal-count (quantile) distance bins, so every bin holds the same #samples
 sam3_vision_config: conf/sam3_vision_config.json
 checkpoint: data/pe_reid_checkpoint.pkl
 

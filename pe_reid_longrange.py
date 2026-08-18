@@ -20,9 +20,9 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, load_dataset_encoders, _norm, _patch_masks, HALF
+from src.offline_training.dataset_encoders import crop_around_masks, load_dataset_encoders, _norm, _patch_masks, HALF
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame, _box_center as box_center
-from src.utils.load_bboxes import convert_bbox, load_bboxes
+from src.utils.load_bboxes import convert_bbox
 from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
 
 
@@ -104,17 +104,17 @@ def box_prompt_masks(sam, frame, boxes):
 
 
 @torch.inference_mode()
-def entity_tokens(sam, backbones, frame, boxes, floor, crop_size):
-    """Return each box's (foreground, background) tokens for every backbone, cropped at the anchor scale.
-    Returns a list aligned to boxes (each entry {backbone: (fg, bg)}), or None if any box's mask is empty."""
+def entity_tokens(sam, backbones, frame, boxes, crop_size):
+    """Return each box's (foreground, background) tokens for every backbone, cropped tightly around its
+    own mask. Returns a list aligned to boxes (each entry {backbone: (fg, bg)}), or None if any mask is empty."""
 
     box_masks = box_prompt_masks(sam, frame, boxes)
     if any((box_mask > 0).sum() == 0 for box_mask in box_masks):
         return None
 
-    # Crop every box out of the (repeated) frame in one call, floored at the anchor scale.
+    # Crop every box out of the (repeated) frame in one call, each at its own mask's natural scale.
     frame_per_box = np.repeat(frame[None], len(box_masks), axis=0)
-    box_crops, box_crop_masks = crop_around_masks(frame_per_box, np.stack(box_masks).astype(np.float32), crop_size, 0.25, floor)
+    box_crops, box_crop_masks = crop_around_masks(frame_per_box, np.stack(box_masks).astype(np.float32), crop_size, 0.25)
 
     tokens_by_box = [{} for _ in boxes]
     for backbone_name, encode in backbones.items():
@@ -146,11 +146,19 @@ def distance(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
 
-def nearest_distractors(target_center, clean_boxes, n_distractors):
+def to_pixel(box, width, height, scale):
+    """Box centre in pixels at the common working resolution -- un-normalized, and isotropic in x and y
+    (both scaled the same), unlike the per-axis normalized coordinates."""
+
+    cx, cy = box_center(box)
+    return cx * width * scale, cy * height * scale
+
+
+def nearest_distractors(target_center, clean_boxes, n_distractors, width, height, scale):
     """The n_distractors clean-person boxes closest to the target this frame -- hard negatives that
     share the target's local background and scale, so the comparison isolates appearance."""
 
-    return sorted(clean_boxes, key=lambda box: distance(box_center(box), target_center))[:n_distractors]
+    return sorted(clean_boxes, key=lambda box: distance(to_pixel(box, width, height, scale), target_center))[:n_distractors]
 
 
 def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
@@ -163,11 +171,7 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
     if anchor_index is None:
         return
 
-    # The anchor's amodal box (full extent, incl. occluded parts) sets the crop scale for the trajectory.
     visible_json = Path(config.detection_data.visible_directory) / f"{video}.json"
-    amodal_json = Path(config.detection_data.amodal_directory) / f"{video}.json"
-    anchor_amodal = load_bboxes(str(amodal_json), str(visible_json), person, use_amodal=True)[anchor_index]
-
     warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
     window = slice(warmup, warmup + config.max_frames)
     frames = detection_data.frames[window]
@@ -177,26 +181,29 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
     if len(frames) < 2 or float(boxes[0][2]) <= 0:
         return
 
-    # Anchor query: the target's foreground tokens at frame 0, cropped at the anchor's amodal scale.
-    anchor_box = anchor_amodal if float(anchor_amodal[2]) > 0 else boxes[0]
-    floor = anchor_size_pixels(anchor_box, frames[0].shape)
-    anchor = entity_tokens(sam, backbones, frames[0], [boxes[0]], floor, config.crop_size)
+    # Anchor query: the target's foreground tokens at frame 0, cropped tightly around its own mask.
+    anchor = entity_tokens(sam, backbones, frames[0], [boxes[0]], config.crop_size)
     if anchor is None:
         return
     query = anchor[0]
-    anchor_center = box_center(boxes[0])
     clean_boxes = load_clean_boxes_by_frame(visible_json, person)
 
+    # Distances are measured in pixels at the common 1024 working resolution (un-normalized, isotropic).
+    height, width = frames[0].shape[:2]
+    px_scale = 1024.0 / max(width, height)
+    anchor_center = to_pixel(boxes[0], width, height, px_scale)
+
     for t in range(1, len(frames), config.stride):
-        target_center = box_center(boxes[t])
-        distractors = nearest_distractors(target_center, clean_boxes.get(int(frame_indices[t]), []), config.n_distractors)
+        target_center = to_pixel(boxes[t], width, height, px_scale)
+        distractors = nearest_distractors(target_center, clean_boxes.get(int(frame_indices[t]), []),
+                                          config.n_distractors, width, height, px_scale)
         if occlusions[t] > 0.5 or float(boxes[t][2]) <= 0 or not distractors:
             continue
 
         # Candidates are the target (index 0) then its nearest distractors, each binned by its distance from the anchor.
         candidate_boxes = [boxes[t]] + distractors
-        candidate_dists = [distance(box_center(box), anchor_center) for box in candidate_boxes]
-        candidates = entity_tokens(sam, backbones, frames[t], candidate_boxes, floor, config.crop_size)
+        candidate_dists = [distance(to_pixel(box, width, height, px_scale), anchor_center) for box in candidate_boxes]
+        candidates = entity_tokens(sam, backbones, frames[t], candidate_boxes, config.crop_size)
         if candidates is None:
             continue
 
@@ -228,6 +235,19 @@ def binned_auc(samples, edges, min_bin_samples):
     return [auc(b) if len(b) >= min_bin_samples else np.nan for b in bins]
 
 
+def quantile_edges(results, n_bins):
+    """Equal-count distance-bin edges from the pooled candidate distances (identical across backbones),
+    so each bin holds the same number of samples. None until there are enough samples to bin."""
+
+    samples = next(iter(results.values()), [])
+    if len(samples) < n_bins:
+        return None
+    distances = np.array([s[0] for s in samples])
+    edges = np.quantile(distances, np.linspace(0, 1, n_bins + 1))
+    edges[-1] += 1e-9                                    # make the top edge inclusive
+    return edges
+
+
 def diagnose(results, edges):
     """Print, per backbone and bin, the target/distractor counts and mean similarity, so the AUC shape
     can be read off directly: a dip is either the gap collapsing (dis_sim rising to tgt_sim) or the bin
@@ -249,14 +269,20 @@ def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj, metric="fore
     """Plot one figure spec (its backbones' AUC vs candidate distance from anchor) and save the figure and curves."""
 
     curves = {name: binned_auc(results[name], edges, min_bin_samples) for name in spec.group if name in results}
-    centers = (edges[:-1] + edges[1:]) / 2
+
+    # Place each point at its bin's median distance (bins are equal-count, so unevenly spaced in distance).
+    ref = next((results[name] for name in spec.group if name in results), [])
+    ref_distances = np.array([s[0] for s in ref])
+    centers = [np.median(ref_distances[(ref_distances >= lo) & (ref_distances < hi)])
+               if ((ref_distances >= lo) & (ref_distances < hi)).any() else (lo + hi) / 2
+               for lo, hi in zip(edges[:-1], edges[1:])]
 
     figure, axis = plt.subplots(figsize=(8.5, 5.4))
     for name, curve in curves.items():
         axis.plot(centers, curve, marker="o", markersize=5, color=colors.get(name), label=name)
     axis.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="chance (0.50)")
 
-    axis.set_xlabel("candidate distance from anchor (normalized)")
+    axis.set_xlabel("candidate distance from anchor (pixels @1024, equal-count bins)")
     axis.set_ylabel("target-vs-distractor AUC")
     axis.set_title(f"Re-ID via {metric}  |  {n_traj} trajectories", fontsize=10)
     axis.set_ylim(0.45, 1.02)
@@ -297,7 +323,6 @@ def run_reid(config: DictConfig):
     backbones = load_backbones(config.sam3_vision_config, config.sam3_input)
     print(f"backbones: {list(backbones)}")
 
-    edges = np.array(config.spatial_edges, dtype=float)
     colors = OmegaConf.to_container(config.colors)
     trajectories = test_trajectories(person_path, config.n_traj)
     results_fg, results_fgbg, done = load_checkpoint(config.checkpoint)
@@ -315,6 +340,9 @@ def run_reid(config: DictConfig):
                 results_fgbg[name].append((candidate_distance, label, fgbg))
         done.add(key)
 
+        edges = quantile_edges(results_fg, config.n_bins)
+        if edges is None:
+            continue
         for spec in config.figures:
             plot_auc(results_fg, spec, edges, colors, config.min_bin_samples, len(done))
         plot_auc(results_fgbg, config.fgbg_figure, edges, colors, config.min_bin_samples, len(done), metric="FG - BG")
