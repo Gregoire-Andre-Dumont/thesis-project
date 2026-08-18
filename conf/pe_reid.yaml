@@ -34,7 +34,7 @@ n_traj: 300
 stride: 1   
 crop_size: 512  
 sam3_input: 448   
-n_distractors: 3  
+n_distractors: 2 
 max_frames: 250    
 min_bin_samples: 20
 checkpoint_every: 5 
