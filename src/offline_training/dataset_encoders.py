@@ -1,11 +1,11 @@
-"""Four ~80M encoders that each turn a crop into a 32x32 grid of patch tokens, for the calibrator dataset.
+"""Four LARGE (~212-304M) encoders that each turn a crop into a 32x32 grid of patch tokens, for the calibrator dataset.
 No hiera/memory variants -- one token set per encoder. All share the 32x32 grid so their patch-similarity
 maps to the anchor are comparable.
 
-  pe        vit_pe_spatial_base_patch16_512.fb   86.4M  contrastive VL   (512 -> 32x32, HALF norm)
-  dino      vit_base_patch16_dinov3.lvd1689m     85.6M  self-sup DINOv3  (512 -> 32x32, ImageNet norm)
-  hiera_sam sam2_hiera_base_plus.fb_r896_2pt1    ~70M   Hiera-B+ SAM2    (512 -> 32x32 stage-2)
-  hiera_mae hiera_base_plus_224.mae              69.9M  Hiera-B+ MAE     (512 -> 32x32 stage-2, pos interp)
+  perception vit_pe_spatial_large_patch14_448.fb  ~304M  contrastive VL   (448 -> 32x32, HALF norm)
+  dino       vit_large_patch16_dinov3.lvd1689m    ~300M  self-sup DINOv3  (512 -> 32x32, ImageNet norm)
+  hiera_sam  sam2_hiera_large.fb_r1024_2pt1       ~212M  Hiera-L SAM2     (512 -> 32x32 stage-2)
+  hiera_mae  hiera_large_224.mae                  ~213M  Hiera-L MAE      (512 -> 32x32 stage-2, pos interp)
 """
 import cv2
 import numpy as np
@@ -33,31 +33,31 @@ def _hiera_stage2(model, crops, dev, dtype):
 
 
 def _load_hiera_mae(dev, dtype):
-    """Hiera-B+ MAE backbone at 512 (features_only). timm won't interpolate the pos_embed on load,
+    """Hiera-L MAE backbone at 512 (features_only). timm won't interpolate the pos_embed on load,
     so we bicubic-resize the pretrained 56x56 stage-0 grid to 128x128 and load with the 'model.' prefix."""
-    src = timm.create_model("hiera_base_plus_224.mae", pretrained=True).state_dict()
-    pe = src["pos_embed"]                                                 # (1, 56*56, 112)
+    src = timm.create_model("hiera_large_224.mae", pretrained=True).state_dict()
+    pe = src["pos_embed"]                                                 # (1, 56*56, dim)
     s, d = int(pe.shape[1] ** .5), pe.shape[2]
     src["pos_embed"] = F.interpolate(pe.reshape(1, s, s, d).permute(0, 3, 1, 2).float(),
                                      size=(GRID * 4, GRID * 4), mode="bicubic", align_corners=False
                                      ).permute(0, 2, 3, 1).reshape(1, (GRID * 4) ** 2, d)
-    model = timm.create_model("hiera_base_plus_224.mae", pretrained=False, img_size=512, features_only=True)
+    model = timm.create_model("hiera_large_224.mae", pretrained=False, img_size=512, features_only=True)
     model.load_state_dict({"model." + k: v for k, v in src.items()}, strict=False)
     return model.eval().to(dev).to(dtype)
 
 
 def _build_perception(dev, dtype):
-    pe = timm.create_model("vit_pe_spatial_base_patch16_512.fb", pretrained=True, num_classes=0).eval().to(dev).to(dtype)
-    return lambda crops: pe.forward_features(_norm(crops, 512, HALF, HALF, dev, dtype))[:, pe.num_prefix_tokens:].float()
+    pe = timm.create_model("vit_pe_spatial_large_patch14_448.fb", pretrained=True, num_classes=0).eval().to(dev).to(dtype)
+    return lambda crops: pe.forward_features(_norm(crops, 448, HALF, HALF, dev, dtype))[:, pe.num_prefix_tokens:].float()
 
 
 def _build_dino(dev, dtype):
-    dino = timm.create_model("vit_base_patch16_dinov3.lvd1689m", pretrained=True, num_classes=0, img_size=512).eval().to(dev).to(dtype)
+    dino = timm.create_model("vit_large_patch16_dinov3.lvd1689m", pretrained=True, num_classes=0, img_size=512).eval().to(dev).to(dtype)
     return lambda crops: dino.forward_features(_norm(crops, 512, IMEAN, ISTD, dev, dtype))[:, dino.num_prefix_tokens:].float()
 
 
 def _build_hiera_sam(dev, dtype):
-    sam2 = timm.create_model("sam2_hiera_base_plus.fb_r896_2pt1", pretrained=True, features_only=True).eval().to(dev).to(dtype)
+    sam2 = timm.create_model("sam2_hiera_large.fb_r1024_2pt1", pretrained=True, features_only=True).eval().to(dev).to(dtype)
     return lambda crops: _hiera_stage2(sam2, crops, dev, dtype)
 
 

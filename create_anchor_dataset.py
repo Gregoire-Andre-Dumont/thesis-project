@@ -21,7 +21,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["HYDRA_FULL_ERROR"] = "1"
 
-# The four ~80M backbones the calibrator dataset is built for (one token set each, no variants).
+# The four LARGE (~212-304M) backbones the calibrator dataset is built for (one token set each, no variants).
 ENCODER_NAMES = ("perception", "dino", "hiera_sam", "hiera_mae")
 
 

@@ -1,0 +1,62 @@
+defaults:
+  - trackers@tracker: baselines/sam_baseline
+
+detection_data:
+  _target_: src.typing.detection_data.DetectionData
+  amodal_directory: data/person_path/amodal
+  visible_directory: data/person_path/visible
+  video_directory: data/person_path/videos
+  load_frames: True
+  num_threads: 32
+
+person_path:
+  _target_: src.typing.person_path.PersonPath
+  main_directory: data/person_path
+  occlusion_ranges: [2, 150]
+  n_experiments: 1200
+  n_after_occlusion: 50
+  random_seed: 44
+  min_visible_ratio: 0.7
+  resize_resolution: 1024
+  min_visible_area: 500
+  max_visible_area: null
+  max_distractor_overlap: 0.50
+  min_distractor_overlap: 0.00
+  non_targets:
+    - "crowd"
+    - "person_in_vehicle"
+    - "reflection"
+    - "person_in_background"
+    - "severly_occluded_person"
+
+# re-id parameters
+n_traj: 300
+stride: 1   
+crop_size: 512  
+sam3_input: 448   
+n_distractors: 3  
+max_frames: 250    
+min_bin_samples: 20
+checkpoint_every: 5 
+
+distractor_dist_range: [0.0, 0.5]               # distractors sampled uniformly over this distance range
+spatial_edges: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]   # distractor-distance bin edges (normalized)
+sam3_vision_config: conf/sam3_vision_config.json   # bundled to avoid the gated facebook/sam3 repo
+
+checkpoint: data/pe_reid_checkpoint.pkl
+
+# One figure per entry; pe_spatial appears in both as the shared reference.
+figures:
+  - group: [hiera_sam, hiera_mae, pe_sam3, pe_spatial]
+    plot: data/pe_reid_spatial_backbones.png
+    npy: data/pe_reid_spatial_backbones.npy
+  - group: [pe_spatial, pe_core]
+    plot: data/pe_reid_spatial_pe.png
+    npy: data/pe_reid_spatial_pe.npy
+
+colors:
+  pe_core: "#cc4444"
+  pe_spatial: "#22aa77"
+  pe_sam3: "#3377cc"
+  hiera_mae: "#dd9933"
+  hiera_sam: "#9944bb"
