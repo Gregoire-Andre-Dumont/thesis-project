@@ -158,14 +158,18 @@ def to_pixel(box, width, height, scale):
     return cx * width * scale, cy * height * scale
 
 
-def nearest_distractors(target_center, clean_boxes, n_distractors, width, height, scale):
-    """The n_distractors clean-person boxes closest to the target this frame -- hard negatives that
-    share the target's local background and scale, so the comparison isolates appearance."""
+def clean_distractors(clean_boxes, n_distractors, min_norm_area, rng):
+    """Up to n_distractors clean people whose box is large enough (>= min_norm_area -- the same visible-area
+    floor the target satisfies), chosen at random rather than by proximity, so they are not biased toward
+    the target's local background."""
 
-    return sorted(clean_boxes, key=lambda box: distance(to_pixel(box, width, height, scale), target_center))[:n_distractors]
+    pool = [box for box in clean_boxes if box[2] * box[3] >= min_norm_area]
+    if len(pool) <= n_distractors:
+        return pool
+    return [pool[i] for i in rng.choice(len(pool), size=n_distractors, replace=False)]
 
 
-def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
+def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng):
     """Yield (backbone, dists, fg_scores, fgbg_scores) per visible frame; index 0 is the target, rest distractors.
     fg = candidate foreground vs anchor foreground; fgbg = that minus candidate background vs anchor foreground."""
 
@@ -202,15 +206,14 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
     height, width = frames[0].shape[:2]
     px_scale = 1024.0 / max(width, height)
     anchor_center = to_pixel(boxes[0], width, height, px_scale)
+    min_norm_area = config.person_path.min_visible_area / (width * height * px_scale ** 2)   # target's visible-area floor, in normalized area
 
     for t in range(1, len(frames), config.stride):
-        target_center = to_pixel(boxes[t], width, height, px_scale)
-        distractors = nearest_distractors(target_center, clean_boxes.get(int(frame_indices[t]), []),
-                                          config.n_distractors, width, height, px_scale)
+        distractors = clean_distractors(clean_boxes.get(int(frame_indices[t]), []), config.n_distractors, min_norm_area, rng)
         if occlusions[t] > 0.5 or float(boxes[t][2]) <= 0 or not distractors:
             continue
 
-        # Candidates are the target (index 0) then its nearest distractors, each binned by its distance from the anchor.
+        # Candidates are the target (index 0) then its clean distractors, each binned by its distance from the anchor.
         candidate_boxes = [boxes[t]] + distractors
         candidate_dists = [distance(to_pixel(box, width, height, px_scale), anchor_center) for box in candidate_boxes]
         candidates = entity_tokens(sam, backbones, frames[t], candidate_boxes, floor, config.crop_size)
@@ -338,12 +341,13 @@ def run_reid(config: DictConfig):
     results_fg, results_fgbg, done = load_checkpoint(config.checkpoint)
     print(f"benchmarking {len(trajectories)} trajectories; resuming with {len(done)} done")
 
+    rng = np.random.RandomState(0)          # reproducible random distractor choice
     for completed, trajectory in enumerate(tqdm(trajectories, desc="re-id"), start=1):
         key = f"{trajectory[0]}_{trajectory[1]}_{trajectory[2]}"
         if key in done:
             continue
 
-        for name, dists, fg_scores, fgbg_scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
+        for name, dists, fg_scores, fgbg_scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng):
             for index, (candidate_distance, fg, fgbg) in enumerate(zip(dists, fg_scores, fgbg_scores)):
                 label = 1 if index == 0 else 0               # index 0 is the target, the rest are distractors
                 results_fg[name].append((candidate_distance, label, fg))
