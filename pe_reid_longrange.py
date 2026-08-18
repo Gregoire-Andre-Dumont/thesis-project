@@ -216,26 +216,26 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng)
                 yield name, candidate_dists, scores
 
 
-def auc(pairs):
-    """Target-vs-distractor AUC over pairs (target_distance, target_score, distractor_score); NaN if empty."""
+def auc(samples):
+    """AUC separating target (label 1) from distractor (label 0) over samples (candidate_distance, label, score).
+    NaN if empty or single-class."""
 
-    if not pairs:
+    if not samples:
         return float("nan")
-    positives = [p[1] for p in pairs]
-    negatives = [p[2] for p in pairs]
-    labels = np.array([1] * len(positives) + [0] * len(negatives))
-    return roc_auc_score(labels, np.array(positives + negatives))
+    labels = np.array([s[1] for s in samples])
+    scores = np.array([s[2] for s in samples])
+    return roc_auc_score(labels, scores) if 0 < labels.sum() < len(labels) else float("nan")
 
 
-def binned_auc(pairs, edges, min_bin_samples):
-    """Target-vs-distractor AUC per bin of the target's distance from the anchor; NaN for thin bins."""
+def binned_auc(samples, edges, min_bin_samples):
+    """Target-vs-distractor AUC per bin of the candidate's own distance from the anchor; NaN for thin bins."""
 
-    bins = [[p for p in pairs if lo <= p[0] < hi] for lo, hi in zip(edges[:-1], edges[1:])]
+    bins = [[s for s in samples if lo <= s[0] < hi] for lo, hi in zip(edges[:-1], edges[1:])]
     return [auc(b) if len(b) >= min_bin_samples else np.nan for b in bins]
 
 
 def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj):
-    """Plot one figure spec (its backbones' AUC vs target distance from anchor) and save the figure and curves."""
+    """Plot one figure spec (its backbones' AUC vs candidate distance from anchor) and save the figure and curves."""
 
     curves = {name: binned_auc(results[name], edges, min_bin_samples) for name in spec.group if name in results}
     centers = (edges[:-1] + edges[1:]) / 2
@@ -245,7 +245,7 @@ def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj):
         axis.plot(centers, curve, marker="o", markersize=5, color=colors.get(name), label=name)
     axis.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="chance (0.50)")
 
-    axis.set_xlabel("target distance from anchor (normalized)")
+    axis.set_xlabel("candidate distance from anchor (normalized)")
     axis.set_ylabel("target-vs-distractor AUC")
     axis.set_title(f"Re-ID via foreground similarity  |  {n_traj} trajectories", fontsize=10)
     axis.set_ylim(0.45, 1.02)
@@ -299,9 +299,9 @@ def run_reid(config: DictConfig):
             continue
 
         for name, dists, scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng):
-            target_distance = dists[0]                       # how far the target has drifted from the anchor
-            for distractor_score in scores[1:]:
-                results[name].append((target_distance, scores[0], distractor_score))
+            for index, (candidate_distance, score) in enumerate(zip(dists, scores)):
+                label = 1 if index == 0 else 0               # index 0 is the target, the rest are distractors
+                results[name].append((candidate_distance, label, score))
         done.add(key)
 
         for spec in config.figures:

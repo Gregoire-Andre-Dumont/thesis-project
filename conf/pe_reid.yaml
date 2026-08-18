@@ -40,7 +40,7 @@ min_bin_samples: 20
 checkpoint_every: 5 
 
 distractor_dist_range: [0.0, 0.5]                         # distractors sampled uniformly over their distance from the anchor
-spatial_edges: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]   # target-distance-from-anchor bin edges (normalized)
+spatial_edges: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]   # candidate-distance-from-anchor bin edges (normalized)
 sam3_vision_config: conf/sam3_vision_config.json   # bundled to avoid the gated facebook/sam3 repo
 
 checkpoint: data/pe_reid_checkpoint.pkl
