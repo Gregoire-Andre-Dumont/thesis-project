@@ -104,9 +104,9 @@ def box_prompt_masks(sam, frame, boxes):
 
 
 @torch.inference_mode()
-def foreground_tokens(sam, backbones, frame, boxes, floor, crop_size):
-    """Return each box's foreground tokens for every backbone, cropped at the anchor scale (floor).
-    Returns a list aligned to boxes, or None if any box yields an empty mask."""
+def entity_tokens(sam, backbones, frame, boxes, floor, crop_size):
+    """Return each box's (foreground, background) tokens for every backbone, cropped at the anchor scale.
+    Returns a list aligned to boxes (each entry {backbone: (fg, bg)}), or None if any box's mask is empty."""
 
     box_masks = box_prompt_masks(sam, frame, boxes)
     if any((box_mask > 0).sum() == 0 for box_mask in box_masks):
@@ -116,32 +116,28 @@ def foreground_tokens(sam, backbones, frame, boxes, floor, crop_size):
     frame_per_box = np.repeat(frame[None], len(box_masks), axis=0)
     box_crops, box_crop_masks = crop_around_masks(frame_per_box, np.stack(box_masks).astype(np.float32), crop_size, 0.25, floor)
 
-    foreground_by_box = [{} for _ in boxes]
+    tokens_by_box = [{} for _ in boxes]
     for backbone_name, encode in backbones.items():
         patch_tokens = encode(box_crops)                                        # (num_boxes, 32*32, dim)
         foreground_masks = _patch_masks(box_crop_masks, patch_tokens.device)
 
-        for box_foreground, box_patch_tokens, mask in zip(foreground_by_box, patch_tokens, foreground_masks):
-            box_foreground[backbone_name] = box_patch_tokens[mask].clone()
-        del patch_tokens 
-                        
+        for box_tokens, box_patch_tokens, mask in zip(tokens_by_box, patch_tokens, foreground_masks):
+            box_tokens[backbone_name] = (box_patch_tokens[mask].clone(), box_patch_tokens[~mask].clone())
+        del patch_tokens                                # free this backbone before the next large model runs
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
-    return foreground_by_box
+    return tokens_by_box
 
 
 @torch.inference_mode()
-def chamfer_similarity(query_fg, candidate_fg):
-    """Bidirectional (symmetric) chamfer: average of candidate->anchor and anchor->candidate mean best cosine."""
+def chamfer_similarity(reference_fg, tokens):
+    """Unidirectional chamfer: mean best cosine of each token to any anchor-foreground patch. NaN if either is empty."""
 
-    if query_fg.shape[0] == 0 or candidate_fg.shape[0] == 0:
+    if reference_fg.shape[0] == 0 or tokens.shape[0] == 0:
         return float("nan")
-    query = F.normalize(query_fg, dim=-1)
-    candidate = F.normalize(candidate_fg, dim=-1)
-    similarity = candidate @ query.T                        # (n_candidate_patches, n_anchor_patches)
-    candidate_to_anchor = similarity.max(dim=1).values.mean()
-    anchor_to_candidate = similarity.max(dim=0).values.mean()
-    return float(0.5 * (candidate_to_anchor + anchor_to_candidate))
+    reference = F.normalize(reference_fg, dim=-1)
+    tokens = F.normalize(tokens, dim=-1)
+    return float((tokens @ reference.T).max(dim=1).values.mean())
 
 
 def distance(a, b):
@@ -158,8 +154,8 @@ def nearest_distractors(target_center, clean_boxes, n_distractors):
 
 
 def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
-    """Yield (backbone, dists, scores) per visible frame; index 0 is the target, the rest distractors.
-    dists[i] is candidate i's distance from the anchor centre, scores[i] its chamfer to the anchor query."""
+    """Yield (backbone, dists, fg_scores, fgbg_scores) per visible frame; index 0 is the target, rest distractors.
+    fg = candidate foreground vs anchor foreground; fgbg = that minus candidate background vs anchor foreground."""
 
     video, person, anchor_frame = trajectory
     detection_data.initialize_target(video, person)
@@ -184,7 +180,7 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
     # Anchor query: the target's foreground tokens at frame 0, cropped at the anchor's amodal scale.
     anchor_box = anchor_amodal if float(anchor_amodal[2]) > 0 else boxes[0]
     floor = anchor_size_pixels(anchor_box, frames[0].shape)
-    anchor = foreground_tokens(sam, backbones, frames[0], [boxes[0]], floor, config.crop_size)
+    anchor = entity_tokens(sam, backbones, frames[0], [boxes[0]], floor, config.crop_size)
     if anchor is None:
         return
     query = anchor[0]
@@ -200,14 +196,18 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
         # Candidates are the target (index 0) then its nearest distractors, each binned by its distance from the anchor.
         candidate_boxes = [boxes[t]] + distractors
         candidate_dists = [distance(box_center(box), anchor_center) for box in candidate_boxes]
-        candidates = foreground_tokens(sam, backbones, frames[t], candidate_boxes, floor, config.crop_size)
+        candidates = entity_tokens(sam, backbones, frames[t], candidate_boxes, floor, config.crop_size)
         if candidates is None:
             continue
 
         for name in backbones:
-            scores = [chamfer_similarity(query[name], candidate[name]) for candidate in candidates]
-            if not any(np.isnan(scores)):
-                yield name, candidate_dists, scores
+            anchor_fg = query[name][0]
+            fg_scores = [chamfer_similarity(anchor_fg, candidate[name][0]) for candidate in candidates]   # candidate FG vs anchor FG
+            bg_scores = [chamfer_similarity(anchor_fg, candidate[name][1]) for candidate in candidates]   # candidate BG vs anchor FG
+            if any(np.isnan(fg_scores)) or any(np.isnan(bg_scores)):
+                continue
+            fgbg_scores = [fg - bg for fg, bg in zip(fg_scores, bg_scores)]
+            yield name, candidate_dists, fg_scores, fgbg_scores
 
 
 def auc(samples):
@@ -245,7 +245,7 @@ def diagnose(results, edges):
                       f"tgt_sim={tgt:.3f} dis_sim={dis:.3f} gap={tgt - dis:+.3f}")
 
 
-def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj):
+def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj, metric="foreground similarity"):
     """Plot one figure spec (its backbones' AUC vs candidate distance from anchor) and save the figure and curves."""
 
     curves = {name: binned_auc(results[name], edges, min_bin_samples) for name in spec.group if name in results}
@@ -258,7 +258,7 @@ def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj):
 
     axis.set_xlabel("candidate distance from anchor (normalized)")
     axis.set_ylabel("target-vs-distractor AUC")
-    axis.set_title(f"Re-ID via foreground similarity  |  {n_traj} trajectories", fontsize=10)
+    axis.set_title(f"Re-ID via {metric}  |  {n_traj} trajectories", fontsize=10)
     axis.set_ylim(0.45, 1.02)
     axis.grid(alpha=0.3)
     axis.legend(loc="lower left", fontsize=8)
@@ -270,19 +270,19 @@ def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj):
 
 
 def load_checkpoint(path):
-    """Load (results, done) from the checkpoint file, or an empty pair when there is none."""
+    """Load (results_fg, results_fgbg, done) from the checkpoint, or empties when there is none."""
 
     if not Path(path).exists():
-        return defaultdict(list), set()
+        return defaultdict(list), defaultdict(list), set()
     state = pickle.loads(Path(path).read_bytes())
-    return defaultdict(list, state["results"]), set(state["done"])
+    return defaultdict(list, state["results_fg"]), defaultdict(list, state["results_fgbg"]), set(state["done"])
 
 
-def save_checkpoint(path, results, done):
-    """Atomically write the raw pairs and finished-trajectory keys so the next run resumes here."""
+def save_checkpoint(path, results_fg, results_fgbg, done):
+    """Atomically write the FG and FG-BG samples plus finished-trajectory keys so the next run resumes here."""
 
     tmp = Path(path).with_suffix(".pkl.tmp")
-    tmp.write_bytes(pickle.dumps({"results": dict(results), "done": list(done)}))
+    tmp.write_bytes(pickle.dumps({"results_fg": dict(results_fg), "results_fgbg": dict(results_fgbg), "done": list(done)}))
     tmp.replace(path)
 
 
@@ -300,7 +300,7 @@ def run_reid(config: DictConfig):
     edges = np.array(config.spatial_edges, dtype=float)
     colors = OmegaConf.to_container(config.colors)
     trajectories = test_trajectories(person_path, config.n_traj)
-    results, done = load_checkpoint(config.checkpoint)
+    results_fg, results_fgbg, done = load_checkpoint(config.checkpoint)
     print(f"benchmarking {len(trajectories)} trajectories; resuming with {len(done)} done")
 
     for completed, trajectory in enumerate(tqdm(trajectories, desc="re-id"), start=1):
@@ -308,22 +308,26 @@ def run_reid(config: DictConfig):
         if key in done:
             continue
 
-        for name, dists, scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
-            for index, (candidate_distance, score) in enumerate(zip(dists, scores)):
+        for name, dists, fg_scores, fgbg_scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, config):
+            for index, (candidate_distance, fg, fgbg) in enumerate(zip(dists, fg_scores, fgbg_scores)):
                 label = 1 if index == 0 else 0               # index 0 is the target, the rest are distractors
-                results[name].append((candidate_distance, label, score))
+                results_fg[name].append((candidate_distance, label, fg))
+                results_fgbg[name].append((candidate_distance, label, fgbg))
         done.add(key)
 
         for spec in config.figures:
-            plot_auc(results, spec, edges, colors, config.min_bin_samples, len(done))
+            plot_auc(results_fg, spec, edges, colors, config.min_bin_samples, len(done))
+        plot_auc(results_fgbg, config.fgbg_figure, edges, colors, config.min_bin_samples, len(done), metric="FG - BG")
         if completed % config.checkpoint_every == 0:
-            save_checkpoint(config.checkpoint, results, done)
-            diagnose(results, edges)
+            save_checkpoint(config.checkpoint, results_fg, results_fgbg, done)
+            diagnose(results_fg, edges)
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-    save_checkpoint(config.checkpoint, results, done)
-    diagnose(results, edges)
+    save_checkpoint(config.checkpoint, results_fg, results_fgbg, done)
+    print("\noverall target-vs-distractor AUC (FG | FG-BG):")
+    for name in results_fg:
+        print(f"  {name:11s} FG={auc(results_fg[name]):.3f}   FG-BG={auc(results_fgbg[name]):.3f}   (n={len(results_fg[name])})")
 
 
 if __name__ == "__main__":

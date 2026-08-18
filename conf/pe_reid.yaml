@@ -34,7 +34,7 @@ n_traj: 300
 stride: 2   
 crop_size: 512  
 sam3_input: 448   
-n_distractors: 2 
+n_distractors: 3
 max_frames: 250    
 min_bin_samples: 20
 checkpoint_every: 5 
@@ -50,6 +50,12 @@ figures:
   - group: [pe_spatial, pe_core]
     plot: data/pe_reid_spatial_pe.png
     npy: data/pe_reid_spatial_pe.npy
+
+# Third figure: FG - BG (foreground-minus-background similarity) for the four group-A encoders.
+fgbg_figure:
+  group: [hiera_sam, hiera_mae, pe_sam3, pe_spatial]
+  plot: data/pe_reid_fgbg.png
+  npy: data/pe_reid_fgbg.npy
 
 colors:
   pe_core: "#cc4444"
