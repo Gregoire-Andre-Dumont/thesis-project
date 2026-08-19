@@ -48,15 +48,17 @@ def _box_center(b):
 
 @torch.inference_mode()
 def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, clean_boxes_by_frame,
-                      frame_indices, occlusions, k=3, chunk=4):
-    """Return target_iou (n,) and distractor_iou (n, k). Each frame is encoded once and its proposal
-    mask is scored against the box-prompted pseudo-GT of the target and the k nearest clean distractors.
-    Occluded frames stay zero; fewer than k distractors leaves the remaining columns zero."""
+                      frame_indices, occlusions, k=3, chunk=4, precomputed_features=None):
+    """Return target_iou (n,) and distractor_iou (n, k). Each frame's proposal mask is scored against the
+    box-prompted pseudo-GT of the target and the k nearest clean distractors. Occluded frames stay zero;
+    fewer than k distractors leaves the remaining columns zero.
+
+    precomputed_features: optional {t: [lowres, hires_x2, hires_x4]} per-frame image encodings (B=1) to
+    reuse instead of re-running the SAM image encoder -- the same 3-map list the trackers cache."""
 
     n = len(frames)
     target_iou = np.zeros(n, np.float32)
     distractor_iou = np.zeros((n, k), np.float32)
-    prepared = [model.image_encoder.prepare_image(cv2.cvtColor(f, cv2.COLOR_RGB2BGR), 1024, True) for f in frames]
 
     def prompt_iou(single, predicted, box):
         mask, _, _ = model.initialize_video_masking(single, convert_bbox(np.asarray(box, np.float32)))
@@ -67,27 +69,33 @@ def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, clean_boxes_
         union = (predicted | pseudo_gt).sum()
         return float((predicted & pseudo_gt).sum() / union) if union > 0 else 0.0
 
-    for start in range(0, n, chunk):
-        feats = model.image_encoder(torch.cat(prepared[start:start + chunk], dim=0))
-        for i in range(feats[0].shape[0]):
-            t = start + i
-            if occlusions[t] > 0.5:
-                continue
-            single = [f[i:i + 1] for f in feats]
-            predicted = np.asarray(predicted_masks[t]) > 0
+    def score_frame(t, single):
+        if occlusions[t] > 0.5:
+            return
+        predicted = np.asarray(predicted_masks[t]) > 0
+        if float(target_boxes[t][2]) > 0.0:
+            target_iou[t] = prompt_iou(single, predicted, target_boxes[t])
 
-            if float(target_boxes[t][2]) > 0.0:
-                target_iou[t] = prompt_iou(single, predicted, target_boxes[t])
+        center = _centroid_norm(predicted)
+        if center is None:
+            if float(target_boxes[t][2]) <= 0.0:
+                return
+            center = _box_center(target_boxes[t])
+        boxes = clean_boxes_by_frame.get(int(frame_indices[t]), [])
+        nearest = sorted(boxes, key=lambda b: (_box_center(b)[0] - center[0]) ** 2
+                                              + (_box_center(b)[1] - center[1]) ** 2)[:k]
+        for j, box in enumerate(nearest):
+            distractor_iou[t, j] = prompt_iou(single, predicted, box)
 
-            center = _centroid_norm(predicted)
-            if center is None:
-                if float(target_boxes[t][2]) <= 0.0:
-                    continue
-                center = _box_center(target_boxes[t])
-            boxes = clean_boxes_by_frame.get(int(frame_indices[t]), [])
-            nearest = sorted(boxes, key=lambda b: (_box_center(b)[0] - center[0]) ** 2
-                                                  + (_box_center(b)[1] - center[1]) ** 2)[:k]
-            for j, box in enumerate(nearest):
-                distractor_iou[t, j] = prompt_iou(single, predicted, box)
+    if precomputed_features is not None:                    # reuse cached encodings; no image-encoder pass
+        device = next(model.image_encoder.parameters()).device
+        for t in range(n):
+            score_frame(t, [f.to(device) for f in precomputed_features[t]])
+    else:
+        prepared = [model.image_encoder.prepare_image(cv2.cvtColor(f, cv2.COLOR_RGB2BGR), 1024, True) for f in frames]
+        for start in range(0, n, chunk):
+            feats = model.image_encoder(torch.cat(prepared[start:start + chunk], dim=0))
+            for i in range(feats[0].shape[0]):
+                score_frame(start + i, [f[i:i + 1] for f in feats])
 
     return target_iou, distractor_iou

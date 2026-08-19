@@ -54,10 +54,11 @@ def pe_foreground_tokens(pe_encode, frames, masks, floor, crop_size, chunk=16):
     return [tokens[i][foreground[i]].clone() for i in range(len(crops))]
 
 
-def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_directory, crop_size):
+def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_directory, crop_size, frame_cache):
     """Run one policy over a trajectory and return per-frame (target_iou, distractor_iou, predicted_iou,
     pe_fg_chamfer), or None if the anchor is missing. distractor_iou is the max over nearest distractors;
-    pe_fg_chamfer is the proposal's PE foreground chamfer to the frame-0 target."""
+    pe_fg_chamfer is the proposal's PE foreground chamfer to the frame-0 target. `frame_cache` is a shared
+    {frame_index: image features} dict -- filled by the first policy on this trajectory, reused by the rest."""
 
     video, person, anchor_frame = trajectory
     detection_data.initialize_target(video, person)
@@ -66,6 +67,7 @@ def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_dir
         return None
 
     warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
+    tracker.frame_cache = frame_cache                   # reuse SAM image encodings across policies + label prompts
     predicted_masks = tracker.predict_masks(detection_data).numpy()
     predicted_iou = tracker.iou_scores.numpy()
 
@@ -79,9 +81,12 @@ def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_dir
     if len(frames) < 2 or float(boxes[0][2]) <= 0:
         return None
 
+    # The pseudo-GT labels reuse the cached per-frame encodings (cache is keyed on the warmup-inclusive clip).
     clean_boxes = load_clean_boxes_by_frame(Path(visible_directory) / f"{video}.json", person)
+    precomputed = {t: frame_cache[warmup + t] for t in range(len(frames)) if warmup + t in frame_cache}
     target_iou, distractor_iou = pseudo_iou_labels(
-        tracker.model, frames, predicted_masks, boxes, clean_boxes, frame_indices, occlusions)
+        tracker.model, frames, predicted_masks, boxes, clean_boxes, frame_indices, occlusions,
+        precomputed_features=precomputed if len(precomputed) == len(frames) else None)
 
     # PE foreground chamfer of each proposal to the frame-0 target proposal (the anchor).
     floor = anchor_size_pixels(boxes[0], frames[0].shape)
@@ -143,22 +148,30 @@ def run(config: DictConfig):
                 "pe_fg_chamfer": auc_vs_threshold(target_iou, distractor_iou, pe_chamfer, config.target_threshold, t_values)}
 
     policy_config = {"oracle": config.oracle_config, "baseline": config.baseline_config}
+    trackers = {policy: hydra.utils.instantiate(OmegaConf.load(policy_config[policy]).tracker) for policy in POLICIES}
+    columns = {policy: [[], [], [], []] for policy in POLICIES}   # per policy: target_iou, distractor_iou, predicted_iou, pe_fg_chamfer
+
+    # Interleaved: run both policies on each trajectory so both figures build together. A fresh per-trajectory
+    # cache holds the SAM image encodings, filled by the first policy and reused by the second (and the labels).
+    for completed, trajectory in enumerate(tqdm(trajectories, desc="covariate-shift"), start=1):
+        frame_cache = {}
+        for policy in POLICIES:
+            result = track_trajectory(trackers[policy], pe_encode, detection_data, trajectory,
+                                      config.detection_data.visible_directory, config.crop_size, frame_cache)
+            if result is not None:
+                for column, values in zip(columns[policy], result):
+                    column.append(values)
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        if completed % config.plot_every == 0:                    # refresh both figures as they build
+            for policy in POLICIES:
+                if columns[policy][0]:
+                    plot_policy(policy, curves_from(columns[policy]), t_values, config.target_threshold, completed, f"{config.plot_prefix}_{policy}.png")
+
     all_curves = {}
     for policy in POLICIES:
-        tracker = hydra.utils.instantiate(OmegaConf.load(policy_config[policy]).tracker)
-        columns = [[], [], [], []]                       # target_iou, distractor_iou, predicted_iou, pe_fg_chamfer
-        for completed, trajectory in enumerate(tqdm(trajectories, desc=policy), start=1):
-            result = track_trajectory(tracker, pe_encode, detection_data, trajectory, config.detection_data.visible_directory, config.crop_size)
-            if result is not None:
-                for column, values in zip(columns, result):
-                    column.append(values)
-            if DEVICE == "cuda":
-                torch.cuda.empty_cache()
-            if completed % config.plot_every == 0 and columns[0]:     # refresh the figure as it builds
-                plot_policy(policy, curves_from(columns), t_values, config.target_threshold, completed, f"{config.plot_prefix}_{policy}.png")
-
-        all_curves[policy] = curves_from(columns)
-        target_iou, distractor_iou = np.concatenate(columns[0]), np.concatenate(columns[1])
+        all_curves[policy] = curves_from(columns[policy])
+        target_iou, distractor_iou = np.concatenate(columns[policy][0]), np.concatenate(columns[policy][1])
         n_target = int((target_iou > config.target_threshold).sum())
         n_distractor = int(((distractor_iou > config.t_min) & (target_iou <= config.target_threshold)).sum())
         print(f"{policy:9s} frames: target={n_target}  distractor(>{config.t_min})={n_distractor}")
