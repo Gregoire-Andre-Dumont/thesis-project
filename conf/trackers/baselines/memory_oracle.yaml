@@ -4,7 +4,7 @@ tracker:
   use_mask_iou: true
   model:
     _target_: src.modules.samara_hiera_model.SamaraHieraModel
-    sam_model_path: tm/sam_large.pt
+    sam_model_path: tm/sam_base_plus.pt
     crop_resize: 512
     pad_ratio: 1.0
     

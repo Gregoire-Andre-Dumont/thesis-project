@@ -54,11 +54,13 @@ def pe_foreground_tokens(pe_encode, frames, masks, floor, crop_size, chunk=16):
     return [tokens[i][foreground[i]].clone() for i in range(len(crops))]
 
 
-def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_directory, crop_size, frame_cache, max_frames):
+def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_directory, crop_size, frame_cache,
+                     max_frames, target_threshold, t_min):
     """Run one policy over a trajectory and return per-frame (target_iou, distractor_iou, predicted_iou,
     pe_fg_chamfer), or None if the anchor is missing. distractor_iou is the max over nearest distractors;
-    pe_fg_chamfer is the proposal's PE foreground chamfer to the frame-0 target. `frame_cache` is a shared
-    {frame_index: image features} dict -- filled by the first policy on this trajectory, reused by the rest."""
+    pe_fg_chamfer is the proposal's PE foreground chamfer to the frame-0 target (NaN on frames the AUC
+    ignores). `frame_cache` is a shared {frame_index: image features} dict -- filled by the first policy
+    on this trajectory, reused by the rest."""
 
     video, person, anchor_frame = trajectory
     detection_data.initialize_target(video, person)
@@ -93,14 +95,21 @@ def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_dir
     target_iou, distractor_iou = pseudo_iou_labels(
         tracker.model, frames, predicted_masks, boxes, clean_boxes, frame_indices, occlusions,
         precomputed_features=precomputed if len(precomputed) == len(frames) else None, include_occluded=True)
+    distractor_iou = distractor_iou.max(axis=1)
 
-    # PE foreground chamfer of each proposal to the frame-0 target proposal (the anchor).
+    # PE foreground chamfer, but only on the frames the AUC will use (target, or distractor at the lowest t),
+    # plus the anchor reference (frame 0). Ignored frames stay NaN and are dropped from the AUC anyway.
+    selected = (target_iou > target_threshold) | (distractor_iou > t_min)
+    selected[0] = True                                   # the anchor is the chamfer reference
+    indices = np.where(selected)[0]
     floor = anchor_size_pixels(boxes[0], frames[0].shape)
-    fg_tokens = pe_foreground_tokens(pe_encode, frames, predicted_masks, floor, crop_size)
-    anchor_fg = fg_tokens[0]
-    pe_chamfer = np.array([chamfer_scores(anchor_fg, fg)[0] for fg in fg_tokens], np.float32)
+    fg_tokens = pe_foreground_tokens(pe_encode, frames[indices], predicted_masks[indices], floor, crop_size)
+    anchor_fg = fg_tokens[0]                              # frame 0 is the first selected index
+    pe_chamfer = np.full(len(frames), np.nan, np.float32)
+    for local, global_index in enumerate(indices):
+        pe_chamfer[global_index] = chamfer_scores(anchor_fg, fg_tokens[local])[0]
 
-    return target_iou, distractor_iou.max(axis=1), predicted_iou, pe_chamfer
+    return target_iou, distractor_iou, predicted_iou, pe_chamfer
 
 
 def auc_vs_threshold(target_iou, distractor_iou, score, target_threshold, t_values):
@@ -157,12 +166,15 @@ def run(config: DictConfig):
     trackers = {policy: hydra.utils.instantiate(OmegaConf.load(policy_config[policy]).tracker) for policy in POLICIES}
     columns = {policy: [[], [], [], []] for policy in POLICIES}   # per policy: target_iou, distractor_iou, predicted_iou, pe_fg_chamfer
 
-    # Interleaved: run both policies on each trajectory so both figures build together. Each policy gets its
-    # OWN per-trajectory cache (its predict_masks fills it, its labels reuse it) -- no cross-policy sharing.
+    # Interleaved: run both policies on each trajectory so both figures build together. Both policies now use
+    # the SAME SAM model, so one per-trajectory cache is shared -- the first policy fills the SAM image
+    # encodings, the second (and both label passes) reuse them.
     for completed, trajectory in enumerate(tqdm(trajectories, desc="covariate-shift"), start=1):
+        frame_cache = {}
         for policy in POLICIES:
             result = track_trajectory(trackers[policy], pe_encode, detection_data, trajectory,
-                                      config.detection_data.visible_directory, config.crop_size, {}, config.max_frames)
+                                      config.detection_data.visible_directory, config.crop_size, frame_cache,
+                                      config.max_frames, config.target_threshold, config.t_min)
             if result is not None:
                 for column, values in zip(columns[policy], result):
                     column.append(values)
