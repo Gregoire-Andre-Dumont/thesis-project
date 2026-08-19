@@ -157,13 +157,12 @@ def run(config: DictConfig):
     trackers = {policy: hydra.utils.instantiate(OmegaConf.load(policy_config[policy]).tracker) for policy in POLICIES}
     columns = {policy: [[], [], [], []] for policy in POLICIES}   # per policy: target_iou, distractor_iou, predicted_iou, pe_fg_chamfer
 
-    # Interleaved: run both policies on each trajectory so both figures build together. A fresh per-trajectory
-    # cache holds the SAM image encodings, filled by the first policy and reused by the second (and the labels).
+    # Interleaved: run both policies on each trajectory so both figures build together. Each policy gets its
+    # OWN per-trajectory cache (its predict_masks fills it, its labels reuse it) -- no cross-policy sharing.
     for completed, trajectory in enumerate(tqdm(trajectories, desc="covariate-shift"), start=1):
-        frame_cache = {}
         for policy in POLICIES:
             result = track_trajectory(trackers[policy], pe_encode, detection_data, trajectory,
-                                      config.detection_data.visible_directory, config.crop_size, frame_cache, config.max_frames)
+                                      config.detection_data.visible_directory, config.crop_size, {}, config.max_frames)
             if result is not None:
                 for column, values in zip(columns[policy], result):
                     column.append(values)
@@ -176,7 +175,9 @@ def run(config: DictConfig):
                     distractor_iou = np.concatenate(columns[policy][1])
                     n_target = int((target_iou > config.target_threshold).sum())
                     n_distractor = int(((distractor_iou > config.t_min) & (target_iou <= config.target_threshold)).sum())
-                    print(f"[{completed}] {policy:9s} frames: target={n_target}  distractor(>{config.t_min})={n_distractor}", flush=True)
+                    print(f"[{completed}] {policy:9s} frames: target={n_target}  distractor(>{config.t_min})={n_distractor}"
+                          f"  | target_iou max={target_iou.max():.2f} mean={target_iou.mean():.2f}"
+                          f"  distractor_iou max={distractor_iou.max():.2f}", flush=True)
                     plot_policy(policy, curves_from(columns[policy]), t_values, config.target_threshold, completed, f"{config.plot_prefix}_{policy}.png")
 
     all_curves = {}
