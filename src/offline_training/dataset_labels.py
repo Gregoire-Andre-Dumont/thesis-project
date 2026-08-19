@@ -48,10 +48,14 @@ def _box_center(b):
 
 @torch.inference_mode()
 def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, clean_boxes_by_frame,
-                      frame_indices, occlusions, k=3, chunk=4, precomputed_features=None):
+                      frame_indices, occlusions, k=3, chunk=4, precomputed_features=None, include_occluded=False):
     """Return target_iou (n,) and distractor_iou (n, k). Each frame's proposal mask is scored against the
-    box-prompted pseudo-GT of the target and the k nearest clean distractors. Occluded frames stay zero;
-    fewer than k distractors leaves the remaining columns zero.
+    box-prompted pseudo-GT of the target and the k nearest clean distractors. Fewer than k distractors
+    leaves the remaining columns zero.
+
+    include_occluded: if False (default), occluded frames stay zero. If True, occluded frames are still
+    scored for DISTRACTOR IoU (the target has no GT box so target_iou stays 0, but a distractor overlap is
+    an unambiguous capture) -- used to catch captures that happen while the target is occluded.
 
     precomputed_features: optional {t: [lowres, hires_x2, hires_x4]} per-frame image encodings (B=1) to
     reuse instead of re-running the SAM image encoder -- the same 3-map list the trackers cache."""
@@ -70,7 +74,7 @@ def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, clean_boxes_
         return float((predicted & pseudo_gt).sum() / union) if union > 0 else 0.0
 
     def score_frame(t, single):
-        if occlusions[t] > 0.5:
+        if occlusions[t] > 0.5 and not include_occluded:
             return
         predicted = np.asarray(predicted_masks[t]) > 0
         if float(target_boxes[t][2]) > 0.0:

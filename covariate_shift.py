@@ -54,7 +54,7 @@ def pe_foreground_tokens(pe_encode, frames, masks, floor, crop_size, chunk=16):
     return [tokens[i][foreground[i]].clone() for i in range(len(crops))]
 
 
-def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_directory, crop_size, frame_cache):
+def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_directory, crop_size, frame_cache, max_frames):
     """Run one policy over a trajectory and return per-frame (target_iou, distractor_iou, predicted_iou,
     pe_fg_chamfer), or None if the anchor is missing. distractor_iou is the max over nearest distractors;
     pe_fg_chamfer is the proposal's PE foreground chamfer to the frame-0 target. `frame_cache` is a shared
@@ -67,6 +67,12 @@ def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_dir
         return None
 
     warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
+    end = warmup + max_frames                            # cap the trajectory length before tracking
+    detection_data.frames = detection_data.frames[:end]
+    detection_data.bboxes_norm = detection_data.bboxes_norm[:end]
+    detection_data.occlusions = detection_data.occlusions[:end]
+    detection_data.frame_indices = detection_data.frame_indices[:end]
+
     tracker.frame_cache = frame_cache                   # reuse SAM image encodings across policies + label prompts
     predicted_masks = tracker.predict_masks(detection_data).numpy()
     predicted_iou = tracker.iou_scores.numpy()
@@ -86,7 +92,7 @@ def track_trajectory(tracker, pe_encode, detection_data, trajectory, visible_dir
     precomputed = {t: frame_cache[warmup + t] for t in range(len(frames)) if warmup + t in frame_cache}
     target_iou, distractor_iou = pseudo_iou_labels(
         tracker.model, frames, predicted_masks, boxes, clean_boxes, frame_indices, occlusions,
-        precomputed_features=precomputed if len(precomputed) == len(frames) else None)
+        precomputed_features=precomputed if len(precomputed) == len(frames) else None, include_occluded=True)
 
     # PE foreground chamfer of each proposal to the frame-0 target proposal (the anchor).
     floor = anchor_size_pixels(boxes[0], frames[0].shape)
@@ -157,7 +163,7 @@ def run(config: DictConfig):
         frame_cache = {}
         for policy in POLICIES:
             result = track_trajectory(trackers[policy], pe_encode, detection_data, trajectory,
-                                      config.detection_data.visible_directory, config.crop_size, frame_cache)
+                                      config.detection_data.visible_directory, config.crop_size, frame_cache, config.max_frames)
             if result is not None:
                 for column, values in zip(columns[policy], result):
                     column.append(values)
@@ -166,6 +172,11 @@ def run(config: DictConfig):
         if completed % config.plot_every == 0:                    # refresh both figures as they build
             for policy in POLICIES:
                 if columns[policy][0]:
+                    target_iou = np.concatenate(columns[policy][0])
+                    distractor_iou = np.concatenate(columns[policy][1])
+                    n_target = int((target_iou > config.target_threshold).sum())
+                    n_distractor = int(((distractor_iou > config.t_min) & (target_iou <= config.target_threshold)).sum())
+                    print(f"[{completed}] {policy:9s} frames: target={n_target}  distractor(>{config.t_min})={n_distractor}", flush=True)
                     plot_policy(policy, curves_from(columns[policy]), t_values, config.target_threshold, completed, f"{config.plot_prefix}_{policy}.png")
 
     all_curves = {}

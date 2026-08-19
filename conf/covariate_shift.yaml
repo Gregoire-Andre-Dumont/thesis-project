@@ -28,6 +28,7 @@ t_min: 0.1               # sweep of the distractor threshold t (a frame is a DIS
 t_max: 0.8
 t_steps: 11
 crop_size: 512           # crop resolution for the PE foreground tokens
+max_frames: 250          # cap each trajectory to this many frames from the anchor
 plot_every: 3          # refresh each policy figure every this many trajectories
 
 # the two memory-gating policies
