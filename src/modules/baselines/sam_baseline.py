@@ -32,9 +32,10 @@ class SAMBaseline:
     def predict_masks(self, detection_data: DetectionData):
         """Predict the masks of the target object with the baseline SAM 2."""
 
-        # Reset and initialize the memory bank with the new target
+        # Reset and initialize the memory bank with the new target (the anchor, same as the oracle --
+        # after warmup slicing the anchor is at index 1, so use initialize_references' default).
         self.main_memory.reset_memory()
-        self.main_memory.initialize_references(self.model, detection_data, anchor_index=0)
+        self.main_memory.initialize_references(self.model, detection_data)
 
         n_frames = detection_data.frames.shape[0]
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)
