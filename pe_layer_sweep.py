@@ -40,7 +40,9 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 
 MIN_DIST = 400.0                                  # only score candidates this far (px @1024) from the anchor
 LAYER_STEP = 4                                    # sample every this many transformer blocks
-COLORS = {"pe_core": "#cc4444", "pe_spatial": "#22aa77", "pe_sam3": "#3377cc"}
+CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)   # CLIP / OWL-ViT normalization
+CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+COLORS = {"pe_core": "#cc4444", "pe_spatial": "#22aa77", "pe_sam3": "#3377cc", "clip": "#9467bd", "owlvit": "#ff7f0e"}
 UNI_PATH, BI_PATH, NPY_PATH = "data/pe_layer_sweep_uni.png", "data/pe_layer_sweep_bi.png", "data/pe_layer_sweep_unibi.npy"
 
 
@@ -88,6 +90,27 @@ def load_pe_sam3(sam3_config, sam3_input):
             patches = h.shape[1]
             grid = round(patches ** 0.5)
             if grid * grid != patches:                                  # drop leading prefix tokens (e.g. CLS)
+                h = h[:, patches - grid * grid:]
+            out[layer] = h.float()
+        return out
+    return encode
+
+
+def load_hf_vision(model_cls, name, size, mean, std):
+    """A transformers CLIP-style vision model (CLIP / OWL-ViT) as a per-layer encoder; drops the CLS token.
+    interpolate_pos_encoding lets both run at `size` so their token grids match despite different native inputs."""
+    model = model_cls.from_pretrained(name).eval().to(DEVICE).to(DTYPE)
+
+    @torch.inference_mode()
+    def encode(crops):
+        x = _norm(crops, size, mean, std, DEVICE, DTYPE)
+        hidden = model(x, interpolate_pos_encoding=True, output_hidden_states=True).hidden_states
+        out = {}                                                        # hidden[0] = embedding, hidden[b+1] = after block b
+        for layer in sampled_layers(len(hidden) - 1):
+            h = hidden[layer + 1]
+            patches = h.shape[1]
+            grid = round(patches ** 0.5)
+            if grid * grid != patches:                                  # drop the leading CLS token
                 h = h[:, patches - grid * grid:]
             out[layer] = h.float()
         return out
@@ -219,10 +242,13 @@ def run(config: DictConfig):
     detection_data = hydra.utils.instantiate(config.detection_data)
     person_path = hydra.utils.instantiate(config.person_path)
     sam = hydra.utils.instantiate(config.tracker.tracker).model
+    from transformers import CLIPVisionModel, OwlViTVisionModel
     encoders = {
         "pe_core":    load_pe_timm("vit_pe_core_large_patch14_336.fb", 336),
         "pe_spatial": load_pe_timm("vit_pe_spatial_large_patch14_448.fb", 448),
         "pe_sam3":    load_pe_sam3(config.sam3_vision_config, config.sam3_input),
+        "clip":       load_hf_vision(CLIPVisionModel, "openai/clip-vit-large-patch14", 336, CLIP_MEAN, CLIP_STD),
+        "owlvit":     load_hf_vision(OwlViTVisionModel, "google/owlvit-large-patch14", 336, CLIP_MEAN, CLIP_STD),
     }
     print(f"encoders: {list(encoders)}")
 
