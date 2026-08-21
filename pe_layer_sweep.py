@@ -41,7 +41,7 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 MIN_DIST = 400.0                                  # only score candidates this far (px @1024) from the anchor
 LAYER_STEP = 4                                    # sample every this many transformer blocks
 COLORS = {"pe_core": "#cc4444", "pe_spatial": "#22aa77", "pe_sam3": "#3377cc"}
-PLOT_PATH, NPY_PATH = "data/pe_layer_sweep.png", "data/pe_layer_sweep.npy"
+UNI_PATH, BI_PATH, NPY_PATH = "data/pe_layer_sweep_uni.png", "data/pe_layer_sweep_bi.png", "data/pe_layer_sweep_unibi.npy"
 
 
 def sampled_layers(depth):
@@ -123,8 +123,8 @@ def layer_foreground(sam, encoders, frame, boxes, floor, crop_size):
 
 
 def evaluate_trajectory(sam, encoders, detection_data, trajectory, config, rng, crop_size):
-    """Yield (model, layer, label, score) for every far candidate (distance > MIN_DIST) per frame, where
-    score is the bidirectional foreground chamfer of that candidate's layer tokens to the anchor's."""
+    """Yield (model, layer, label, uni, bi) for every far candidate (distance > MIN_DIST) per frame, where
+    uni/bi are the uni- and bidirectional foreground chamfer of that candidate's layer tokens to the anchor's."""
     video, person, anchor_frame = trajectory
     detection_data.initialize_target(video, person)
     anchor_index = anchor_trajectory_index(detection_data, anchor_frame)
@@ -176,39 +176,42 @@ def evaluate_trajectory(sam, encoders, detection_data, trajectory, config, rng, 
             for layer, anchor_fg_list in anchor[model_name].items():
                 anchor_fg = anchor_fg_list[0]
                 for i, (_, label) in enumerate(far):
-                    score = chamfer_scores(anchor_fg, candidates[model_name][layer][i])[1]   # bidirectional
-                    if not np.isnan(score):
-                        yield model_name, layer, label, score
+                    uni, bi = chamfer_scores(anchor_fg, candidates[model_name][layer][i])
+                    yield model_name, layer, label, uni, bi
 
 
-def layer_auc(pairs):
-    """AUC over (label, score) pairs; NaN if one class."""
-    labels = np.array([p[0] for p in pairs])
-    scores = np.array([p[1] for p in pairs])
+def layer_auc(rows, column):
+    """AUC over rows (label, uni, bi) using `column` (1=uni, 2=bi); NaN if one class or no valid scores."""
+    rows = [r for r in rows if not np.isnan(r[column])]
+    if not rows:
+        return np.nan
+    labels = np.array([r[0] for r in rows])
+    scores = np.array([r[column] for r in rows])
     return roc_auc_score(labels, scores) if 0 < labels.sum() < len(labels) else np.nan
 
 
-def plot_sweep(samples, n_traj):
-    """AUC vs layer index, one line per model. samples: {(model, layer): [(label, score), ...]}."""
+def plot_sweep(samples, column, direction, path, n_traj):
+    """AUC vs layer index, one line per model, for one chamfer direction. Returns the curves it drew.
+    samples: {(model, layer): [(label, uni, bi), ...]}."""
     figure, axis = plt.subplots(figsize=(8.5, 5.4))
     curves = {}
     for model_name in sorted({m for m, _ in samples}):
         layers = sorted(layer for m, layer in samples if m == model_name)
-        aucs = [layer_auc(samples[(model_name, layer)]) for layer in layers]
+        aucs = [layer_auc(samples[(model_name, layer)], column) for layer in layers]
         curves[model_name] = (layers, aucs)
         axis.plot(layers, aucs, marker="o", markersize=5, color=COLORS.get(model_name), label=model_name)
 
     axis.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="chance (0.50)")
     axis.set_xlabel("transformer layer index (sampled every 4 blocks)")
     axis.set_ylabel(f"target-vs-distractor AUC  (candidates > {int(MIN_DIST)} px from anchor)")
-    axis.set_title(f"PE layer-wise long-range re-ID  |  {n_traj} trajectories", fontsize=10)
+    axis.set_title(f"PE layer-wise long-range re-ID ({direction} chamfer)  |  {n_traj} trajectories", fontsize=10)
     axis.set_ylim(0.45, 1.02)
     axis.grid(alpha=0.3)
     axis.legend(loc="lower left", fontsize=8)
     figure.tight_layout()
-    figure.savefig(PLOT_PATH, dpi=120)
+    figure.savefig(path, dpi=120)
     plt.close(figure)
-    np.save(NPY_PATH, {"curves": curves, "n_traj": n_traj}, allow_pickle=True)
+    return curves
 
 
 @hydra.main(config_path="conf", config_name="pe_reid", version_base=None)
@@ -225,20 +228,25 @@ def run(config: DictConfig):
 
     trajectories = test_trajectories(person_path, config.n_traj)
     rng = np.random.RandomState(0)
-    samples = defaultdict(list)
+    samples = defaultdict(list)                          # (model, layer) -> [(label, uni, bi), ...]
     for completed, trajectory in enumerate(tqdm(trajectories, desc="layer-sweep"), start=1):
-        for model_name, layer, label, score in evaluate_trajectory(sam, encoders, detection_data, trajectory, config, rng, config.crop_size):
-            samples[(model_name, layer)].append((label, score))
+        for model_name, layer, label, uni, bi in evaluate_trajectory(sam, encoders, detection_data, trajectory, config, rng, config.crop_size):
+            samples[(model_name, layer)].append((label, uni, bi))
         if completed % 5 == 0 and samples:
-            plot_sweep(samples, completed)
+            plot_sweep(samples, 1, "unidirectional", UNI_PATH, completed)
+            plot_sweep(samples, 2, "bidirectional", BI_PATH, completed)
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-    plot_sweep(samples, len(trajectories))
-    print("\nfinal per-layer AUC (candidates > {:.0f} px):".format(MIN_DIST))
+    uni_curves = plot_sweep(samples, 1, "unidirectional", UNI_PATH, len(trajectories))
+    bi_curves = plot_sweep(samples, 2, "bidirectional", BI_PATH, len(trajectories))
+    np.save(NPY_PATH, {"uni": uni_curves, "bi": bi_curves, "n_traj": len(trajectories)}, allow_pickle=True)
+
+    print("\nfinal per-layer AUC (candidates > {:.0f} px)  [uni | bi]:".format(MIN_DIST))
     for model_name in sorted({m for m, _ in samples}):
         layers = sorted(layer for m, layer in samples if m == model_name)
-        print(f"  {model_name:11s} " + "  ".join(f"L{layer}={layer_auc(samples[(model_name, layer)]):.3f}" for layer in layers))
+        cells = "  ".join(f"L{layer}={layer_auc(samples[(model_name, layer)], 1):.3f}|{layer_auc(samples[(model_name, layer)], 2):.3f}" for layer in layers)
+        print(f"  {model_name:11s} {cells}")
 
 
 if __name__ == "__main__":
