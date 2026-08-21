@@ -76,11 +76,11 @@ def load_backbones(sam3_config, sam3_input):
     pe_spatial / hiera_sam / hiera_mae are the shared calibrator encoders; pe_core and pe_sam3 are added here."""
 
     shared = load_dataset_encoders(["perception", "hiera_sam", "hiera_mae"], DEVICE, DTYPE)
-    pe_core = timm.create_model("vit_pe_core_large_patch14_336.fb", pretrained=True, num_classes=0, img_size=448).eval().to(DEVICE).to(DTYPE)
+    pe_core = timm.create_model("vit_pe_core_large_patch14_336.fb", pretrained=True, num_classes=0).eval().to(DEVICE).to(DTYPE)
 
     @torch.inference_mode()
     def pe_core_tokens(crops):
-        return pe_core.forward_features(_norm(crops, 448, HALF, HALF, DEVICE, DTYPE))[:, pe_core.num_prefix_tokens:].float()
+        return pe_core.forward_features(_norm(crops, 336, HALF, HALF, DEVICE, DTYPE))[:, pe_core.num_prefix_tokens:].float()
 
     return {
         "pe_core": pe_core_tokens,
@@ -116,10 +116,13 @@ def entity_tokens(sam, backbones, frame, boxes, floor, crop_size):
     frame_per_box = np.repeat(frame[None], len(box_masks), axis=0)
     box_crops, box_crop_masks = crop_around_masks(frame_per_box, np.stack(box_masks).astype(np.float32), crop_size, 0.2, floor)
 
+    crop_masks = torch.from_numpy(box_crop_masks).unsqueeze(1)      # (num_boxes, 1, cr, cr)
     tokens_by_box = [{} for _ in boxes]
     for backbone_name, encode in backbones.items():
-        patch_tokens = encode(box_crops)                                        # (num_boxes, 32*32, dim)
-        foreground_masks = _patch_masks(box_crop_masks, patch_tokens.device)
+        patch_tokens = encode(box_crops)                                        # (num_boxes, grid*grid, dim)
+        grid = round(patch_tokens.shape[1] ** 0.5)                              # this backbone's own token grid
+        foreground_masks = (F.interpolate(crop_masks.to(patch_tokens.device).float(), size=(grid, grid),
+                                          mode="nearest") > 0.5).flatten(1)      # (num_boxes, grid*grid) bool
 
         for box_tokens, box_patch_tokens, mask in zip(tokens_by_box, patch_tokens, foreground_masks):
             box_tokens[backbone_name] = box_patch_tokens[mask].clone()          # foreground tokens only
