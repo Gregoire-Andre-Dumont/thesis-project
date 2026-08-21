@@ -247,8 +247,8 @@ def run(config: DictConfig):
         "pe_core":    load_pe_timm("vit_pe_core_large_patch14_336.fb", 336),
         "pe_spatial": load_pe_timm("vit_pe_spatial_large_patch14_448.fb", 448),
         "pe_sam3":    load_pe_sam3(config.sam3_vision_config, config.sam3_input),
-        "clip":       load_hf_vision(CLIPVisionModel, "openai/clip-vit-large-patch14", 336, CLIP_MEAN, CLIP_STD),
-        "owlvit":     load_hf_vision(OwlViTVisionModel, "google/owlvit-large-patch14", 336, CLIP_MEAN, CLIP_STD),
+        "clip":       load_hf_vision(CLIPVisionModel, "openai/clip-vit-large-patch14", 224, CLIP_MEAN, CLIP_STD),
+        "owlvit":     load_hf_vision(OwlViTVisionModel, "google/owlvit-large-patch14", 840, CLIP_MEAN, CLIP_STD),
     }
     print(f"encoders: {list(encoders)}")
 
