@@ -83,8 +83,8 @@ def load_pe_sam3(sam3_config, sam3_input):
         out = {}                                                          # hidden[0] = embedding, hidden[b+1] = after block b
         for layer in sampled_layers(len(hidden) - 1):
             h = hidden[layer + 1]                                        # "after block `layer`", matching timm's indexing
-            if h.dim() == 4:                                             # (n, C, H, W) -> (n, HW, C)
-                h = h.flatten(2).transpose(1, 2)
+            if h.dim() == 4:                                             # SAM3 ViT layers are (n, H, W, C) channels-LAST
+                h = h.flatten(1, 2)                                      # -> (n, H*W, C), matching last_hidden_state
             patches = h.shape[1]
             grid = round(patches ** 0.5)
             if grid * grid != patches:                                  # drop leading prefix tokens (e.g. CLS)
