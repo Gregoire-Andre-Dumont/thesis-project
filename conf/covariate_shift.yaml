@@ -9,7 +9,7 @@ detection_data:
 person_path:
   _target_: src.typing.person_path.PersonPath
   main_directory: data/person_path
-  occlusion_ranges: [7, 150]
+  occlusion_ranges: [5, 150]
   n_experiments: 1200
   n_after_occlusion: 50
   random_seed: 44
@@ -22,17 +22,19 @@ person_path:
   non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person]
 
 # experiment parameters
-n_traj: 300 
-target_threshold: 0.2   
-t_min: 0.1        
-t_max: 0.8
-t_steps: 11
-crop_size: 512 
-max_frames: 250          
-plot_every: 3          
+n_traj: 30
+stride: 2
+crop_size: 512
+max_frames: 250
+k_distractors: 3
+label_iou_threshold: 0.2
+encoders: [perception, hiera_sam]
+alphas: [0.0, 0.25, 0.5, 0.75, 1.0]
+memory_sizes: [1, 2, 4, 8, 16]
 
-# the two memory-gating policies
-oracle_config: conf/trackers/baselines/memory_oracle.yaml     # commits on TRUE IoU
-baseline_config: conf/trackers/baselines/sam_baseline.yaml    # commits on SAM's own predicted IoU
-
-plot_prefix: data/covariate_shift    # writes {prefix}_oracle.png, {prefix}_baseline.png, {prefix}.npy
+# the two memory-gating policies (both run as real SAM 2 rollouts)
+oracle_config: conf/trackers/baselines/memory_oracle.yaml   
+baseline_config: conf/trackers/baselines/sam_baseline.yaml   
+out_dir: data/covariate_shift 
+checkpoint_every: 10
+plot_every: 4

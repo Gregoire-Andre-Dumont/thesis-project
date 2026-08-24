@@ -1,16 +1,18 @@
-"""Layer-wise re-ID sweep for the PE variants: pe_core vs pe_spatial vs pe_sam3.
+"""Layer-wise re-ID sweep for the detector-fine-tuning pairs: clip vs owlvit vs pe_spatial vs pe_sam3.
 
 Same tracker-free setup as pe_reid_longrange (SAM box-prompt -> mask -> crop -> foreground tokens), but
-instead of the final layer we extract patch tokens at every 4th transformer block and score foreground
-chamfer at each. Only candidates whose distance from the anchor exceeds MIN_DIST px (@1024) are used --
-this is the long-range regime. The plot: x = layer index, y = target-vs-distractor AUC, one line per model.
+instead of the final layer we extract patch tokens every LAYER_STEP transformer blocks (incl. the last) and
+score foreground chamfer at each. Only candidates whose distance from the anchor exceeds MIN_DIST px (@1024)
+are used -- the long-range regime. Two plots (uni- and bidirectional chamfer): x = layer index, y = target-
+vs-distractor AUC, one line per model.
 
-Hypothesis: SAM 3's detector fine-tuning erases the re-ID signal from its trunk, so pe_sam3's per-layer
-AUC stays low / degrades, while pe_spatial (and pe_core) keep a strong signal in their mid/late layers.
+Hypothesis: detector fine-tuning erodes re-ID through the trunk, so the fine-tuned encoders (pe_sam3 from
+pe_spatial, owlvit from clip) trail their base encoders' per-layer AUC, especially in the late blocks.
 """
 import json
 import logging
 import os
+import pickle
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -27,6 +29,9 @@ from omegaconf import DictConfig
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src` and create_anchor_dataset
+
 from pe_reid_longrange import (test_trajectories, box_prompt_masks, chamfer_scores, distance, to_pixel,
                                clean_distractors, DEVICE, DTYPE)
 from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
@@ -39,11 +44,13 @@ warnings.filterwarnings("ignore")
 os.environ["HYDRA_FULL_ERROR"] = "1"
 
 MIN_DIST = 400.0                                  # only score candidates this far (px @1024) from the anchor
-LAYER_STEP = 4                                    # sample every this many transformer blocks
+LAYER_STEP = 2                                    # sample every this many transformer blocks (last block always included)
 CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)   # CLIP / OWL-ViT normalization
 CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
-COLORS = {"pe_core": "#cc4444", "pe_spatial": "#22aa77", "pe_sam3": "#3377cc", "clip": "#9467bd", "owlvit": "#ff7f0e"}
-UNI_PATH, BI_PATH, NPY_PATH = "data/pe_layer_sweep_uni.png", "data/pe_layer_sweep_bi.png", "data/pe_layer_sweep_unibi.npy"
+COLORS = {"pe_spatial": "#22aa77", "pe_sam3": "#3377cc", "clip": "#cc4444", "owlvit": "#ff7f0e"}
+OUT_DIR = "data/pe_layer_sweep"
+UNI_PATH, BI_PATH, NPY_PATH = f"{OUT_DIR}/uni.png", f"{OUT_DIR}/bi.png", f"{OUT_DIR}/curves.npy"
+CKPT_PATH = f"{OUT_DIR}/checkpoint.pkl"
 
 
 def sampled_layers(depth):
@@ -237,36 +244,60 @@ def plot_sweep(samples, column, direction, path, n_traj):
     return curves
 
 
-@hydra.main(config_path="conf", config_name="pe_reid", version_base=None)
+def load_checkpoint(path):
+    """Load (samples, done) from the checkpoint, or empties when there is none. samples maps
+    (model, layer) -> [(label, uni, bi), ...]; done is the set of finished trajectory keys."""
+    if not Path(path).exists():
+        return defaultdict(list), set()
+    state = pickle.loads(Path(path).read_bytes())
+    return defaultdict(list, state["samples"]), set(state["done"])
+
+
+def save_checkpoint(path, samples, done):
+    """Atomically write the accumulated per-(model, layer) samples and finished trajectory keys, so the run resumes here."""
+    tmp = Path(path).with_suffix(".pkl.tmp")
+    tmp.write_bytes(pickle.dumps({"samples": dict(samples), "done": list(done)}))
+    tmp.replace(path)
+
+
+@hydra.main(config_path="../conf", config_name="pe_reid", version_base=None)
 def run(config: DictConfig):
+    os.makedirs(OUT_DIR, exist_ok=True)
     detection_data = hydra.utils.instantiate(config.detection_data)
     person_path = hydra.utils.instantiate(config.person_path)
     sam = hydra.utils.instantiate(config.tracker.tracker).model
     from transformers import CLIPVisionModel, OwlViTVisionModel
     encoders = {
-        "pe_core":    load_pe_timm("vit_pe_core_large_patch14_336.fb", 336),
         "pe_spatial": load_pe_timm("vit_pe_spatial_large_patch14_448.fb", 448),
         "pe_sam3":    load_pe_sam3(config.sam3_vision_config, config.sam3_input),
-        "clip":       load_hf_vision(CLIPVisionModel, "openai/clip-vit-large-patch14", 224, CLIP_MEAN, CLIP_STD),
-        "owlvit":     load_hf_vision(OwlViTVisionModel, "google/owlvit-large-patch14", 840, CLIP_MEAN, CLIP_STD),
+        "clip":       load_hf_vision(CLIPVisionModel, "openai/clip-vit-large-patch14", config.clip_input, CLIP_MEAN, CLIP_STD),
+        "owlvit":     load_hf_vision(OwlViTVisionModel, "google/owlvit-large-patch14", config.owlvit_input, CLIP_MEAN, CLIP_STD),
     }
     print(f"encoders: {list(encoders)}")
 
     trajectories = test_trajectories(person_path, config.n_traj)
     rng = np.random.RandomState(0)
-    samples = defaultdict(list)                          # (model, layer) -> [(label, uni, bi), ...]
+    samples, done = load_checkpoint(CKPT_PATH)           # (model, layer) -> [(label, uni, bi)]; finished trajectory keys
+    print(f"sweeping {len(trajectories)} trajectories; resuming with {len(done)} done")
     for completed, trajectory in enumerate(tqdm(trajectories, desc="layer-sweep"), start=1):
+        key = f"{trajectory[0]}_{trajectory[1]}_{trajectory[2]}"
+        if key in done:
+            continue
         for model_name, layer, label, uni, bi in evaluate_trajectory(sam, encoders, detection_data, trajectory, config, rng, config.crop_size):
             samples[(model_name, layer)].append((label, uni, bi))
+        done.add(key)
+        if completed % config.checkpoint_every == 0:
+            save_checkpoint(CKPT_PATH, samples, done)
         if completed % 5 == 0 and samples:
-            plot_sweep(samples, 1, "unidirectional", UNI_PATH, completed)
-            plot_sweep(samples, 2, "bidirectional", BI_PATH, completed)
+            plot_sweep(samples, 1, "unidirectional", UNI_PATH, len(done))
+            plot_sweep(samples, 2, "bidirectional", BI_PATH, len(done))
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-    uni_curves = plot_sweep(samples, 1, "unidirectional", UNI_PATH, len(trajectories))
-    bi_curves = plot_sweep(samples, 2, "bidirectional", BI_PATH, len(trajectories))
-    np.save(NPY_PATH, {"uni": uni_curves, "bi": bi_curves, "n_traj": len(trajectories)}, allow_pickle=True)
+    save_checkpoint(CKPT_PATH, samples, done)
+    uni_curves = plot_sweep(samples, 1, "unidirectional", UNI_PATH, len(done))
+    bi_curves = plot_sweep(samples, 2, "bidirectional", BI_PATH, len(done))
+    np.save(NPY_PATH, {"uni": uni_curves, "bi": bi_curves, "n_traj": len(done)}, allow_pickle=True)
 
     print("\nfinal per-layer AUC (candidates > {:.0f} px)  [uni | bi]:".format(MIN_DIST))
     for model_name in sorted({m for m, _ in samples}):

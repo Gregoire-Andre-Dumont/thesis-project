@@ -31,7 +31,8 @@ person_path:
 
 # re-id parameters
 n_traj: 300
-stride: 2   
+stride: 2
+n_bins: 5   
 crop_size: 512  
 sam3_input: 448   
 n_distractors: 3
@@ -39,27 +40,19 @@ max_frames: 250
 min_bin_samples: 20
 checkpoint_every: 5 
 
-n_bins: 5                # equal-count (quantile) distance bins, so every bin holds the same #samples
+         
 sam3_vision_config: conf/sam3_vision_config.json
-checkpoint: data/pe_reid_checkpoint.pkl
-
-figures:
-  - group: [hiera_sam, hiera_mae, pe_sam3, pe_spatial]
-    plot: data/pe_reid_spatial_backbones.png
-    npy: data/pe_reid_spatial_backbones.npy
-  - group: [pe_spatial, pe_core]
-    plot: data/pe_reid_spatial_pe.png
-    npy: data/pe_reid_spatial_pe.npy
-
-# Third figure: unidirectional (candidate->anchor) chamfer for the four group-A encoders.
-uni_figure:
-  group: [hiera_sam, hiera_mae, pe_sam3, pe_spatial]
-  plot: data/pe_reid_unidirectional.png
-  npy: data/pe_reid_unidirectional.npy
+checkpoint: data/pe_reid_6bb_checkpoint.pkl 
+clip_input: 448   
+owlvit_input: 840
+groups:
+  hiera: [hiera_sam, hiera_mae, pe_spatial, pe_sam3]
+  clip:  [clip, owlvit, pe_spatial, pe_sam3] 
 
 colors:
-  pe_core: "#cc4444"
   pe_spatial: "#22aa77"
   pe_sam3: "#3377cc"
   hiera_mae: "#dd9933"
   hiera_sam: "#9944bb"
+  clip: "#cc4444"
+  owlvit: "#ff7f0e"

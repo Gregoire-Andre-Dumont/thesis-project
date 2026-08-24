@@ -72,8 +72,8 @@ def trajectory_is_complete(dataset_path, stem):
     return all(encoder_path(dataset_path, name, stem).exists() for name in ENCODER_NAMES)
 
 
-def process_trajectory(tracker, label_model, encoders, detection_data, video_name, person_id,
-                       anchor_video_frame, visible_directory, config):
+def process_trajectory(tracker, label_model, encoders, detection_data, video_name,
+                       person_id, anchor_video_frame, visible_directory, config):
     """Track the trajectory once, then per frame build the four encoders' anchor-similarity maps and
     the target + 3-nearest-distractor pseudo-IoU labels. Returns (metadata, features_by_encoder) or
     None when the anchor is missing."""

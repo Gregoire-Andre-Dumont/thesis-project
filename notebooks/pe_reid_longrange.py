@@ -20,6 +20,9 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src` and create_anchor_dataset
+
 from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, load_dataset_encoders, _norm, _patch_masks, HALF
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame, _box_center as box_center
 from src.utils.load_bboxes import convert_bbox, load_bboxes
@@ -32,6 +35,8 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)   # CLIP / OWL-ViT normalization
+CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
 
 
 def test_trajectories(person_path, n_traj, test_size=0.20, random_seed=42):
@@ -71,23 +76,37 @@ def load_sam3_encoder(sam3_config, sam3_input):
     return tokens
 
 
-def load_backbones(sam3_config, sam3_input):
-    """Load the five LARGE backbones (~212-454M params) keyed by name; each emits a 32x32 token grid.
-    pe_spatial / hiera_sam / hiera_mae are the shared calibrator encoders; pe_core and pe_sam3 are added here."""
+def load_hf_vision(model_cls, name, size, mean, std):
+    """A transformers CLIP-style vision model (CLIP / OWL-ViT) as a final-layer token function; drops the CLS
+    token. interpolate_pos_encoding lets it run at `size` (native by default) with its position embeddings scaled."""
 
-    shared = load_dataset_encoders(["perception", "hiera_sam", "hiera_mae"], DEVICE, DTYPE)
-    pe_core = timm.create_model("vit_pe_core_large_patch14_336.fb", pretrained=True, num_classes=0).eval().to(DEVICE).to(DTYPE)
+    model = model_cls.from_pretrained(name).eval().to(DEVICE).to(DTYPE)
 
     @torch.inference_mode()
-    def pe_core_tokens(crops):
-        return pe_core.forward_features(_norm(crops, 336, HALF, HALF, DEVICE, DTYPE))[:, pe_core.num_prefix_tokens:].float()
+    def tokens(crops):
+        hidden = model(_norm(crops, size, mean, std, DEVICE, DTYPE), interpolate_pos_encoding=True).last_hidden_state
+        patches = hidden.shape[1]
+        grid = round(patches ** 0.5)
+        if grid * grid != patches:                          # drop the leading CLS token
+            hidden = hidden[:, patches - grid * grid:]
+        return hidden.float()
+    return tokens
 
+
+def load_backbones(config):
+    """Load the six LARGE backbones keyed by name; each emits its own token grid (grid-adaptive downstream).
+    Two base->fine-tuned pairs are covered: pe_spatial->pe_sam3 and clip->owlvit (detector fine-tuning), plus
+    the Hiera pair hiera_mae->hiera_sam (MAE vs SAM). pe_spatial/hiera_* come from the shared calibrator encoders."""
+
+    from transformers import CLIPVisionModel, OwlViTVisionModel
+    shared = load_dataset_encoders(["perception", "hiera_sam", "hiera_mae"], DEVICE, DTYPE)
     return {
-        "pe_core": pe_core_tokens,
         "pe_spatial": shared["perception"],
+        "pe_sam3": load_sam3_encoder(config.sam3_vision_config, config.sam3_input),
         "hiera_mae": shared["hiera_mae"],
         "hiera_sam": shared["hiera_sam"],
-        "pe_sam3": load_sam3_encoder(sam3_config, sam3_input),
+        "clip": load_hf_vision(CLIPVisionModel, "openai/clip-vit-large-patch14", config.clip_input, CLIP_MEAN, CLIP_STD),
+        "owlvit": load_hf_vision(OwlViTVisionModel, "google/owlvit-large-patch14", config.owlvit_input, CLIP_MEAN, CLIP_STD),
     }
 
 
@@ -264,30 +283,13 @@ def quantile_edges(results, n_bins):
     return edges
 
 
-def diagnose(results, edges):
-    """Print, per backbone and bin, the target/distractor counts and mean similarity, so the AUC shape
-    can be read off directly: a dip is either the gap collapsing (dis_sim rising to tgt_sim) or the bin
-    being target-starved (tiny n_tgt)."""
+def plot_auc(results, group, edges, colors, min_bin_samples, n_traj, plot_path, npy_path, metric="foreground similarity"):
+    """Plot one group's backbones' AUC vs candidate distance from anchor, and save the figure and curves."""
 
-    for name, samples in results.items():
-        print(f"\n{name}")
-        for lo, hi in zip(edges[:-1], edges[1:]):
-            in_bin = [s for s in samples if lo <= s[0] < hi]
-            target_sims = [s[2] for s in in_bin if s[1] == 1]
-            distractor_sims = [s[2] for s in in_bin if s[1] == 0]
-            if target_sims and distractor_sims:
-                tgt, dis = np.mean(target_sims), np.mean(distractor_sims)
-                print(f"  d[{lo:.1f},{hi:.1f}) n_tgt={len(target_sims):4d} n_dis={len(distractor_sims):5d} "
-                      f"tgt_sim={tgt:.3f} dis_sim={dis:.3f} gap={tgt - dis:+.3f}")
-
-
-def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj, metric="foreground similarity"):
-    """Plot one figure spec (its backbones' AUC vs candidate distance from anchor) and save the figure and curves."""
-
-    curves = {name: binned_auc(results[name], edges, min_bin_samples) for name in spec.group if name in results}
+    curves = {name: binned_auc(results[name], edges, min_bin_samples) for name in group if name in results}
 
     # Place each point at its bin's median distance (bins are equal-count, so unevenly spaced in distance).
-    ref = next((results[name] for name in spec.group if name in results), [])
+    ref = next((results[name] for name in group if name in results), [])
     ref_distances = np.array([s[0] for s in ref])
     centers = [np.median(ref_distances[(ref_distances >= lo) & (ref_distances < hi)])
                if ((ref_distances >= lo) & (ref_distances < hi)).any() else (lo + hi) / 2
@@ -306,9 +308,9 @@ def plot_auc(results, spec, edges, colors, min_bin_samples, n_traj, metric="fore
     axis.legend(loc="lower left", fontsize=8)
 
     figure.tight_layout()
-    figure.savefig(spec.plot, dpi=120)
+    figure.savefig(plot_path, dpi=120)
     plt.close(figure)
-    np.save(spec.npy, {"edges": edges, "curves": curves, "n_traj": n_traj}, allow_pickle=True)
+    np.save(npy_path, {"edges": edges, "curves": curves, "n_traj": n_traj}, allow_pickle=True)
 
 
 def load_checkpoint(path):
@@ -334,7 +336,7 @@ def save_checkpoint(path, results_bi, results_uni, per_traj, done):
     np.save("data/pe_reid_per_traj.npy", per_traj, allow_pickle=True)
 
 
-@hydra.main(config_path="conf", config_name="pe_reid", version_base=None)
+@hydra.main(config_path="../conf", config_name="pe_reid", version_base=None)
 def run_reid(config: DictConfig):
     """Score every backbone's foreground similarity as re-ID against distractors, on the test trajectories.
     Resumes from a checkpoint and refreshes the two comparison figures after each trajectory."""
@@ -342,10 +344,11 @@ def run_reid(config: DictConfig):
     detection_data = hydra.utils.instantiate(config.detection_data)
     person_path = hydra.utils.instantiate(config.person_path)
     sam = hydra.utils.instantiate(config.tracker.tracker).model
-    backbones = load_backbones(config.sam3_vision_config, config.sam3_input)
+    backbones = load_backbones(config)
     print(f"backbones: {list(backbones)}")
 
     colors = OmegaConf.to_container(config.colors)
+    groups = OmegaConf.to_container(config.groups)          # {group_name: [backbone, ...]}
     trajectories = test_trajectories(person_path, config.n_traj)
     results_bi, results_uni, per_traj, done = load_checkpoint(config.checkpoint)
     print(f"benchmarking {len(trajectories)} trajectories; resuming with {len(done)} done")
@@ -370,12 +373,15 @@ def run_reid(config: DictConfig):
         edges = quantile_edges(results_bi, config.n_bins)
         if edges is None:
             continue
-        for spec in config.figures:
-            plot_auc(results_bi, spec, edges, colors, config.min_bin_samples, len(done))
-        plot_auc(results_uni, config.uni_figure, edges, colors, config.min_bin_samples, len(done), metric="unidirectional chamfer")
+        # Four figures: each group (hiera, clip) drawn in both chamfer directions (bidirectional, unidirectional).
+        for direction, results in (("bidirectional", results_bi), ("unidirectional", results_uni)):
+            for group_name, group in groups.items():
+                plot_auc(results, group, edges, colors, config.min_bin_samples, len(done),
+                         f"data/pe_reid_{group_name}_{direction}.png",
+                         f"data/pe_reid_{group_name}_{direction}.npy",
+                         metric=f"{direction} chamfer")
         if completed % config.checkpoint_every == 0:
             save_checkpoint(config.checkpoint, results_bi, results_uni, per_traj, done)
-            diagnose(results_bi, edges)
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
