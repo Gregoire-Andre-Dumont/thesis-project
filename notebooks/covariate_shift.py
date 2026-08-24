@@ -15,6 +15,7 @@ and the oracle-minus-policy AUC gap -- the covariate shift, which a higher ancho
 should shrink, and only when the encoder can actually re-identify the target.
 """
 
+import gc
 import logging
 import os
 import pickle
@@ -152,21 +153,48 @@ def best_f1_threshold(scores, labels):
     return float(scores_descending[best_cut])
 
 
-def calibrated_commits(rollout, occlusions, label_iou_threshold):
-    """Per-policy commit masks. The threshold maximizes F1, on the oracle rollout, against the "should commit"
-    label (true IoU > threshold and no occlusion); the oracle then gates on true IoU, the policy on predicted
-    IoU. Returns {policy: bool array}, or None if the label is single-class."""
+def oracle_signals(oracle, detection_data, trajectory, max_frames):
+    """Phase 1: run only the oracle rollout and return its per-frame IoU signals (mask_iou = true pseudo-GT IoU,
+    pred_iou = SAM's estimate, occlusion), or None if the anchor is missing. No chamfers, no policy rollout --
+    these are pooled across all trajectories to calibrate the global commit thresholds."""
 
-    is_visible = occlusions < 0.5
-    true_iou = rollout["oracle"]["mask_iou"]
-    predicted_iou = rollout["oracle"]["pred_iou"]
-
-    should_commit = (true_iou > label_iou_threshold) & is_visible
-    oracle_threshold = best_f1_threshold(true_iou, should_commit)
-    policy_threshold = best_f1_threshold(predicted_iou, should_commit)
-    if np.isnan(oracle_threshold) or np.isnan(policy_threshold):
+    video, person, anchor_frame = trajectory
+    detection_data.initialize_target(video, person)
+    anchor_index = anchor_trajectory_index(detection_data, anchor_frame)
+    if anchor_index is None:
         return None
 
+    warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
+    end = warmup + max_frames
+    for attribute in ("frames", "bboxes_norm", "occlusions", "frame_indices"):
+        setattr(detection_data, attribute, getattr(detection_data, attribute)[:end])
+
+    oracle.frame_cache = None
+    oracle.predict_masks(detection_data)
+    keep = slice(warmup, None)
+    return {"mask_iou": oracle.mask_iou_scores.numpy()[keep],
+            "pred_iou": oracle.iou_scores.numpy()[keep],
+            "occlusion": np.asarray(detection_data.occlusions)[keep]}
+
+
+def global_thresholds(signals, label_iou_threshold):
+    """The single F1-optimal commit threshold per policy, over every trajectory's oracle signals pooled: on
+    true IoU for the oracle and on predicted IoU for the policy, against the "should commit" label (true IoU >
+    threshold and no occlusion)."""
+
+    mask_iou = np.concatenate([signal["mask_iou"] for signal in signals.values()])
+    pred_iou = np.concatenate([signal["pred_iou"] for signal in signals.values()])
+    occlusion = np.concatenate([signal["occlusion"] for signal in signals.values()])
+
+    should_commit = (mask_iou > label_iou_threshold) & (occlusion < 0.5)
+    return best_f1_threshold(mask_iou, should_commit), best_f1_threshold(pred_iou, should_commit)
+
+
+def apply_commits(rollout, occlusions, oracle_threshold, policy_threshold):
+    """Per-policy commit masks from the global thresholds: the oracle gates on true IoU (and visibility), the
+    policy on SAM's own predicted IoU. Returns {policy: bool array}."""
+
+    is_visible = occlusions < 0.5
     oracle_commits = (rollout["oracle"]["mask_iou"] >= oracle_threshold) & is_visible
     policy_commits = rollout["policy"]["pred_iou"] >= policy_threshold
     return {"oracle": oracle_commits, "policy": policy_commits}
@@ -232,11 +260,24 @@ def scored_frames(frames, boxes, occlusions, frame_indices, clean_boxes, stride,
             yield frame, distractor_boxes
 
 
-def collect_trajectory(trackers, sam, encoders, detection_data, trajectory, config, frame_cache):
-    """Run both rollouts and return one record per candidate (see candidate_record), so the alpha/memory sweep
-    is pure arithmetic afterwards. Returns a list of records, or None if the trajectory is unusable."""
+def release_cache(frame_cache, trackers):
+    """Free the per-trajectory image-embedding cache and drop the trackers' references to it."""
 
+    frame_cache.clear()
+    for tracker in trackers.values():
+        tracker.frame_cache = None
+    gc.collect()
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+
+
+def collect_trajectory(trackers, sam, encoders, detection_data, trajectory, config, oracle_threshold, policy_threshold):
+    """Phase 2: run both rollouts, commit with the global thresholds, and return one record per candidate (see
+    candidate_record) so the alpha/memory sweep is pure arithmetic. None if the trajectory is unusable."""
+
+    frame_cache = {}                                 # oracle fills it, the policy reuses it (one SAM encode per frame)
     result = run_rollouts(trackers, detection_data, trajectory, config.max_frames, frame_cache)
+    release_cache(frame_cache, trackers)             # rollouts done; the token extraction below re-encodes fresh
     if result is None:
         return None
     rollout, (frames, boxes, occlusions, frame_indices), anchor_index = result
@@ -250,9 +291,7 @@ def collect_trajectory(trackers, sam, encoders, detection_data, trajectory, conf
     anchor_box = anchor_amodal if float(anchor_amodal[2]) > 0 else boxes[0]
     floor = anchor_size_pixels(anchor_box, frames[0].shape)
 
-    commits = calibrated_commits(rollout, occlusions, config.label_iou_threshold)
-    if commits is None:
-        return None
+    commits = apply_commits(rollout, occlusions, oracle_threshold, policy_threshold)
     anchor_tokens, committed_tokens = reference_tokens(sam, encoders, rollout, frames, boxes, floor, commits, config.crop_size)
 
     clean_boxes = load_clean_boxes_by_frame(visible_json, person)
@@ -391,55 +430,117 @@ def save_checkpoint(path, candidates, done):
     tmp.replace(path)
 
 
-@hydra.main(config_path="../conf", config_name="covariate_shift", version_base=None)
-def run(config: DictConfig):
-    """Collect candidate chamfers over the test trajectories and draw the per-encoder covariate-shift heatmaps."""
+def load_signals(path):
+    """Load the phase-1 cache {trajectory_key: per-frame oracle signals}, or empty when there is none."""
 
-    os.makedirs(config.out_dir, exist_ok=True)
-    checkpoint = f"{config.out_dir}/checkpoint.pkl"
+    if not Path(path).exists():
+        return {}
+    return pickle.loads(Path(path).read_bytes())
 
-    detection_data = hydra.utils.instantiate(config.detection_data)
-    person_path = hydra.utils.instantiate(config.person_path)
-    encoders = load_dataset_encoders(list(config.encoders), DEVICE, DTYPE)
+
+def save_signals(path, signals):
+    """Atomically write the phase-1 oracle signals cache."""
+
+    tmp = Path(path).with_suffix(".pkl.tmp")
+    tmp.write_bytes(pickle.dumps(signals))
+    tmp.replace(path)
+
+
+def load_trackers(config):
+    """Instantiate the oracle and policy SAM 2 trackers from their configs."""
 
     policy_config = {"oracle": config.oracle_config, "policy": config.baseline_config}
     trackers = {}
     for policy in POLICIES:
         trackers[policy] = hydra.utils.instantiate(OmegaConf.load(policy_config[policy]).tracker)
-    sam = trackers["oracle"].model                          
+    return trackers
 
-    trajectories = test_trajectories(person_path, config.n_traj)
-    candidates, done = load_checkpoint(checkpoint)
-    print(f"covariate shift over {len(trajectories)} trajectories ({list(config.encoders)}); resuming with {len(done)} done")
 
-    for completed, trajectory in enumerate(tqdm(trajectories, desc="covariate-shift"), start=1):
+def calibrate_thresholds(oracle, detection_data, trajectories, config, signals_path):
+    """Phase 1: cache every trajectory's oracle IoU signals (resuming from the pkl), then fit and return the
+    global (oracle_threshold, policy_threshold)."""
+
+    signals = load_signals(signals_path)
+    print(f"phase 1: oracle signals over {len(trajectories)} trajectories; resuming with {len(signals)} cached")
+
+    for completed, trajectory in enumerate(tqdm(trajectories, desc="phase 1: oracle"), start=1):
+        key = f"{trajectory[0]}_{trajectory[1]}_{trajectory[2]}"
+        if key in signals:
+            continue
+        signal = oracle_signals(oracle, detection_data, trajectory, config.max_frames)
+        if signal is not None:
+            signals[key] = signal
+        if completed % config.checkpoint_every == 0:
+            save_signals(signals_path, signals)
+    save_signals(signals_path, signals)
+
+    oracle_threshold, policy_threshold = global_thresholds(signals, config.label_iou_threshold)
+    print(f"global thresholds -> oracle(true IoU)={oracle_threshold:.3f}  policy(pred IoU)={policy_threshold:.3f}")
+    return oracle_threshold, policy_threshold
+
+
+def collect_chamfers(trackers, encoders, detection_data, trajectories, config, oracle_threshold, policy_threshold, chamfers_path):
+    """Phase 2: run the policies with the global thresholds, caching candidate chamfers (resuming from the pkl)
+    and refreshing the heatmaps. Returns (candidates, number of finished trajectories)."""
+
+    sam = trackers["oracle"].model                           # box-prompts the anchor / candidate masks
+    candidates, done = load_checkpoint(chamfers_path)
+
+    for completed, trajectory in enumerate(tqdm(trajectories, desc="phase 2: policies"), start=1):
         key = f"{trajectory[0]}_{trajectory[1]}_{trajectory[2]}"
         if key in done:
             continue
 
-        collected = collect_trajectory(trackers, sam, encoders, detection_data, trajectory, config, frame_cache={})
-        if collected:
+        collected = collect_trajectory(trackers, sam, encoders, detection_data,
+                                       trajectory, config, oracle_threshold, policy_threshold)
+        if collected is not None:
             candidates.extend(collected)
         done.add(key)
 
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
         if completed % config.checkpoint_every == 0:
-            save_checkpoint(checkpoint, candidates, done)
+            save_checkpoint(chamfers_path, candidates, done)
         if completed % config.plot_every == 0 and candidates:
             draw_heatmaps(candidates, config, len(done))
 
-    save_checkpoint(checkpoint, candidates, done)
-    grids = draw_heatmaps(candidates, config, len(done))
-    summary = {"grids": grids, "alphas": list(config.alphas), "memory_sizes": list(config.memory_sizes), "n_traj": len(done)}
-    np.save(f"{config.out_dir}/grids.npy", summary, allow_pickle=True)
+    save_checkpoint(chamfers_path, candidates, done)
+    return candidates, len(done)
 
-    print("\ncovariate shift (max oracle-policy AUC gap) per encoder:")
+
+def report(grids, oracle_threshold, policy_threshold):
+    """Print the global thresholds and each encoder's covariate-shift summary."""
+
+    print(f"\nglobal thresholds: oracle={oracle_threshold:.3f}  policy={policy_threshold:.3f}")
+    print("covariate shift (max oracle-policy AUC gap) per encoder:")
     for encoder, grid in grids.items():
         max_gap = np.nanmax(grid["gap"])
         min_policy_auc = np.nanmin(grid["policy"])
         max_policy_auc = np.nanmax(grid["policy"])
         print(f"  {encoder:11s} max_gap={max_gap:.3f}  policy_auc[min..max]={min_policy_auc:.3f}..{max_policy_auc:.3f}")
+
+
+@hydra.main(config_path="../conf", config_name="covariate_shift", version_base=None)
+def run(config: DictConfig):
+    """Phase 1: cache oracle IoU signals and fit the global thresholds. Phase 2: run the policies, cache the
+    chamfer similarities, and draw the covariate-shift heatmaps."""
+
+    os.makedirs(config.out_dir, exist_ok=True)
+    detection_data = hydra.utils.instantiate(config.detection_data)
+    person_path = hydra.utils.instantiate(config.person_path)
+    encoders = load_dataset_encoders(list(config.encoders), DEVICE, DTYPE)
+    trackers = load_trackers(config)
+    trajectories = test_trajectories(person_path, config.n_traj)
+
+    oracle_threshold, policy_threshold = calibrate_thresholds(
+        trackers["oracle"], detection_data, trajectories, config, f"{config.out_dir}/signals.pkl")
+    candidates, n_traj = collect_chamfers(
+        trackers, encoders, detection_data, trajectories, config,
+        oracle_threshold, policy_threshold, f"{config.out_dir}/chamfers.pkl")
+
+    grids = draw_heatmaps(candidates, config, n_traj)
+    summary = {"grids": grids, "alphas": list(config.alphas), "memory_sizes": list(config.memory_sizes),
+               "oracle_threshold": oracle_threshold, "policy_threshold": policy_threshold, "n_traj": n_traj}
+    np.save(f"{config.out_dir}/grids.npy", summary, allow_pickle=True)
+    report(grids, oracle_threshold, policy_threshold)
 
 
 if __name__ == "__main__":
