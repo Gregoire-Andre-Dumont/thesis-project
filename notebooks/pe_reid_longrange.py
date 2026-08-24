@@ -124,12 +124,10 @@ def box_prompt_masks(sam, frame, boxes):
 
 @torch.inference_mode()
 def entity_tokens(sam, backbones, frame, boxes, floor, crop_size):
-    """Return each box's foreground tokens for every backbone, cropped around its own mask but floored
-    at the anchor scale. Returns a list aligned to boxes ({backbone: fg_tokens}), or None if any mask is empty."""
+    """Return each box's foreground tokens for every backbone, cropped around its own mask but floored at the
+    anchor scale. Aligned to boxes ({backbone: fg_tokens}); an empty mask yields empty tokens (scored NaN)."""
 
     box_masks = box_prompt_masks(sam, frame, boxes)
-    if any((box_mask > 0).sum() == 0 for box_mask in box_masks):
-        return None
 
     # Crop every box out of the (repeated) frame in one call, floored at the anchor scale.
     frame_per_box = np.repeat(frame[None], len(box_masks), axis=0)
@@ -139,9 +137,9 @@ def entity_tokens(sam, backbones, frame, boxes, floor, crop_size):
     tokens_by_box = [{} for _ in boxes]
     for backbone_name, encode in backbones.items():
         patch_tokens = encode(box_crops)                                        # (num_boxes, grid*grid, dim)
-        grid = round(patch_tokens.shape[1] ** 0.5)                              # this backbone's own token grid
-        foreground_masks = (F.interpolate(crop_masks.to(patch_tokens.device).float(), size=(grid, grid),
-                                          mode="nearest") > 0.5).flatten(1)      # (num_boxes, grid*grid) bool
+        grid_size = round(patch_tokens.shape[1] ** 0.5)                         # this backbone's own token grid
+        resized_masks = F.interpolate(crop_masks.to(patch_tokens.device).float(), size=(grid_size, grid_size), mode="nearest")
+        foreground_masks = (resized_masks > 0.5).flatten(1)                     # (num_boxes, grid*grid) bool
 
         for box_tokens, box_patch_tokens, mask in zip(tokens_by_box, patch_tokens, foreground_masks):
             box_tokens[backbone_name] = box_patch_tokens[mask].clone()          # foreground tokens only
@@ -220,8 +218,6 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng)
     anchor_box = anchor_amodal if float(anchor_amodal[2]) > 0 else boxes[0]
     floor = anchor_size_pixels(anchor_box, frames[0].shape)
     anchor = entity_tokens(sam, backbones, frames[0], [boxes[0]], floor, config.crop_size)
-    if anchor is None:
-        return
     query = anchor[0]                                    # {backbone: anchor foreground tokens}
     clean_boxes = load_clean_boxes_by_frame(visible_json, person)
 
@@ -240,8 +236,6 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng)
         candidate_boxes = [boxes[t]] + distractors
         candidate_dists = [distance(to_pixel(box, width, height, px_scale), anchor_center) for box in candidate_boxes]
         candidates = entity_tokens(sam, backbones, frames[t], candidate_boxes, floor, config.crop_size)
-        if candidates is None:
-            continue
 
         for name in backbones:
             pairs = [chamfer_scores(query[name], candidate[name]) for candidate in candidates]   # (uni, bi) per candidate
@@ -258,16 +252,23 @@ def auc(samples):
 
     if not samples:
         return float("nan")
-    labels = np.array([s[1] for s in samples])
-    scores = np.array([s[2] for s in samples])
+    labels = np.array([sample[1] for sample in samples])
+    scores = np.array([sample[2] for sample in samples])
     return roc_auc_score(labels, scores) if 0 < labels.sum() < len(labels) else float("nan")
 
 
 def binned_auc(samples, edges, min_bin_samples):
     """Target-vs-distractor AUC per bin of the candidate's own distance from the anchor; NaN for thin bins."""
 
-    bins = [[s for s in samples if lo <= s[0] < hi] for lo, hi in zip(edges[:-1], edges[1:])]
-    return [auc(b) if len(b) >= min_bin_samples else np.nan for b in bins]
+    bin_aucs = []
+    for low, high in zip(edges[:-1], edges[1:]):
+        in_bin = []
+        for sample in samples:
+            candidate_distance = sample[0]
+            if low <= candidate_distance < high:
+                in_bin.append(sample)
+        bin_aucs.append(auc(in_bin) if len(in_bin) >= min_bin_samples else np.nan)
+    return bin_aucs
 
 
 def quantile_edges(results, n_bins):
@@ -277,7 +278,7 @@ def quantile_edges(results, n_bins):
     samples = next(iter(results.values()), [])
     if len(samples) < n_bins:
         return None
-    distances = np.array([s[0] for s in samples])
+    distances = np.array([sample[0] for sample in samples])
     edges = np.quantile(distances, np.linspace(0, 1, n_bins + 1))
     edges[-1] += 1e-9                                    # make the top edge inclusive
     return edges
@@ -289,11 +290,15 @@ def plot_auc(results, group, edges, colors, min_bin_samples, n_traj, plot_path, 
     curves = {name: binned_auc(results[name], edges, min_bin_samples) for name in group if name in results}
 
     # Place each point at its bin's median distance (bins are equal-count, so unevenly spaced in distance).
-    ref = next((results[name] for name in group if name in results), [])
-    ref_distances = np.array([s[0] for s in ref])
-    centers = [np.median(ref_distances[(ref_distances >= lo) & (ref_distances < hi)])
-               if ((ref_distances >= lo) & (ref_distances < hi)).any() else (lo + hi) / 2
-               for lo, hi in zip(edges[:-1], edges[1:])]
+    reference = next((results[name] for name in group if name in results), [])
+    reference_distances = np.array([sample[0] for sample in reference])
+    centers = []
+    for low, high in zip(edges[:-1], edges[1:]):
+        in_bin = (reference_distances >= low) & (reference_distances < high)
+        if in_bin.any():
+            centers.append(np.median(reference_distances[in_bin]))
+        else:
+            centers.append((low + high) / 2)
 
     figure, axis = plt.subplots(figsize=(8.5, 5.4))
     for name, curve in curves.items():

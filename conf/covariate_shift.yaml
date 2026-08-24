@@ -22,7 +22,7 @@ person_path:
   non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person]
 
 # experiment parameters
-n_traj: 30
+n_traj: 10
 stride: 2
 crop_size: 512
 max_frames: 250
@@ -36,5 +36,5 @@ memory_sizes: [1, 2, 4, 8, 16]
 oracle_config: conf/trackers/baselines/memory_oracle.yaml   
 baseline_config: conf/trackers/baselines/sam_baseline.yaml   
 out_dir: data/covariate_shift 
-checkpoint_every: 10
-plot_every: 4
+checkpoint_every: 3
+plot_every: 2

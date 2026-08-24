@@ -42,6 +42,7 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 def select_tracker_yamls(config, trackers_directory):
     """Resolve which tracker configs to run: a single `tracker_name`, else every yaml in the
     experiment directory, optionally narrowed to one backbone `size`."""
+
     tracker_name = config.get("tracker_name", None)
     if tracker_name:
         return [trackers_directory / f"{tracker_name}.yaml"]
@@ -64,6 +65,7 @@ def resolve_split(tracker_config, config):
 
     Returns `(trainer_config, trajectory_paths, train_indices, test_indices)`; `trainer_config`
     is None for trackers that need no calibrator training."""
+
     trainer_config_path = tracker_config.tracker.get("trainer_config_path", None)
     if trainer_config_path is not None and Path(trainer_config_path).exists():
         trainer_config = OmegaConf.load(trainer_config_path)
@@ -81,6 +83,7 @@ def resolve_split(tracker_config, config):
 def train_calibrator(trainer_config, config, trajectory_paths, train_indices, test_indices):
     """Train the tracker's calibrator. An optional `train_fraction` sub-samples the available
     train trajectories (fixed seed) so training-set size can be swept independently of the split."""
+
     train_fraction = trainer_config.get("train_fraction", None)
     if train_fraction is not None:
         available_train = len(train_indices)
@@ -104,6 +107,7 @@ def train_calibrator(trainer_config, config, trajectory_paths, train_indices, te
 def run_tracker(tracker, trajectory_paths, test_indices, detection_data, output_path):
     """Track every test trajectory and append its per-frame IoU (occluded frames zeroed) to
     `output_path`. Resumes by skipping trajectories already saved; writes atomically."""
+
     label = output_path.stem
     if output_path.exists():
         with open(output_path, "rb") as handle:
