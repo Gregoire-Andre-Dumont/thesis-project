@@ -9,10 +9,11 @@ its nearest distractors) and score each candidate
 
     score = alpha * chamfer(candidate, anchor) + (1 - alpha) * mean_e chamfer(candidate, recent_entry_e)
 
-then take the target-vs-distractor AUC. alpha (anchor weight) and memory size are swept post-hoc. For each of
-two encoders (perception, hiera_sam) we draw two heatmaps over (alpha, memory size): the policy-rollout AUC,
-and the oracle-minus-policy AUC gap -- the covariate shift, which a higher anchor weight or larger memory
-should shrink, and only when the encoder can actually re-identify the target.
+then measure the target-vs-distractor F1 at the F1-optimal threshold fitted on the oracle's scores. alpha
+(anchor weight) and memory size are swept post-hoc. For each of two encoders (perception, hiera_sam) we draw
+two heatmaps over (alpha, memory size): the policy-rollout F1, and the oracle-minus-policy F1 gap -- the
+covariate shift, which a higher anchor weight or larger memory should shrink, and only when the encoder can
+actually re-identify the target.
 """
 
 import gc
@@ -31,7 +32,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
-from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src` and create_anchor_dataset
@@ -238,7 +238,7 @@ def reference_tokens(sam, encoders, rollout, frames, boxes, floor, commits, crop
 
 def candidate_record(candidate_tokens, label, anchor_tokens, committed_tokens, frame, max_memory, encoders):
     """One candidate's record: its chamfer to the anchor and to the most-recent committed entries (per policy,
-    per encoder). An empty candidate scores NaN, dropped later at the AUC."""
+    per encoder). An empty candidate scores NaN, dropped later when the F1 is measured."""
 
     anchor_similarity = {}
     for encoder_name in encoders:
@@ -329,18 +329,24 @@ def collect_trajectory(trackers, sam, encoders, detection_data, trajectory, conf
     return candidates
 
 
-def auc(labelled_scores):
-    """Target-vs-distractor AUC over (label, score) pairs; NaN scores dropped; NaN if one class remains."""
+def labelled_scores(candidates, encoder, policy, alpha, memory_size):
+    """The (labels, scores) arrays for one cell: every candidate's alpha-weighted score under this policy,
+    with NaN scores (empty foreground) dropped."""
 
-    labels = np.array([label for label, _score in labelled_scores])
-    scores = np.array([score for _label, score in labelled_scores])
-
+    labels = np.array([candidate["label"] for candidate in candidates])
+    scores = np.array([mixed_score(candidate, encoder, policy, alpha, memory_size) for candidate in candidates])
     valid = ~np.isnan(scores)
-    labels = labels[valid]
-    scores = scores[valid]
-    if labels.sum() == 0 or labels.sum() == len(labels):
-        return np.nan
-    return roc_auc_score(labels, scores)
+    return labels[valid], scores[valid]
+
+
+def target_f1(labels, scores, threshold):
+    """F1 of the target class (label 1), calling a candidate 'target' iff its score >= threshold."""
+
+    predicted_target = scores >= threshold
+    is_target = labels == 1
+    true_positives = int((predicted_target & is_target).sum())
+    denominator = int(predicted_target.sum()) + int(is_target.sum())
+    return 2 * true_positives / denominator if denominator else np.nan
 
 
 def mixed_score(candidate, encoder, policy, alpha, memory_size):
@@ -356,22 +362,29 @@ def mixed_score(candidate, encoder, policy, alpha, memory_size):
     return alpha * anchor_similarity + (1 - alpha) * memory_similarity
 
 
-def score_grid(candidates, encoder, policy, alphas, memory_sizes):
-    """AUC grid (rows = memory sizes, columns = anchor weights) for one encoder and policy."""
+def f1_grids(candidates, encoder, alphas, memory_sizes):
+    """Per cell (rows = memory sizes, columns = anchor weights): the policy's target-vs-distractor F1 and the
+    oracle-minus-policy F1 gap. Both use one threshold per cell -- the F1-optimal cut fitted on the oracle's
+    scores -- so the gap is measured at the operating point the memory policy would actually commit on."""
 
-    grid = np.full((len(memory_sizes), len(alphas)), np.nan)
+    policy_grid = np.full((len(memory_sizes), len(alphas)), np.nan)
+    gap_grid = np.full((len(memory_sizes), len(alphas)), np.nan)
     for row, memory_size in enumerate(memory_sizes):
         for column, alpha in enumerate(alphas):
-            labelled_scores = []
-            for candidate in candidates:
-                score = mixed_score(candidate, encoder, policy, alpha, memory_size)
-                labelled_scores.append((candidate["label"], score))
-            grid[row, column] = auc(labelled_scores)
-    return grid
+            oracle_labels, oracle_scores = labelled_scores(candidates, encoder, "oracle", alpha, memory_size)
+            policy_labels, policy_scores = labelled_scores(candidates, encoder, "policy", alpha, memory_size)
+
+            threshold = best_f1_threshold(oracle_scores, oracle_labels == 1)
+            if np.isnan(threshold):
+                continue
+
+            policy_grid[row, column] = target_f1(policy_labels, policy_scores, threshold)
+            gap_grid[row, column] = target_f1(oracle_labels, oracle_scores, threshold) - policy_grid[row, column]
+    return policy_grid, gap_grid
 
 
 def annotate_cells(axis, grid, low, high):
-    """Write each finite AUC value into its heatmap cell, in a colour that contrasts with the cell."""
+    """Write each finite value into its heatmap cell, in a colour that contrasts with the cell."""
 
     midpoint = (low + high) / 2
     for row in range(grid.shape[0]):
@@ -384,7 +397,7 @@ def annotate_cells(axis, grid, low, high):
 
 
 def draw_panel(axis, grid, title, cmap, low, high, alphas, memory_sizes):
-    """Draw one AUC heatmap (anchor weight on x, memory size on y) with per-cell labels; return the image."""
+    """Draw one heatmap (anchor weight on x, memory size on y) with per-cell labels; return the image."""
 
     image = axis.imshow(grid, origin="lower", aspect="auto", cmap=cmap, vmin=low, vmax=high)
     axis.set_xticks(range(len(alphas)), [f"{alpha:g}" for alpha in alphas])
@@ -397,16 +410,16 @@ def draw_panel(axis, grid, title, cmap, low, high, alphas, memory_sizes):
 
 
 def plot_heatmaps(policy_grid, gap_grid, encoder, alphas, memory_sizes, n_traj, path):
-    """Two heatmaps for one encoder: the policy-rollout AUC, and the oracle-minus-policy AUC gap (covariate shift)."""
+    """Two heatmaps for one encoder: the policy-rollout F1, and the oracle-minus-policy F1 gap (covariate shift)."""
 
     figure, (policy_axis, gap_axis) = plt.subplots(1, 2, figsize=(12, 5))
 
-    policy_image = draw_panel(policy_axis, policy_grid, "policy-rollout AUC", "viridis", 0.5, 1.0, alphas, memory_sizes)
+    policy_image = draw_panel(policy_axis, policy_grid, "policy-rollout F1", "viridis", 0.5, 1.0, alphas, memory_sizes)
     figure.colorbar(policy_image, ax=policy_axis, fraction=0.046)
 
     gap_top = np.nanmax(gap_grid)
     gap_high = gap_top if np.isfinite(gap_top) else 0.1
-    gap_image = draw_panel(gap_axis, gap_grid, "covariate shift (oracle - policy AUC)", "magma", 0.0, gap_high, alphas, memory_sizes)
+    gap_image = draw_panel(gap_axis, gap_grid, "covariate shift (oracle - policy F1)", "magma", 0.0, gap_high, alphas, memory_sizes)
     figure.colorbar(gap_image, ax=gap_axis, fraction=0.046)
 
     figure.suptitle(f"{encoder}  |  {n_traj} trajectories", fontsize=11)
@@ -420,13 +433,10 @@ def draw_heatmaps(candidates, config, n_traj):
 
     grids = {}
     for encoder in config.encoders:
-        policy_grid = score_grid(candidates, encoder, "policy", config.alphas, config.memory_sizes)
-        oracle_grid = score_grid(candidates, encoder, "oracle", config.alphas, config.memory_sizes)
-        gap_grid = oracle_grid - policy_grid
-
+        policy_grid, gap_grid = f1_grids(candidates, encoder, config.alphas, config.memory_sizes)
         figure_path = f"{config.out_dir}/{encoder}.png"
         plot_heatmaps(policy_grid, gap_grid, encoder, list(config.alphas), list(config.memory_sizes), n_traj, figure_path)
-        grids[encoder] = {"policy": policy_grid, "oracle": oracle_grid, "gap": gap_grid}
+        grids[encoder] = {"policy": policy_grid, "gap": gap_grid}
     return grids
 
 
