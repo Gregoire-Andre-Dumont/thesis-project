@@ -33,12 +33,15 @@ class ChamferGatedBaseline(SAMBaseline):
     crop_size: int = 512
 
     def prepare(self, anchor_foreground, floor):
-        """Set the anchor foreground tokens and crop floor, and reset the committed-token memory for a rollout."""
+        """Set the anchor foreground tokens and crop floor, and reset the committed-token memory for a rollout.
+        `committed_tokens` is the bounded window the gate compares against (mirrors SAM's live memory); the
+        unbounded `committed_log` keeps every commit's (frame index, tokens) so the memory as-of any later frame
+        can be reconstructed when the target-vs-distractor F1 is scored afterwards."""
 
         self.anchor_foreground = anchor_foreground
         self.floor = floor
         self.committed_tokens = deque(maxlen=self.memory_size)
-        self.committed_frames = []
+        self.committed_log = []
         self.frame_index = 0
         if self.main_memory is not None:
             self.main_memory.max_memory_history = self.memory_size
@@ -72,6 +75,6 @@ class ChamferGatedBaseline(SAMBaseline):
         committed = score >= self.chamfer_threshold
         if committed:
             self.committed_tokens.append(predicted)
-            self.committed_frames.append(self.frame_index)
+            self.committed_log.append((self.frame_index, predicted))
         self.frame_index += 1
         return committed

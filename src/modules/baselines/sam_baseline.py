@@ -15,6 +15,7 @@ class SAMBaseline:
     model: SamaraHieraModel | None = None
     iou_threshold: float | None = None
     main_memory: MainMemory | None = None
+    label_mask_iou: bool = True        # set False to skip the pseudo-GT mask-IoU label (a per-frame mask decode) when it is not needed
 
     def __post_init__(self):
         """Load and initialize the SAM 2 model with quantization."""
@@ -74,7 +75,7 @@ class SAMBaseline:
 
             # Label the frame with pseudo-GT mask IoU, reusing the encoding just computed for tracking.
             gt = detection_data.bboxes_norm[idx]
-            if detection_data.occlusions[idx] <= 0.5 and float(gt[2]) != 0.0:
+            if self.label_mask_iou and detection_data.occlusions[idx] <= 0.5 and float(gt[2]) != 0.0:
                 mask, _, _ = self.model.initialize_video_masking(
                     image_features, convert_bbox(np.asarray(gt, dtype=np.float32)))
                 target = (mask.squeeze() > 0.0).cpu().numpy()
