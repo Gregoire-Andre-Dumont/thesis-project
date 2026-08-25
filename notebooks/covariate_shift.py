@@ -1,22 +1,20 @@
-"""Covariate shift of a score-gated memory policy, and how anchor weight + memory size reduce it, per encoder.
+"""Covariate shift of a score-gated memory policy, measured on the tracker's OWN predicted masks.
 
-The POLICY is SAM 2 whose memory bank is gated live on the re-ID score itself: at each frame it commits the
-chosen mask iff  alpha * chamfer(pred, anchor) + (1 - alpha) * mean_e chamfer(pred, recent_entry_e) >= tau.
-A wrong commit therefore corrupts the very memory the next commit is judged against -- the covariate shift.
-The ORACLE is SAM 2 whose memory is gated on the true IoU, so its memory never drifts; it is the ceiling.
+The POLICY is SAM 2 whose memory bank is gated live on the re-ID score: at each frame it commits the chosen mask
+iff  alpha * chamfer(pred, anchor) + (1 - alpha) * mean chamfer(pred, recent) >= tau. A wrong commit corrupts the
+memory the next commit is judged against -- the covariate shift.
 
-Because the score drives the memory, each (encoder, alpha) cell needs its OWN policy rollout -- there is no
-post-hoc sweep for the policy. Memory size is fixed (config.memory_size); we sweep only the anchor weight (on
-the perception encoder). The commit threshold tau is calibrated per cell in phase 1: the score cut, pooled over
-the oracle rollouts, that best matches (max F1) the true-IoU "should commit" label (true IoU > threshold and no
-occlusion). Phase 2 then runs, per trajectory, one oracle rollout plus one score-gated rollout per cell (all
-sharing the SAM backbone image cache), and scores the same candidates -- the target and its nearest distractors
--- against each rollout's resulting memory, recording each candidate's anchor-candidate pixel distance.
+The candidates are the policy's own per-frame predicted masks (which can drift onto a distractor). Each frame is
+labelled by mask overlap: positive = on target (target_iou >= label_positive), negative = distractor grab
+(target_iou < label_negative_target and distractor_iou >= label_negative_distractor), the rest dropped. We then
+ask: can the score separate on-target frames from distractor grabs? scored two ways -- against the policy's own
+(corrupted) memory, and against the oracle's true-IoU (clean) memory. The gap (oracle AUC - policy AUC) is the
+covariate shift: at low anchor weight the corrupted memory can no longer flag the very grabs it caused (the
+grabbed distractor now matches the memory), while the clean memory still can.
 
-For each encoder we draw two heatmaps over (anchor-candidate distance bin, anchor weight): the score-gated
-policy's target-vs-distractor AUC among the candidates in each distance bin, and the oracle's. Reading up a
-column shows how re-identification degrades as candidates move far from the anchor; reading across a row shows
-how anchor weight trades off against the recent-memory term at that distance.
+Memory size is fixed (config.memory_size); we sweep the anchor weight. tau is calibrated per cell in phase 1 as
+the score cut best matching (max F1) the true-IoU "should commit" label. For each encoder we draw three heatmaps
+over (equal-count anchor-candidate distance bin, anchor weight): policy AUC, oracle AUC, and their gap.
 """
 
 import gc
@@ -213,8 +211,8 @@ def committed_reference(encoders, positions, frames, masks, floor, crop_size):
 def calibration_records(sam, encoders, oracle_data, floor, config):
     """Phase 1: one record per oracle frame -- its predicted-mask foreground scored (anchor chamfer + chamfers to
     the oracle's true-IoU memory strictly before it) and labelled by whether the frame truly should have been
-    committed. Pooled across trajectories these calibrate each cell's commit threshold. Same record shape as
-    candidate_record, under a single 'oracle' memory, so mixed_score reads it unchanged."""
+    committed. Pooled across trajectories these calibrate each cell's commit threshold; mixed_score reads the
+    records under a single 'oracle' memory."""
 
     frames, masks = oracle_data["frames"], oracle_data["predicted"]
     should_commit = true_iou_commits(oracle_data["mask_iou"], oracle_data["occlusions"], config.label_iou_threshold)
@@ -266,31 +264,54 @@ def anchor_distance(candidate_box, anchor_box, frame_shape):
     return float(np.hypot((candidate_x - anchor_x) * width, (candidate_y - anchor_y) * height))
 
 
-def candidate_record(candidate_tokens, label, distance, anchor_tokens, committed_tokens, frame, max_memory, encoders):
-    """One candidate's record: its anchor-candidate distance, its chamfer to the anchor, and its chamfers to the
-    most-recent committed entries (per policy, per encoder). An empty candidate scores NaN, dropped downstream."""
+def mask_to_bbox(mask):
+    """Normalized xywh bounding box of a predicted mask (all-zeros for an empty mask)."""
 
-    anchor_similarity = {}
-    for encoder_name in encoders:
-        anchor_similarity[encoder_name] = foreground_chamfer(anchor_tokens[encoder_name], candidate_tokens[encoder_name])
+    rows, columns = np.where(mask > 0)
+    if len(columns) == 0:
+        return np.zeros(4, np.float32)
+    size = float(mask.shape[0])
+    x0, x1, y0, y1 = columns.min(), columns.max(), rows.min(), rows.max()
+    return np.array([x0 / size, y0 / size, (x1 - x0 + 1) / size, (y1 - y0 + 1) / size], np.float32)
 
-    recent_similarity = {}
-    for policy, (committed_positions, entry_tokens) in committed_tokens.items():
-        recent_entries = []
-        for entry, position in enumerate(committed_positions):
-            if position <= frame:
-                recent_entries.append(entry)
-        recent_entries = recent_entries[-max_memory:]
 
-        recent_similarity[policy] = {}
-        for encoder_name in encoders:
-            similarities = []
-            for entry in recent_entries:
-                similarity = foreground_chamfer(entry_tokens[entry][encoder_name], candidate_tokens[encoder_name])
-                similarities.append(similarity)
-            recent_similarity[policy][encoder_name] = np.array(similarities, np.float32)
+def box_iou(box_a, box_b):
+    """IoU of two normalized xywh boxes."""
 
-    return {"label": label, "distance": distance, "anchor": anchor_similarity, "recent": recent_similarity}
+    ax0, ay0, aw, ah = box_a
+    bx0, by0, bw, bh = box_b
+    inter_x = max(0.0, min(ax0 + aw, bx0 + bw) - max(ax0, bx0))
+    inter_y = max(0.0, min(ay0 + ah, by0 + bh) - max(ay0, by0))
+    intersection = inter_x * inter_y
+    union = aw * ah + bw * bh - intersection
+    return float(intersection / union) if union > 0 else 0.0
+
+
+def iou_label(target_iou, distractor_iou, config):
+    """Class of a predicted mask by its overlaps: 1 = on target, 0 = grabbed a distractor, -1 = ambiguous (drop)."""
+
+    if target_iou >= config.label_positive:
+        return 1
+    if target_iou < config.label_negative_target and distractor_iou >= config.label_negative_distractor:
+        return 0
+    return -1
+
+
+def recent_chamfer(predicted, positions, tokens, frame, memory_size):
+    """Mean chamfer of a predicted foreground to the most-recent committed entries strictly before `frame`; NaN
+    while the memory is still empty."""
+
+    recent = [token for position, token in zip(positions, tokens) if position < frame][-memory_size:]
+    if not recent:
+        return np.nan
+    return float(np.mean([foreground_chamfer(entry, predicted) for entry in recent]))
+
+
+def mixed(anchor_similarity, recent_similarity, alpha):
+    """alpha-weighted anchor/recent score, falling back to the anchor while the memory is still empty."""
+
+    memory_similarity = anchor_similarity if np.isnan(recent_similarity) else recent_similarity
+    return alpha * anchor_similarity + (1 - alpha) * memory_similarity
 
 
 def scored_frames(frames, boxes, occlusions, frame_indices, clean_boxes, stride, k_distractors):
@@ -315,57 +336,56 @@ def release_cache(frame_cache, trackers):
         torch.cuda.empty_cache()
 
 
-def candidate_frames(sam, encoders, oracle_data, floor, config, trajectory):
-    """Cell-independent per scored frame: the candidate foreground tokens (the target and its nearest clean
-    distractors) and their labels (1 = target, 0 = distractor). Reused to score against every cell's memory."""
-
-    frames, boxes = oracle_data["frames"], oracle_data["boxes"]
-    occlusions, frame_indices = oracle_data["occlusions"], oracle_data["frame_indices"]
-
-    video, person, _ = trajectory
-    clean_boxes = load_clean_boxes_by_frame(Path(config.detection_data.visible_directory) / f"{video}.json", person)
-
-    anchor_box = boxes[0]
-    scored = []
-    for frame, distractor_boxes in scored_frames(frames, boxes, occlusions, frame_indices, clean_boxes, config.stride, config.k_distractors):
-        candidate_boxes = [boxes[frame]] + distractor_boxes           # index 0 = target (label 1), rest distractors (0)
-        candidate_labels = [1] + [0] * len(distractor_boxes)
-        candidate_distances = [anchor_distance(box, anchor_box, frames[0].shape) for box in candidate_boxes]
-        candidate_masks = box_prompt_masks(sam, frames[frame], candidate_boxes)
-
-        repeated_frame = np.repeat(frames[frame][None], len(candidate_masks), axis=0)
-        candidate_tokens = mask_foreground(encoders, repeated_frame, np.stack(candidate_masks), floor, config.crop_size)
-        scored.append({"frame": frame, "tokens": candidate_tokens, "labels": candidate_labels, "distances": candidate_distances})
-    return scored
-
-
-def policy_memory(policy, detection_data, warmup, encode, anchor_tokens, floor, alpha, memory_size, threshold, config):
-    """Run one score-gated rollout (the window is already decoded and the image cache already warm) and return
-    the committed frames' foreground tokens as a memory bank: (post-warmup positions, [{encoder: tokens}])."""
+def policy_rollout(policy, detection_data, warmup, encode, anchor_tokens, floor, alpha, memory_size, threshold, config):
+    """Run one score-gated rollout and return, in post-warmup (sliced) indexing: the predicted masks, the per-frame
+    predicted foreground (every frame -- these are the candidates), and the score-gated memory (committed positions
+    + CPU tokens)."""
 
     policy.encode = encode
     policy.anchor_weight = alpha
     policy.memory_size = memory_size
     policy.chamfer_threshold = threshold
     policy.crop_size = config.crop_size
-    policy.label_mask_iou = False                       # the policy's own mask IoU is never read -- skip the decode
     policy.prepare(anchor_tokens, floor)
-    policy.predict_masks(detection_data)
+    predicted_masks = policy.predict_masks(detection_data).numpy()[warmup:]
 
-    positions = []
-    tokens = []
-    for position, entry_tokens in policy.committed_log:
-        if position >= warmup:
-            positions.append(position - warmup)
-            tokens.append(entry_tokens)
-    return np.array(positions, dtype=int), tokens
+    foreground = {position - warmup: token for position, token in policy.foreground_log if position >= warmup}
+    committed_positions = [position - warmup for position, _ in policy.committed_log if position >= warmup]
+    committed_tokens = [token for position, token in policy.committed_log if position >= warmup]
+    return predicted_masks, foreground, committed_positions, committed_tokens
+
+
+def score_predictions(scored, foreground, predicted_masks, boxes, anchor_box, frame_shape, anchor_cpu,
+                      policy_positions, policy_tokens, oracle_positions, oracle_tokens, alpha, memory_size):
+    """Score every scored frame's predicted mask: its (target_iou, distractor_iou) label inputs, its policy- and
+    oracle-memory scores, and its anchor-candidate distance. Returns five parallel arrays."""
+
+    target_ious, distractor_ious, policy_values, oracle_values, distances = [], [], [], [], []
+    for frame, distractor_boxes in scored:
+        predicted = foreground.get(frame)
+        if predicted is None:
+            continue
+        predicted_bbox = mask_to_bbox(predicted_masks[frame])
+
+        anchor_similarity = foreground_chamfer(anchor_cpu, predicted)
+        policy_recent = recent_chamfer(predicted, policy_positions, policy_tokens, frame, memory_size)
+        oracle_recent = recent_chamfer(predicted, oracle_positions, oracle_tokens, frame, memory_size)
+
+        target_ious.append(box_iou(predicted_bbox, boxes[frame]))
+        distractor_ious.append(max(box_iou(predicted_bbox, distractor) for distractor in distractor_boxes))
+        policy_values.append(mixed(anchor_similarity, policy_recent, alpha))
+        oracle_values.append(mixed(anchor_similarity, oracle_recent, alpha))
+        distances.append(anchor_distance(predicted_bbox, anchor_box, frame_shape))
+
+    return (np.array(target_ious, np.float32), np.array(distractor_ious, np.float32), np.array(policy_values, np.float32),
+            np.array(oracle_values, np.float32), np.array(distances, np.float32))
 
 
 def collect_trajectory(oracle, policy, sam, encoders, detection_data, trajectory, config, commit_thresholds):
-    """Phase 2: one oracle rollout (true-IoU memory) plus one score-gated rollout per cell, all sharing this
-    trajectory's SAM image cache. Returns (oracle_records, policy_scores): the oracle candidate records (swept
-    post-hoc over alpha/memory) and, per cell, the (labels, scores) of the same candidates against that cell's
-    score-gated memory. None if the trajectory is unusable."""
+    """Phase 2: one oracle rollout (true-IoU memory) plus one score-gated rollout per cell, sharing the image
+    cache. The candidates are the POLICY's own per-frame predicted masks; each is scored against the policy's
+    (corrupted) memory and against the oracle's (clean) memory. Returns per-cell (target_iou, distractor_iou,
+    policy score, oracle score, distance) arrays, or None if the trajectory is unusable."""
 
     frame_cache = {} if config.get("share_image_cache", True) else None
     oracle_data = oracle_pass(oracle, detection_data, trajectory, config.max_frames, frame_cache)
@@ -375,57 +395,38 @@ def collect_trajectory(oracle, policy, sam, encoders, detection_data, trajectory
         return None
 
     frames, boxes = oracle_data["frames"], oracle_data["boxes"]
+    occlusions, frame_indices = oracle_data["occlusions"], oracle_data["frame_indices"]
+    anchor_box = boxes[0]
     floor = crop_floor(config, trajectory, oracle_data["anchor_index"], frames, boxes)
     anchor_tokens = anchor_reference(sam, encoders, frames, boxes, floor, config.crop_size)
-    scored = candidate_frames(sam, encoders, oracle_data, floor, config, trajectory)
 
-    # Oracle: its true-IoU memory is policy-independent, so one rollout feeds the whole anchor-weight sweep.
-    oracle_commits = np.where(true_iou_commits(oracle_data["mask_iou"], oracle_data["occlusions"], config.label_iou_threshold))[0]
-    oracle_memory = {"oracle": committed_reference(encoders, oracle_commits, frames, oracle_data["predicted"], floor, config.crop_size)}
-    max_memory = config.memory_size
+    # Oracle clean memory: the true-IoU committed frames' foreground, moved to CPU for the post-hoc scoring.
+    oracle_commits = np.where(true_iou_commits(oracle_data["mask_iou"], occlusions, config.label_iou_threshold))[0]
+    oracle_positions, oracle_entry_tokens = committed_reference(encoders, oracle_commits, frames, oracle_data["predicted"], floor, config.crop_size)
 
-    oracle_records = []
-    for entry in scored:
-        for candidate_tokens, label, distance in zip(entry["tokens"], entry["labels"], entry["distances"]):
-            oracle_records.append(candidate_record(candidate_tokens, label, distance, anchor_tokens, oracle_memory, entry["frame"], max_memory, encoders))
+    video, person, _ = trajectory
+    clean_boxes = load_clean_boxes_by_frame(Path(config.detection_data.visible_directory) / f"{video}.json", person)
+    scored = list(scored_frames(frames, boxes, occlusions, frame_indices, clean_boxes, config.stride, config.k_distractors))
 
-    # Policy: the score gates the memory, so every cell is its own rollout scored against its own memory.
     warmup = oracle_data["warmup"]
     policy.frame_cache = frame_cache                         # every cell's rollout reuses this window's SAM features
-    policy_scores = {}
+    per_cell = {}
     for encoder, memory_size, alpha in cells(config):
+        anchor_cpu = anchor_tokens[encoder].detach().float().cpu()
+        oracle_tokens = [entry[encoder].detach().float().cpu() for entry in oracle_entry_tokens]
+
         threshold = commit_thresholds[(encoder, memory_size, alpha)]
         threshold = -np.inf if np.isnan(threshold) else threshold
-        positions, entry_tokens = policy_memory(policy, detection_data, warmup, encoders[encoder],
-                                                anchor_tokens[encoder], floor, alpha, memory_size, threshold, config)
-        memory = {"policy": (positions, [{encoder: token} for token in entry_tokens])}
+        predicted_masks, foreground, policy_positions, policy_tokens = policy_rollout(
+            policy, detection_data, warmup, encoders[encoder], anchor_tokens[encoder], floor, alpha, memory_size, threshold, config)
 
-        labels = []
-        scores = []
-        distances = []
-        for entry in scored:
-            for candidate_tokens, label, distance in zip(entry["tokens"], entry["labels"], entry["distances"]):
-                record = candidate_record(candidate_tokens, label, distance, anchor_tokens, memory, entry["frame"], memory_size, [encoder])
-                score = mixed_score(record, encoder, "policy", alpha, memory_size)
-                if not np.isnan(score):
-                    labels.append(label)
-                    scores.append(score)
-                    distances.append(distance)
-        policy_scores[(encoder, memory_size, alpha)] = (np.array(labels), np.array(scores, np.float32), np.array(distances, np.float32))
+        per_cell[(encoder, memory_size, alpha)] = score_predictions(
+            scored, foreground, predicted_masks, boxes, anchor_box, frames[0].shape, anchor_cpu,
+            policy_positions, policy_tokens, oracle_positions, oracle_tokens, alpha, memory_size)
 
     if frame_cache is not None:
         release_cache(frame_cache, {"oracle": oracle, "policy": policy})
-    return oracle_records, policy_scores
-
-
-def labelled_scores(candidates, encoder, policy, alpha, memory_size):
-    """The (labels, scores) arrays for one cell: every candidate's alpha-weighted score under this policy,
-    with NaN scores (empty foreground) dropped."""
-
-    labels = np.array([candidate["label"] for candidate in candidates])
-    scores = np.array([mixed_score(candidate, encoder, policy, alpha, memory_size) for candidate in candidates])
-    valid = ~np.isnan(scores)
-    return labels[valid], scores[valid]
+    return per_cell
 
 
 def target_auc(labels, scores):
@@ -463,35 +464,26 @@ def bin_labels(edges):
     return [f"{int(round(low))}-{int(round(high))}" for low, high in zip(edges[:-1], edges[1:])]
 
 
-def policy_distance_grid(policy_scores, encoder, alphas, memory_size, edges):
-    """Grid (rows = anchor-candidate distance bin, columns = anchor weight) of the score-gated policy's
-    target-vs-distractor AUC among the candidates that fall in each distance bin, for one encoder."""
+def distance_grids(cells_data, encoder, alphas, memory_size, edges, config):
+    """Per (distance bin, anchor weight): the AUC with which the score separates on-target predicted masks from
+    distractor grabs, scored against the policy's own (corrupted) memory and against the oracle's (clean) memory.
+    Returns (policy_grid, oracle_grid)."""
 
-    grid = np.full((len(edges) - 1, len(alphas)), np.nan)
+    n_bins = len(edges) - 1
+    policy_grid = np.full((n_bins, len(alphas)), np.nan)
+    oracle_grid = np.full((n_bins, len(alphas)), np.nan)
     for column, alpha in enumerate(alphas):
-        labels, scores, distances = policy_scores.get((encoder, memory_size, alpha), (np.array([]), np.array([]), np.array([])))
-        bins = np.clip(np.digitize(distances, edges) - 1, 0, len(edges) - 2)
-        for row in range(len(edges) - 1):
-            in_bin = bins == row
-            grid[row, column] = target_auc(labels[in_bin], scores[in_bin])
-    return grid
-
-
-def oracle_distance_grid(records, encoder, alphas, memory_size, edges):
-    """The same grid for the oracle's true-IoU memory, its scores swept post-hoc over anchor weight."""
-
-    distances = np.array([record["distance"] for record in records])
-    labels = np.array([record["label"] for record in records])
-    bins = np.clip(np.digitize(distances, edges) - 1, 0, len(edges) - 2)
-
-    grid = np.full((len(edges) - 1, len(alphas)), np.nan)
-    for column, alpha in enumerate(alphas):
-        scores = np.array([mixed_score(record, encoder, "oracle", alpha, memory_size) for record in records])
-        valid = ~np.isnan(scores)
-        for row in range(len(edges) - 1):
-            in_bin = valid & (bins == row)
-            grid[row, column] = target_auc(labels[in_bin], scores[in_bin])
-    return grid
+        arrays = cells_data.get((encoder, memory_size, alpha))
+        if arrays is None:
+            continue
+        target_iou, distractor_iou, policy_values, oracle_values, distances = arrays
+        labels = np.array([iou_label(target, distractor, config) for target, distractor in zip(target_iou, distractor_iou)])
+        bins = np.clip(np.digitize(distances, edges) - 1, 0, n_bins - 1)
+        for row in range(n_bins):
+            keep = (bins == row) & (labels >= 0)
+            policy_grid[row, column] = target_auc(labels[keep], policy_values[keep])
+            oracle_grid[row, column] = target_auc(labels[keep], oracle_values[keep])
+    return policy_grid, oracle_grid
 
 
 def annotate_cells(axis, grid, midpoint):
@@ -518,22 +510,23 @@ def draw_heatmap_panel(axis, grid, title, alphas, labels, cmap, low, high):
     return image
 
 
-def draw_heatmaps(oracle_records, policy_scores, config, n_traj):
-    """For each encoder, three heatmaps over (equal-count distance bin, anchor weight): the score-gated policy's
-    AUC, the oracle's AUC, and the covariate shift (oracle - policy). Returns the grids for caching."""
+def draw_heatmaps(cells_data, config, n_traj):
+    """For each encoder, three heatmaps over (equal-count distance bin, anchor weight): the score's on-target-vs-
+    distractor-grab AUC under the policy's own memory, under the oracle's clean memory, and the covariate shift
+    (oracle - policy). Returns the grids for caching."""
 
-    edges = quantile_edges(np.array([record["distance"] for record in oracle_records]), config.n_distance_bins)
+    all_distances = np.concatenate([arrays[4] for arrays in cells_data.values()]) if cells_data else np.array([0.0, 1.0])
+    edges = quantile_edges(all_distances, config.n_distance_bins)
     labels = bin_labels(edges)
 
     grids = {}
     for encoder in config.encoders:
-        policy_grid = policy_distance_grid(policy_scores, encoder, config.alphas, config.memory_size, edges)
-        oracle_grid = oracle_distance_grid(oracle_records, encoder, config.alphas, config.memory_size, edges)
+        policy_grid, oracle_grid = distance_grids(cells_data, encoder, config.alphas, config.memory_size, edges, config)
         gap_grid = oracle_grid - policy_grid
 
         figure, (policy_axis, oracle_axis, gap_axis) = plt.subplots(1, 3, figsize=(18, 5))
-        auc_image = draw_heatmap_panel(policy_axis, policy_grid, "policy (score-gated) AUC", list(config.alphas), labels, "viridis", 0.5, 1.0)
-        draw_heatmap_panel(oracle_axis, oracle_grid, "oracle (true-IoU) AUC", list(config.alphas), labels, "viridis", 0.5, 1.0)
+        auc_image = draw_heatmap_panel(policy_axis, policy_grid, "policy (score-gated memory) AUC", list(config.alphas), labels, "viridis", 0.5, 1.0)
+        draw_heatmap_panel(oracle_axis, oracle_grid, "oracle (clean memory) AUC", list(config.alphas), labels, "viridis", 0.5, 1.0)
         figure.colorbar(auc_image, ax=[policy_axis, oracle_axis], fraction=0.046)
 
         gap_top = np.nanmax(gap_grid)
@@ -541,7 +534,7 @@ def draw_heatmaps(oracle_records, policy_scores, config, n_traj):
         gap_image = draw_heatmap_panel(gap_axis, gap_grid, "covariate shift (oracle - policy)", list(config.alphas), labels, "magma", 0.0, gap_high)
         figure.colorbar(gap_image, ax=gap_axis, fraction=0.046)
 
-        figure.suptitle(f"{encoder}  |  {n_traj} trajectories  |  memory {config.memory_size}  |  equal-count distance bins", fontsize=11)
+        figure.suptitle(f"{encoder}  |  {n_traj} trajectories  |  memory {config.memory_size}  |  score = detect on-target vs distractor-grab", fontsize=11)
         figure.savefig(f"{config.out_dir}/{encoder}.png", dpi=120, bbox_inches="tight")
         plt.close(figure)
         grids[encoder] = {"policy": policy_grid, "oracle": oracle_grid, "gap": gap_grid, "edges": edges}
@@ -562,17 +555,15 @@ def save_pickle(path, obj):
     tmp.replace(path)
 
 
-def merge_policy_scores(pooled, trajectory_scores):
-    """Concatenate one trajectory's per-cell (labels, scores, distances) onto the pooled totals, in place."""
+def merge_cells(pooled, trajectory_cells):
+    """Concatenate one trajectory's per-cell arrays (target_iou, distractor_iou, policy, oracle, distance) onto the
+    pooled totals, in place."""
 
-    for cell, (labels, scores, distances) in trajectory_scores.items():
+    for cell, arrays in trajectory_cells.items():
         if cell in pooled:
-            previous_labels, previous_scores, previous_distances = pooled[cell]
-            pooled[cell] = (np.concatenate([previous_labels, labels]),
-                            np.concatenate([previous_scores, scores]),
-                            np.concatenate([previous_distances, distances]))
+            pooled[cell] = tuple(np.concatenate([previous, new]) for previous, new in zip(pooled[cell], arrays))
         else:
-            pooled[cell] = (labels, scores, distances)
+            pooled[cell] = arrays
 
 
 def load_trackers(config):
@@ -613,12 +604,11 @@ def calibrate(oracle, sam, encoders, detection_data, trajectories, config, recor
 
 def collect_scores(trackers, encoders, detection_data, trajectories, config, commit_thresholds, scores_path):
     """Phase 2: per trajectory run the oracle plus one score-gated rollout per cell (resuming from the pkl),
-    pooling the oracle candidate records and the per-cell policy scores, and refreshing the heatmaps. Returns
-    (oracle_records, policy_scores, number of finished trajectories)."""
+    pooling the per-cell prediction arrays and refreshing the heatmaps. Returns (cells_data, finished count)."""
 
     oracle, policy, sam = trackers["oracle"], trackers["policy"], trackers["oracle"].model
-    state = load_pickle(scores_path, {"oracle_records": [], "policy_scores": {}, "done": []})
-    oracle_records, policy_scores, done = state["oracle_records"], state["policy_scores"], set(state["done"])
+    state = load_pickle(scores_path, {"cells": {}, "done": []})
+    cells_data, done = state["cells"], set(state["done"])
     print(f"phase 2: {len(trajectories)} trajectories, {len(cells(config))} cells each; resuming with {len(done)} done")
 
     for completed, trajectory in enumerate(tqdm(trajectories, desc="phase 2: policies"), start=1):
@@ -628,18 +618,16 @@ def collect_scores(trackers, encoders, detection_data, trajectories, config, com
 
         collected = collect_trajectory(oracle, policy, sam, encoders, detection_data, trajectory, config, commit_thresholds)
         if collected is not None:
-            trajectory_records, trajectory_scores = collected
-            oracle_records.extend(trajectory_records)
-            merge_policy_scores(policy_scores, trajectory_scores)
+            merge_cells(cells_data, collected)
         done.add(key)
 
         if completed % config.checkpoint_every == 0:
-            save_pickle(scores_path, {"oracle_records": oracle_records, "policy_scores": policy_scores, "done": list(done)})
-        if completed % config.plot_every == 0 and oracle_records:
-            draw_heatmaps(oracle_records, policy_scores, config, len(done))
+            save_pickle(scores_path, {"cells": cells_data, "done": list(done)})
+        if completed % config.plot_every == 0 and cells_data:
+            draw_heatmaps(cells_data, config, len(done))
 
-    save_pickle(scores_path, {"oracle_records": oracle_records, "policy_scores": policy_scores, "done": list(done)})
-    return oracle_records, policy_scores, len(done)
+    save_pickle(scores_path, {"cells": cells_data, "done": list(done)})
+    return cells_data, len(done)
 
 
 @hydra.main(config_path="../conf", config_name="covariate_shift", version_base=None)
@@ -657,10 +645,10 @@ def run(config: DictConfig):
     commit_thresholds = calibrate(
         trackers["oracle"], trackers["oracle"].model, encoders, detection_data, trajectories, config,
         f"{config.out_dir}/calibration.pkl")
-    oracle_records, policy_scores, n_traj = collect_scores(
+    cells_data, n_traj = collect_scores(
         trackers, encoders, detection_data, trajectories, config, commit_thresholds, f"{config.out_dir}/scores.pkl")
 
-    grids = draw_heatmaps(oracle_records, policy_scores, config, n_traj)
+    grids = draw_heatmaps(cells_data, config, n_traj)
     summary = {"grids": grids, "alphas": list(config.alphas), "memory_size": config.memory_size,
                "n_distance_bins": config.n_distance_bins,
                "commit_thresholds": {str(cell): value for cell, value in commit_thresholds.items()}, "n_traj": n_traj}

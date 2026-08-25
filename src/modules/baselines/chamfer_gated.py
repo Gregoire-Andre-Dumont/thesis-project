@@ -42,6 +42,7 @@ class ChamferGatedBaseline(SAMBaseline):
         self.floor = floor
         self.committed_tokens = deque(maxlen=self.memory_size)
         self.committed_log = []
+        self.foreground_log = []       # (frame index, predicted foreground on CPU) for EVERY frame -- the candidates
         self.frame_index = 0
         if self.main_memory is not None:
             self.main_memory.max_memory_history = self.memory_size
@@ -72,9 +73,12 @@ class ChamferGatedBaseline(SAMBaseline):
             recent_similarity = anchor_similarity
         score = self.anchor_weight * anchor_similarity + (1 - self.anchor_weight) * recent_similarity
 
+        predicted_cpu = predicted.detach().float().cpu()                    # float32 CPU for post-hoc chamfers
+        self.foreground_log.append((self.frame_index, predicted_cpu))       # every frame's prediction = a candidate
+
         committed = score >= self.chamfer_threshold
         if committed:
-            self.committed_tokens.append(predicted)
-            self.committed_log.append((self.frame_index, predicted))
+            self.committed_tokens.append(predicted)                         # GPU, for the live gate
+            self.committed_log.append((self.frame_index, predicted_cpu))    # CPU, for post-hoc scoring
         self.frame_index += 1
         return committed
