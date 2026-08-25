@@ -9,7 +9,7 @@ detection_data:
 person_path:
   _target_: src.typing.person_path.PersonPath
   main_directory: data/person_path
-  occlusion_ranges: [5, 150]
+  occlusion_ranges: [7, 150]
   n_experiments: 1200
   n_after_occlusion: 50
   random_seed: 44
