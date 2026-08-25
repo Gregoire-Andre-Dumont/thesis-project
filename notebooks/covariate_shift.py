@@ -37,7 +37,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src` and create_anchor_dataset
 
 from pe_reid_longrange import test_trajectories, box_prompt_masks, chamfer_scores, DEVICE, DTYPE
-from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
+from create_anchor_dataset import anchor_trajectory_index
 from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, load_dataset_encoders
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame, _box_center as box_center
 from src.utils.load_bboxes import load_bboxes
@@ -71,28 +71,54 @@ def foreground_chamfer(reference_tokens, candidate_tokens):
 
 
 @torch.inference_mode()
-def mask_foreground(encoders, frames, masks, floor, crop_size):
+def mask_foreground(encoders, frames, masks, floor, crop_size, chunk=8):
     """Foreground tokens of each (frame, mask) for every encoder, cropped around the mask at the anchor scale.
-    Returns a list of {encoder: foreground_tokens}; a tensor is empty if the mask vanished after cropping."""
+    Returns a list of {encoder: foreground_tokens}; a tensor is empty if the mask vanished after cropping.
+    Crops are encoded in chunks so peak GPU memory stays bounded no matter how many masks are passed at once."""
 
     crops, crop_masks = crop_around_masks(frames, masks.astype(np.float32), crop_size, 0.2, floor)
     crop_masks_tensor = torch.from_numpy(crop_masks).unsqueeze(1)
 
     foreground_per_item = [{} for _ in range(len(masks))]
     for encoder_name, encode in encoders.items():
-        tokens = encode(crops)
+        for start in range(0, len(crops), chunk):
+            span = slice(start, start + chunk)
+            tokens = encode(crops[span])
 
-        grid_size = round(tokens.shape[1] ** 0.5)
-        resized_masks = F.interpolate(crop_masks_tensor.to(tokens.device).float(), size=(grid_size, grid_size), mode="nearest")
-        foreground = (resized_masks > 0.5).flatten(1)
+            grid_size = round(tokens.shape[1] ** 0.5)
+            resized_masks = F.interpolate(crop_masks_tensor[span].to(tokens.device).float(), size=(grid_size, grid_size), mode="nearest")
+            foreground = (resized_masks > 0.5).flatten(1)
 
-        for item, item_tokens, item_foreground in zip(foreground_per_item, tokens, foreground):
-            item[encoder_name] = item_tokens[item_foreground].clone()
+            for item, item_tokens, item_foreground in zip(foreground_per_item[span], tokens, foreground):
+                item[encoder_name] = item_tokens[item_foreground].clone()
 
-        del tokens
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
+            del tokens
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
     return foreground_per_item
+
+
+def load_window(detection_data, trajectory, max_frames):
+    """Decode only the frames the tracker needs -- the warmup frame plus `max_frames` from the anchor, not the
+    whole (possibly 100s-of-frames) trajectory. Reads the annotations first (no decode) to find the window,
+    then re-loads just those frames. Returns (warmup, anchor_index), or None if the anchor is missing."""
+
+    video, person, anchor_frame = trajectory
+    keep_load_frames = detection_data.load_frames
+    detection_data.load_frames = False
+    detection_data.initialize_target(video, person)                       # annotations only, no video decode
+    anchor_index = anchor_trajectory_index(detection_data, anchor_frame)
+    if anchor_index is None:
+        detection_data.load_frames = keep_load_frames
+        return None
+
+    warmup = 1 if anchor_index >= 1 else 0                                 # mirrors slice_detection_data_for_tracker
+    start = anchor_index - warmup
+    window = detection_data.frame_indices[start:start + warmup + max_frames]
+
+    detection_data.load_frames = keep_load_frames
+    detection_data.initialize_target(video, person, frame_indices=window)  # decode only the window
+    return warmup, anchor_index
 
 
 def run_rollouts(trackers, detection_data, trajectory, max_frames, frame_cache):
@@ -101,21 +127,15 @@ def run_rollouts(trackers, detection_data, trajectory, max_frames, frame_cache):
     rollout[policy] holds the post-warmup predicted masks and per-frame IoU signals (mask_iou = true pseudo-GT
     IoU, pred_iou = SAM's own estimate) and shared holds the frames/boxes/occlusions/frame_indices."""
 
-    video, person, anchor_frame = trajectory
     rollout = {}
     shared = None
     anchor_index = None
 
     for policy, tracker in trackers.items():
-        detection_data.initialize_target(video, person)
-        anchor_index = anchor_trajectory_index(detection_data, anchor_frame)
-        if anchor_index is None:
+        window = load_window(detection_data, trajectory, max_frames)
+        if window is None:
             return None
-
-        warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
-        end = warmup + max_frames
-        for attribute in ("frames", "bboxes_norm", "occlusions", "frame_indices"):
-            setattr(detection_data, attribute, getattr(detection_data, attribute)[:end])
+        warmup, anchor_index = window
 
         tracker.frame_cache = frame_cache
         predicted_masks = tracker.predict_masks(detection_data).numpy()
@@ -158,16 +178,10 @@ def oracle_signals(oracle, detection_data, trajectory, max_frames):
     pred_iou = SAM's estimate, occlusion), or None if the anchor is missing. No chamfers, no policy rollout --
     these are pooled across all trajectories to calibrate the global commit thresholds."""
 
-    video, person, anchor_frame = trajectory
-    detection_data.initialize_target(video, person)
-    anchor_index = anchor_trajectory_index(detection_data, anchor_frame)
-    if anchor_index is None:
+    window = load_window(detection_data, trajectory, max_frames)
+    if window is None:
         return None
-
-    warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
-    end = warmup + max_frames
-    for attribute in ("frames", "bboxes_norm", "occlusions", "frame_indices"):
-        setattr(detection_data, attribute, getattr(detection_data, attribute)[:end])
+    warmup, _ = window
 
     oracle.frame_cache = None
     oracle.predict_masks(detection_data)
