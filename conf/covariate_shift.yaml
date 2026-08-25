@@ -29,11 +29,10 @@ max_frames: 300             # per-cell rollouts are ~|alphas|*|memory|*|encoders
 k_distractors: 3
 label_iou_threshold: 0.2
 share_image_cache: true     # the SAM backbone features are reused across the oracle and every policy-cell rollout
-encoders: [perception]      # two 1-D sweeps on perception only -- the full grid over both encoders was too expensive
+encoders: [perception]      # perception only
 alphas: [0.0, 0.25, 0.5, 0.75, 1.0]
-memory_sizes: [1, 2, 4, 8, 16]
-alpha_sweep_memory: 16      # anchor-weight sweep holds memory at this size
-memory_sweep_alpha: 0.75    # memory-size sweep holds anchor weight at this value
+memory_size: 16             # fixed (no memory sweep); the recent term averages the last this-many committed frames
+n_distance_bins: 5          # anchor-candidate distance is binned into this many EQUAL-COUNT (quantile) bins
 
 # oracle gates SAM 2's memory on the true IoU; policy (ChamferGatedBaseline) gates it live on the chamfer score
 oracle_config: conf/trackers/baselines/memory_oracle.yaml
