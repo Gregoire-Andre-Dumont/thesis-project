@@ -263,16 +263,32 @@ def mask_to_bbox(mask):
     return np.array([x0 / size, y0 / size, (x1 - x0 + 1) / size, (y1 - y0 + 1) / size], np.float32)
 
 
-def box_iou(box_a, box_b):
-    """IoU of two normalized xywh boxes."""
+def resize_mask(mask, size=256):
+    """Nearest-neighbour resize of a binary mask to size x size, so predicted masks (256) and box-prompted
+    pseudo-GT masks (frame resolution) can be compared at a common resolution."""
 
-    ax0, ay0, aw, ah = box_a
-    bx0, by0, bw, bh = box_b
-    inter_x = max(0.0, min(ax0 + aw, bx0 + bw) - max(ax0, bx0))
-    inter_y = max(0.0, min(ay0 + ah, by0 + bh) - max(ay0, by0))
-    intersection = inter_x * inter_y
-    union = aw * ah + bw * bh - intersection
+    tensor = torch.from_numpy((mask > 0).astype(np.float32))[None, None]
+    return (F.interpolate(tensor, size=(size, size), mode="nearest")[0, 0] > 0.5).numpy()
+
+
+def mask_iou(mask_a, mask_b):
+    """IoU of two binary masks."""
+
+    intersection = np.logical_and(mask_a, mask_b).sum()
+    union = np.logical_or(mask_a, mask_b).sum()
     return float(intersection / union) if union > 0 else 0.0
+
+
+def pseudo_gt_masks(sam, frames, boxes, scored):
+    """Per scored frame, the box-prompted pseudo-GT masks (target then every distractor), resized to 256 so they
+    line up with SAM's 256x256 predicted masks. Computed once per trajectory -- cell-independent."""
+
+    gt_masks = {}
+    for frame, distractor_boxes in scored:
+        masks = box_prompt_masks(sam, frames[frame], [boxes[frame]] + distractor_boxes)
+        resized = [resize_mask(mask) for mask in masks]
+        gt_masks[frame] = (resized[0], resized[1:])
+    return gt_masks
 
 
 def iou_label(target_iou, distractor_iou, config):
@@ -335,6 +351,7 @@ def policy_rollout(policy, detection_data, warmup, encode, anchor_tokens, floor,
     policy.memory_size = memory_size
     policy.chamfer_threshold = threshold
     policy.crop_size = config.crop_size
+    policy.label_mask_iou = False              # target/distractor mask IoU is computed post-hoc from pseudo-GT masks
     policy.prepare(anchor_tokens, floor)
     predicted_masks = policy.predict_masks(detection_data).numpy()[warmup:]
 
@@ -344,27 +361,28 @@ def policy_rollout(policy, detection_data, warmup, encode, anchor_tokens, floor,
     return predicted_masks, foreground, committed_positions, committed_tokens
 
 
-def score_predictions(scored, foreground, predicted_masks, boxes, anchor_box, frame_shape, anchor_cpu,
+def score_predictions(scored, gt_masks, foreground, predicted_masks, anchor_box, frame_shape, anchor_cpu,
                       policy_positions, policy_tokens, oracle_positions, oracle_tokens, alpha, memory_size):
-    """Score every scored frame's predicted mask: its (target_iou, distractor_iou) label inputs, its policy- and
+    """Score every scored frame's predicted mask: its target/distractor MASK IoU (label inputs), its policy- and
     oracle-memory scores, and its anchor-candidate distance. Returns five parallel arrays."""
 
     target_ious, distractor_ious, policy_values, oracle_values, distances = [], [], [], [], []
-    for frame, distractor_boxes in scored:
+    for frame, _distractor_boxes in scored:
         predicted = foreground.get(frame)
         if predicted is None:
             continue
-        predicted_bbox = mask_to_bbox(predicted_masks[frame])
+        predicted_mask = predicted_masks[frame] > 0
+        target_mask, distractor_masks = gt_masks[frame]
 
         anchor_similarity = foreground_chamfer(anchor_cpu, predicted)
         policy_recent = recent_chamfer(predicted, policy_positions, policy_tokens, frame, memory_size)
         oracle_recent = recent_chamfer(predicted, oracle_positions, oracle_tokens, frame, memory_size)
 
-        target_ious.append(box_iou(predicted_bbox, boxes[frame]))
-        distractor_ious.append(max(box_iou(predicted_bbox, distractor) for distractor in distractor_boxes))
+        target_ious.append(mask_iou(predicted_mask, target_mask))
+        distractor_ious.append(max((mask_iou(predicted_mask, distractor) for distractor in distractor_masks), default=0.0))
         policy_values.append(mixed(anchor_similarity, policy_recent, alpha))
         oracle_values.append(mixed(anchor_similarity, oracle_recent, alpha))
-        distances.append(anchor_distance(predicted_bbox, anchor_box, frame_shape))
+        distances.append(anchor_distance(mask_to_bbox(predicted_masks[frame]), anchor_box, frame_shape))
 
     return (np.array(target_ious, np.float32), np.array(distractor_ious, np.float32), np.array(policy_values, np.float32),
             np.array(oracle_values, np.float32), np.array(distances, np.float32))
@@ -396,6 +414,7 @@ def collect_trajectory(oracle, policy, sam, encoders, detection_data, trajectory
     video, person, _ = trajectory
     clean_boxes = load_clean_boxes_by_frame(Path(config.detection_data.visible_directory) / f"{video}.json", person)
     scored = list(scored_frames(frames, boxes, occlusions, frame_indices, clean_boxes, config.stride))
+    gt_masks = pseudo_gt_masks(sam, frames, boxes, scored)   # box-prompted target/distractor masks, once per trajectory
 
     warmup = oracle_data["warmup"]
     policy.frame_cache = frame_cache                         # every cell's rollout reuses this window's SAM features
@@ -410,7 +429,7 @@ def collect_trajectory(oracle, policy, sam, encoders, detection_data, trajectory
             policy, detection_data, warmup, encoders[encoder], anchor_tokens[encoder], floor, alpha, memory_size, threshold, config)
 
         per_cell[(encoder, memory_size, alpha)] = score_predictions(
-            scored, foreground, predicted_masks, boxes, anchor_box, frames[0].shape, anchor_cpu,
+            scored, gt_masks, foreground, predicted_masks, anchor_box, frames[0].shape, anchor_cpu,
             policy_positions, policy_tokens, oracle_positions, oracle_tokens, alpha, memory_size)
 
     if frame_cache is not None:
@@ -588,8 +607,8 @@ def run(config: DictConfig):
     trajectories = test_trajectories(person_path, config.n_traj)
 
     commit_thresholds = calibrate(
-        trackers["oracle"], trackers["oracle"].model, encoders, detection_data, trajectories, config,
-        f"{config.out_dir}/calibration.pkl")
+        trackers["oracle"], trackers["oracle"].model, encoders, detection_data, trajectories, config, f"{config.out_dir}/calibration.pkl")
+        
     cells_data, n_traj = collect_scores(
         trackers, encoders, detection_data, trajectories, config, commit_thresholds, f"{config.out_dir}/scores.pkl")
 
