@@ -4,7 +4,7 @@ tracker:
   crop_size: 512                    # anchor-scale crop for the encoder, overridden per cell by the script
   model:
     _target_: src.modules.samara_hiera_model.SamaraHieraModel
-    sam_model_path: tm/sam_base_plus.pt
+    sam_model_path: tm/sam_small.pt
     crop_resize: 512
     pad_ratio: 1.0
   main_memory:
