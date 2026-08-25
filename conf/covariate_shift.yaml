@@ -22,7 +22,7 @@ person_path:
   non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person]
 
 # experiment parameters
-n_traj: 60
+n_traj: 20
 stride: 2
 crop_size: 512
 max_frames: 300             # per-cell rollouts are ~|alphas|*|memory|*|encoders| per trajectory -> keep the window short
