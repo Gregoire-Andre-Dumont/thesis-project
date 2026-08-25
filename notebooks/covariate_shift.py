@@ -6,16 +6,18 @@ A wrong commit therefore corrupts the very memory the next commit is judged agai
 The ORACLE is SAM 2 whose memory is gated on the true IoU, so its memory never drifts; it is the ceiling.
 
 Because the score drives the memory, each (encoder, memory size, alpha) cell needs its OWN policy rollout --
-there is no post-hoc sweep for the policy. The commit threshold tau is calibrated per cell in phase 1: the
-score cut, pooled over the oracle rollouts, that best matches (max F1) the true-IoU "should commit" label
-(true IoU > threshold and no occlusion). Phase 2 then runs, per trajectory, one oracle rollout plus one
-score-gated rollout per cell (all sharing the SAM backbone image cache), and scores the same candidates -- the
-target and its nearest distractors -- against each rollout's resulting memory.
+there is no post-hoc sweep for the policy. The full grid is expensive, so we run only two 1-D sweeps (on the
+perception encoder): anchor weight at a fixed memory (alpha_sweep_memory), and memory size at a fixed anchor
+weight (memory_sweep_alpha). The commit threshold tau is calibrated per cell in phase 1: the score cut, pooled
+over the oracle rollouts, that best matches (max F1) the true-IoU "should commit" label (true IoU > threshold
+and no occlusion). Phase 2 then runs, per trajectory, one oracle rollout plus one score-gated rollout per cell
+(all sharing the SAM backbone image cache), and scores the same candidates -- the target and its nearest
+distractors -- against each rollout's resulting memory.
 
-For each encoder we draw two heatmaps over (alpha, memory size): the policy-rollout target-vs-distractor AUC,
-and the oracle-minus-policy AUC gap -- the covariate shift. A higher anchor weight (the score leans on the
-incorruptible anchor) or a larger memory (a single bad commit is diluted) should shrink the gap, and only when
-the encoder can re-identify the target at all.
+For each encoder we draw two line panels: target-vs-distractor AUC vs anchor weight, and vs memory size, each
+with the oracle (true-IoU memory) and policy (score-gated memory) curves and the covariate-shift gap shaded
+between. A higher anchor weight (the score leans on the incorruptible anchor) or a larger memory (a single bad
+commit is diluted) should shrink the gap, and only when the encoder can re-identify the target at all.
 """
 
 import gc
@@ -122,14 +124,24 @@ def load_window(detection_data, trajectory, max_frames):
 
 
 def cells(config):
-    """Every (encoder, memory size, anchor weight) cell of the sweep, in a stable order."""
+    """The (encoder, memory size, anchor weight) cells actually rolled out: the union of the two 1-D sweeps --
+    anchor weight at a fixed memory, and memory size at a fixed anchor weight -- not the full grid. Stable order,
+    de-duplicated (the two sweeps share their crossing point)."""
 
     combinations = []
     for encoder in config.encoders:
+        for alpha in config.alphas:
+            combinations.append((encoder, config.alpha_sweep_memory, alpha))
         for memory_size in config.memory_sizes:
-            for alpha in config.alphas:
-                combinations.append((encoder, memory_size, alpha))
-    return combinations
+            combinations.append((encoder, memory_size, config.memory_sweep_alpha))
+
+    seen = set()
+    unique = []
+    for cell in combinations:
+        if cell not in seen:
+            seen.add(cell)
+            unique.append(cell)
+    return unique
 
 
 def oracle_pass(oracle, detection_data, trajectory, max_frames, frame_cache):
@@ -438,78 +450,60 @@ def mixed_score(candidate, encoder, policy, alpha, memory_size):
     return alpha * anchor_similarity + (1 - alpha) * memory_similarity
 
 
-def auc_grids(oracle_records, policy_scores, encoder, alphas, memory_sizes):
-    """Per cell (rows = memory sizes, columns = anchor weights): the score-gated policy's target-vs-distractor
-    AUC and the oracle-minus-policy AUC gap (the covariate shift). The policy AUC is from the cell's own
-    score-gated rollout; the oracle AUC is from its one true-IoU memory swept post-hoc over alpha/memory."""
+def sweep_aucs(oracle_records, policy_scores, encoder, memory_alpha_points):
+    """Oracle and policy target-vs-distractor AUC at each (memory size, anchor weight) point of a 1-D sweep. The
+    oracle AUC is read from its one true-IoU memory swept post-hoc; the policy AUC from that cell's rollout."""
 
-    policy_grid = np.full((len(memory_sizes), len(alphas)), np.nan)
-    gap_grid = np.full((len(memory_sizes), len(alphas)), np.nan)
-    for row, memory_size in enumerate(memory_sizes):
-        for column, alpha in enumerate(alphas):
-            oracle_labels, oracle_values = labelled_scores(oracle_records, encoder, "oracle", alpha, memory_size)
-            policy_labels, policy_values = policy_scores.get((encoder, memory_size, alpha), (np.array([]), np.array([])))
-
-            policy_grid[row, column] = target_auc(policy_labels, policy_values)
-            gap_grid[row, column] = target_auc(oracle_labels, oracle_values) - policy_grid[row, column]
-    return policy_grid, gap_grid
+    oracle_aucs = []
+    policy_aucs = []
+    for memory_size, alpha in memory_alpha_points:
+        oracle_labels, oracle_values = labelled_scores(oracle_records, encoder, "oracle", alpha, memory_size)
+        policy_labels, policy_values = policy_scores.get((encoder, memory_size, alpha), (np.array([]), np.array([])))
+        oracle_aucs.append(target_auc(oracle_labels, oracle_values))
+        policy_aucs.append(target_auc(policy_labels, policy_values))
+    return oracle_aucs, policy_aucs
 
 
-def annotate_cells(axis, grid, low, high):
-    """Write each finite value into its heatmap cell, in a colour that contrasts with the cell."""
+def draw_curve(axis, positions, tick_labels, oracle_aucs, policy_aucs, title, xlabel):
+    """One AUC-vs-swept-variable panel: the oracle and policy curves with the covariate-shift gap shaded between."""
 
-    midpoint = (low + high) / 2
-    for row in range(grid.shape[0]):
-        for column in range(grid.shape[1]):
-            value = grid[row, column]
-            if not np.isfinite(value):
-                continue
-            text_color = "white" if value < midpoint else "black"
-            axis.text(column, row, f"{value:.2f}", ha="center", va="center", fontsize=7, color=text_color)
+    axis.plot(positions, oracle_aucs, marker="o", color="tab:green", label="oracle (true-IoU memory)")
+    axis.plot(positions, policy_aucs, marker="o", color="tab:red", label="policy (score-gated memory)")
+    axis.fill_between(positions, policy_aucs, oracle_aucs, color="tab:red", alpha=0.12, label="covariate shift")
 
-
-def draw_panel(axis, grid, title, cmap, low, high, alphas, memory_sizes):
-    """Draw one heatmap (anchor weight on x, memory size on y) with per-cell labels; return the image."""
-
-    image = axis.imshow(grid, origin="lower", aspect="auto", cmap=cmap, vmin=low, vmax=high)
-    axis.set_xticks(range(len(alphas)), [f"{alpha:g}" for alpha in alphas])
-    axis.set_yticks(range(len(memory_sizes)), [str(memory_size) for memory_size in memory_sizes])
-    axis.set_xlabel("anchor weight α")
-    axis.set_ylabel("memory size")
+    axis.set_xticks(positions, [str(label) for label in tick_labels])
+    axis.set_xlabel(xlabel)
+    axis.set_ylabel("target-vs-distractor AUC")
+    axis.set_ylim(0.5, 1.0)
     axis.set_title(title, fontsize=10)
-    annotate_cells(axis, grid, low, high)
-    return image
+    axis.grid(True, alpha=0.3)
+    axis.legend(fontsize=8)
 
 
-def plot_heatmaps(policy_grid, gap_grid, encoder, alphas, memory_sizes, n_traj, path):
-    """Two heatmaps for one encoder: the policy-rollout AUC, and the oracle-minus-policy AUC gap (covariate shift)."""
+def draw_sweeps(oracle_records, policy_scores, config, n_traj):
+    """For each encoder, two line panels: AUC vs anchor weight (memory fixed) and AUC vs memory size (anchor
+    weight fixed). Returns the swept AUCs for caching."""
 
-    figure, (policy_axis, gap_axis) = plt.subplots(1, 2, figsize=(12, 5))
-
-    policy_image = draw_panel(policy_axis, policy_grid, "policy-rollout AUC", "viridis", 0.5, 1.0, alphas, memory_sizes)
-    figure.colorbar(policy_image, ax=policy_axis, fraction=0.046)
-
-    gap_top = np.nanmax(gap_grid)
-    gap_high = gap_top if np.isfinite(gap_top) else 0.1
-    gap_image = draw_panel(gap_axis, gap_grid, "covariate shift (oracle - policy AUC)", "magma", 0.0, gap_high, alphas, memory_sizes)
-    figure.colorbar(gap_image, ax=gap_axis, fraction=0.046)
-
-    figure.suptitle(f"{encoder}  |  {n_traj} trajectories", fontsize=11)
-    figure.tight_layout()
-    figure.savefig(path, dpi=120)
-    plt.close(figure)
-
-
-def draw_heatmaps(oracle_records, policy_scores, config, n_traj):
-    """Score every encoder and draw its two heatmaps; return the grids for caching."""
-
-    grids = {}
+    curves = {}
     for encoder in config.encoders:
-        policy_grid, gap_grid = auc_grids(oracle_records, policy_scores, encoder, config.alphas, config.memory_sizes)
-        figure_path = f"{config.out_dir}/{encoder}.png"
-        plot_heatmaps(policy_grid, gap_grid, encoder, list(config.alphas), list(config.memory_sizes), n_traj, figure_path)
-        grids[encoder] = {"policy": policy_grid, "gap": gap_grid}
-    return grids
+        figure, (alpha_axis, memory_axis) = plt.subplots(1, 2, figsize=(12, 5))
+
+        alpha_points = [(config.alpha_sweep_memory, alpha) for alpha in config.alphas]
+        oracle_alpha, policy_alpha = sweep_aucs(oracle_records, policy_scores, encoder, alpha_points)
+        draw_curve(alpha_axis, list(config.alphas), list(config.alphas), oracle_alpha, policy_alpha,
+                   f"AUC vs anchor weight  (memory {config.alpha_sweep_memory})", "anchor weight α")
+
+        memory_points = [(memory_size, config.memory_sweep_alpha) for memory_size in config.memory_sizes]
+        oracle_memory, policy_memory = sweep_aucs(oracle_records, policy_scores, encoder, memory_points)
+        draw_curve(memory_axis, range(len(config.memory_sizes)), list(config.memory_sizes), oracle_memory, policy_memory,
+                   f"AUC vs memory size  (α {config.memory_sweep_alpha})", "memory size")
+
+        figure.suptitle(f"{encoder}  |  {n_traj} trajectories", fontsize=11)
+        figure.tight_layout()
+        figure.savefig(f"{config.out_dir}/{encoder}.png", dpi=120)
+        plt.close(figure)
+        curves[encoder] = {"alpha": (oracle_alpha, policy_alpha), "memory": (oracle_memory, policy_memory)}
+    return curves
 
 
 def load_pickle(path, default):
@@ -598,7 +592,7 @@ def collect_scores(trackers, encoders, detection_data, trajectories, config, com
         if completed % config.checkpoint_every == 0:
             save_pickle(scores_path, {"oracle_records": oracle_records, "policy_scores": policy_scores, "done": list(done)})
         if completed % config.plot_every == 0 and oracle_records:
-            draw_heatmaps(oracle_records, policy_scores, config, len(done))
+            draw_sweeps(oracle_records, policy_scores, config, len(done))
 
     save_pickle(scores_path, {"oracle_records": oracle_records, "policy_scores": policy_scores, "done": list(done)})
     return oracle_records, policy_scores, len(done)
@@ -622,10 +616,11 @@ def run(config: DictConfig):
     oracle_records, policy_scores, n_traj = collect_scores(
         trackers, encoders, detection_data, trajectories, config, commit_thresholds, f"{config.out_dir}/scores.pkl")
 
-    grids = draw_heatmaps(oracle_records, policy_scores, config, n_traj)
-    summary = {"grids": grids, "alphas": list(config.alphas), "memory_sizes": list(config.memory_sizes),
+    curves = draw_sweeps(oracle_records, policy_scores, config, n_traj)
+    summary = {"curves": curves, "alphas": list(config.alphas), "memory_sizes": list(config.memory_sizes),
+               "alpha_sweep_memory": config.alpha_sweep_memory, "memory_sweep_alpha": config.memory_sweep_alpha,
                "commit_thresholds": {str(cell): value for cell, value in commit_thresholds.items()}, "n_traj": n_traj}
-    np.save(f"{config.out_dir}/grids.npy", summary, allow_pickle=True)
+    np.save(f"{config.out_dir}/curves.npy", summary, allow_pickle=True)
 
 
 if __name__ == "__main__":
