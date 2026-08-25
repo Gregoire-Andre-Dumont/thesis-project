@@ -25,7 +25,7 @@ person_path:
 n_traj: 60
 stride: 2
 crop_size: 512
-max_frames: 80              # per-cell rollouts are ~|alphas|*|memory|*|encoders| per trajectory -> keep the window short
+max_frames: 300             # per-cell rollouts are ~|alphas|*|memory|*|encoders| per trajectory -> keep the window short
 k_distractors: 3
 label_iou_threshold: 0.2
 share_image_cache: true     # the SAM backbone features are reused across the oracle and every policy-cell rollout
