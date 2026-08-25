@@ -275,9 +275,12 @@ def collect_trajectory(trackers, sam, encoders, detection_data, trajectory, conf
     """Phase 2: run both rollouts, commit with the global thresholds, and return one record per candidate (see
     candidate_record) so the alpha/memory sweep is pure arithmetic. None if the trajectory is unusable."""
 
-    frame_cache = {}                                 # oracle fills it, the policy reuses it (one SAM encode per frame)
+    # Sharing the image cache across the oracle/policy rollouts saves one SAM backbone pass but holds
+    # max_frames image encodings in RAM -- only worth it when reused across many rollouts, so default off.
+    frame_cache = {} if config.get("share_image_cache", False) else None
     result = run_rollouts(trackers, detection_data, trajectory, config.max_frames, frame_cache)
-    release_cache(frame_cache, trackers)             # rollouts done; the token extraction below re-encodes fresh
+    if frame_cache is not None:
+        release_cache(frame_cache, trackers)         # rollouts done; the token extraction below re-encodes fresh
     if result is None:
         return None
     rollout, (frames, boxes, occlusions, frame_indices), anchor_index = result

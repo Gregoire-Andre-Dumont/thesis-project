@@ -28,6 +28,8 @@ crop_size: 512
 max_frames: 250
 k_distractors: 3
 label_iou_threshold: 0.2
+share_image_cache: false        # cache SAM image features across the oracle/policy rollouts -- off: RAM-flat,
+                                # on: holds max_frames encodings in RAM (only worth it with a small max_frames)
 encoders: [perception, hiera_sam]
 alphas: [0.0, 0.25, 0.5, 0.75, 1.0]
 memory_sizes: [1, 2, 4, 8, 16]
