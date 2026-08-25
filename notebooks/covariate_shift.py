@@ -13,8 +13,9 @@ covariate shift: at low anchor weight the corrupted memory can no longer flag th
 grabbed distractor now matches the memory), while the clean memory still can.
 
 Memory size is fixed (config.memory_size); we sweep the anchor weight. tau is calibrated per cell in phase 1 as
-the score cut best matching (max F1) the true-IoU "should commit" label. For each encoder we draw three heatmaps
-over (equal-count anchor-candidate distance bin, anchor weight): policy AUC, oracle AUC, and their gap.
+the score cut best matching (max F1) the true-IoU "should commit" label. For each encoder we draw one AUC-vs-
+anchor-weight figure: the policy and oracle curves with the covariate-shift gap (oracle AUC - policy AUC) shaded
+between. (Each candidate's anchor-candidate distance is still recorded, for optional near/far splits.)
 """
 
 import gc
@@ -48,19 +49,6 @@ from src.utils.load_bboxes import load_bboxes
 logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore")
 os.environ["HYDRA_FULL_ERROR"] = "1"
-
-def nearest_distractors(clean_boxes, target_box, k):
-    """The k clean people whose box centre is closest to the target's centre (the candidate distractors)."""
-
-    target_x, target_y = box_center(target_box)
-
-    def squared_distance_to_target(box):
-        box_x, box_y = box_center(box)
-        return (box_x - target_x) ** 2 + (box_y - target_y) ** 2
-
-    ranked_boxes = sorted(clean_boxes, key=squared_distance_to_target)
-    return ranked_boxes[:k]
-
 
 def foreground_chamfer(reference_tokens, candidate_tokens):
     """Unidirectional foreground chamfer of the candidate to a reference (candidate -> reference)."""
@@ -314,13 +302,14 @@ def mixed(anchor_similarity, recent_similarity, alpha):
     return alpha * anchor_similarity + (1 - alpha) * memory_similarity
 
 
-def scored_frames(frames, boxes, occlusions, frame_indices, clean_boxes, stride, k_distractors):
-    """Yield (frame, distractor_boxes) for each visible, boxed frame that has at least one clean distractor."""
+def scored_frames(frames, boxes, occlusions, frame_indices, clean_boxes, stride):
+    """Yield (frame, distractor_boxes) for each visible, boxed frame that has at least one clean distractor;
+    distractor_boxes is every clean person in the frame, so a prediction is checked against all of them."""
 
     for frame in range(1, len(frames), stride):
         if occlusions[frame] > 0.5 or float(boxes[frame][2]) <= 0:
             continue
-        distractor_boxes = nearest_distractors(clean_boxes.get(int(frame_indices[frame]), []), boxes[frame], k_distractors)
+        distractor_boxes = clean_boxes.get(int(frame_indices[frame]), [])   # every clean person in the frame
         if distractor_boxes:
             yield frame, distractor_boxes
 
@@ -406,7 +395,7 @@ def collect_trajectory(oracle, policy, sam, encoders, detection_data, trajectory
 
     video, person, _ = trajectory
     clean_boxes = load_clean_boxes_by_frame(Path(config.detection_data.visible_directory) / f"{video}.json", person)
-    scored = list(scored_frames(frames, boxes, occlusions, frame_indices, clean_boxes, config.stride, config.k_distractors))
+    scored = list(scored_frames(frames, boxes, occlusions, frame_indices, clean_boxes, config.stride))
 
     warmup = oracle_data["warmup"]
     policy.frame_cache = frame_cache                         # every cell's rollout reuses this window's SAM features
@@ -450,95 +439,51 @@ def mixed_score(candidate, encoder, policy, alpha, memory_size):
     return alpha * anchor_similarity + (1 - alpha) * memory_similarity
 
 
-def quantile_edges(distances, n_bins):
-    """Distance-bin edges giving ~equal candidate counts per bin -- the quantiles of the pooled anchor-candidate
-    distances at 0, 1/n, ..., 1. So every bin holds roughly the same number of samples, not the same width."""
+def auc_by_alpha(cells_data, encoder, alphas, memory_size, config):
+    """Per anchor weight, the AUC with which the score separates on-target predicted masks from distractor grabs
+    (pooled over all distances), under the policy's own (corrupted) memory and under the oracle's clean memory."""
 
-    finite = distances[np.isfinite(distances)]
-    return np.quantile(finite, np.linspace(0, 1, n_bins + 1))
-
-
-def bin_labels(edges):
-    """Human-readable px range per bin, e.g. '0-46', '46-91', ... from the (possibly uneven) quantile edges."""
-
-    return [f"{int(round(low))}-{int(round(high))}" for low, high in zip(edges[:-1], edges[1:])]
-
-
-def distance_grids(cells_data, encoder, alphas, memory_size, edges, config):
-    """Per (distance bin, anchor weight): the AUC with which the score separates on-target predicted masks from
-    distractor grabs, scored against the policy's own (corrupted) memory and against the oracle's (clean) memory.
-    Returns (policy_grid, oracle_grid)."""
-
-    n_bins = len(edges) - 1
-    policy_grid = np.full((n_bins, len(alphas)), np.nan)
-    oracle_grid = np.full((n_bins, len(alphas)), np.nan)
-    for column, alpha in enumerate(alphas):
+    policy_aucs = []
+    oracle_aucs = []
+    for alpha in alphas:
         arrays = cells_data.get((encoder, memory_size, alpha))
         if arrays is None:
+            policy_aucs.append(np.nan)
+            oracle_aucs.append(np.nan)
             continue
-        target_iou, distractor_iou, policy_values, oracle_values, distances = arrays
+        target_iou, distractor_iou, policy_values, oracle_values, _distances = arrays
         labels = np.array([iou_label(target, distractor, config) for target, distractor in zip(target_iou, distractor_iou)])
-        bins = np.clip(np.digitize(distances, edges) - 1, 0, n_bins - 1)
-        for row in range(n_bins):
-            keep = (bins == row) & (labels >= 0)
-            policy_grid[row, column] = target_auc(labels[keep], policy_values[keep])
-            oracle_grid[row, column] = target_auc(labels[keep], oracle_values[keep])
-    return policy_grid, oracle_grid
+        keep = labels >= 0
+        policy_aucs.append(target_auc(labels[keep], policy_values[keep]))
+        oracle_aucs.append(target_auc(labels[keep], oracle_values[keep]))
+    return policy_aucs, oracle_aucs
 
 
-def annotate_cells(axis, grid, midpoint):
-    """Write each finite cell value, in a colour that contrasts with the cell (relative to `midpoint`)."""
+def draw_curves(cells_data, config, n_traj):
+    """For each encoder, one AUC-vs-anchor-weight figure: how well the score separates on-target predicted masks
+    from distractor grabs, under the policy's own memory and the oracle's clean memory, with the covariate-shift
+    gap shaded between. Returns the curves for caching."""
 
-    for row in range(grid.shape[0]):
-        for column in range(grid.shape[1]):
-            value = grid[row, column]
-            if np.isfinite(value):
-                axis.text(column, row, f"{value:.2f}", ha="center", va="center", fontsize=7,
-                          color="white" if value < midpoint else "black")
-
-
-def draw_heatmap_panel(axis, grid, title, alphas, labels, cmap, low, high):
-    """One distance-by-anchor-weight heatmap (anchor weight on x, distance bin on y) with per-cell values."""
-
-    image = axis.imshow(grid, origin="lower", aspect="auto", cmap=cmap, vmin=low, vmax=high)
-    axis.set_xticks(range(len(alphas)), [f"{alpha:g}" for alpha in alphas])
-    axis.set_yticks(range(len(labels)), labels)
-    axis.set_xlabel("anchor weight α")
-    axis.set_ylabel("anchor–candidate distance (px)")
-    axis.set_title(title, fontsize=10)
-    annotate_cells(axis, grid, (low + high) / 2)
-    return image
-
-
-def draw_heatmaps(cells_data, config, n_traj):
-    """For each encoder, three heatmaps over (equal-count distance bin, anchor weight): the score's on-target-vs-
-    distractor-grab AUC under the policy's own memory, under the oracle's clean memory, and the covariate shift
-    (oracle - policy). Returns the grids for caching."""
-
-    all_distances = np.concatenate([arrays[4] for arrays in cells_data.values()]) if cells_data else np.array([0.0, 1.0])
-    edges = quantile_edges(all_distances, config.n_distance_bins)
-    labels = bin_labels(edges)
-
-    grids = {}
+    curves = {}
     for encoder in config.encoders:
-        policy_grid, oracle_grid = distance_grids(cells_data, encoder, config.alphas, config.memory_size, edges, config)
-        gap_grid = oracle_grid - policy_grid
+        policy_aucs, oracle_aucs = auc_by_alpha(cells_data, encoder, config.alphas, config.memory_size, config)
 
-        figure, (policy_axis, oracle_axis, gap_axis) = plt.subplots(1, 3, figsize=(18, 5))
-        auc_image = draw_heatmap_panel(policy_axis, policy_grid, "policy (score-gated memory) AUC", list(config.alphas), labels, "viridis", 0.5, 1.0)
-        draw_heatmap_panel(oracle_axis, oracle_grid, "oracle (clean memory) AUC", list(config.alphas), labels, "viridis", 0.5, 1.0)
-        figure.colorbar(auc_image, ax=[policy_axis, oracle_axis], fraction=0.046)
+        figure, axis = plt.subplots(figsize=(7, 5))
+        axis.plot(list(config.alphas), oracle_aucs, marker="o", color="tab:green", label="oracle (clean memory)")
+        axis.plot(list(config.alphas), policy_aucs, marker="o", color="tab:red", label="policy (score-gated memory)")
+        axis.fill_between(list(config.alphas), policy_aucs, oracle_aucs, color="tab:red", alpha=0.12, label="covariate shift")
 
-        gap_top = np.nanmax(gap_grid)
-        gap_high = gap_top if np.isfinite(gap_top) and gap_top > 0 else 0.1
-        gap_image = draw_heatmap_panel(gap_axis, gap_grid, "covariate shift (oracle - policy)", list(config.alphas), labels, "magma", 0.0, gap_high)
-        figure.colorbar(gap_image, ax=gap_axis, fraction=0.046)
-
-        figure.suptitle(f"{encoder}  |  {n_traj} trajectories  |  memory {config.memory_size}  |  score = detect on-target vs distractor-grab", fontsize=11)
-        figure.savefig(f"{config.out_dir}/{encoder}.png", dpi=120, bbox_inches="tight")
+        axis.set_xlabel("anchor weight α")
+        axis.set_ylabel("on-target vs distractor-grab AUC")
+        axis.set_ylim(0.5, 1.0)
+        axis.grid(True, alpha=0.3)
+        axis.legend(fontsize=8)
+        axis.set_title(f"{encoder}  |  {n_traj} trajectories  |  memory {config.memory_size}", fontsize=10)
+        figure.tight_layout()
+        figure.savefig(f"{config.out_dir}/{encoder}.png", dpi=120)
         plt.close(figure)
-        grids[encoder] = {"policy": policy_grid, "oracle": oracle_grid, "gap": gap_grid, "edges": edges}
-    return grids
+        curves[encoder] = {"policy": policy_aucs, "oracle": oracle_aucs}
+    return curves
 
 
 def load_pickle(path, default):
@@ -624,7 +569,7 @@ def collect_scores(trackers, encoders, detection_data, trajectories, config, com
         if completed % config.checkpoint_every == 0:
             save_pickle(scores_path, {"cells": cells_data, "done": list(done)})
         if completed % config.plot_every == 0 and cells_data:
-            draw_heatmaps(cells_data, config, len(done))
+            draw_curves(cells_data, config, len(done))
 
     save_pickle(scores_path, {"cells": cells_data, "done": list(done)})
     return cells_data, len(done)
@@ -648,11 +593,10 @@ def run(config: DictConfig):
     cells_data, n_traj = collect_scores(
         trackers, encoders, detection_data, trajectories, config, commit_thresholds, f"{config.out_dir}/scores.pkl")
 
-    grids = draw_heatmaps(cells_data, config, n_traj)
-    summary = {"grids": grids, "alphas": list(config.alphas), "memory_size": config.memory_size,
-               "n_distance_bins": config.n_distance_bins,
+    curves = draw_curves(cells_data, config, n_traj)
+    summary = {"curves": curves, "alphas": list(config.alphas), "memory_size": config.memory_size,
                "commit_thresholds": {str(cell): value for cell, value in commit_thresholds.items()}, "n_traj": n_traj}
-    np.save(f"{config.out_dir}/grids.npy", summary, allow_pickle=True)
+    np.save(f"{config.out_dir}/curves.npy", summary, allow_pickle=True)
 
 
 if __name__ == "__main__":
