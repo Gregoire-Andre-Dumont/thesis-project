@@ -506,16 +506,6 @@ def collect_chamfers(trackers, encoders, detection_data, trajectories, config, o
     return candidates, len(done)
 
 
-def report(grids, oracle_threshold, policy_threshold):
-    """Print the global thresholds and each encoder's covariate-shift summary."""
-
-    print(f"\nglobal thresholds: oracle={oracle_threshold:.3f}  policy={policy_threshold:.3f}")
-    print("covariate shift (max oracle-policy AUC gap) per encoder:")
-    for encoder, grid in grids.items():
-        max_gap = np.nanmax(grid["gap"])
-        min_policy_auc = np.nanmin(grid["policy"])
-        max_policy_auc = np.nanmax(grid["policy"])
-        print(f"  {encoder:11s} max_gap={max_gap:.3f}  policy_auc[min..max]={min_policy_auc:.3f}..{max_policy_auc:.3f}")
 
 
 @hydra.main(config_path="../conf", config_name="covariate_shift", version_base=None)
@@ -540,7 +530,6 @@ def run(config: DictConfig):
     summary = {"grids": grids, "alphas": list(config.alphas), "memory_sizes": list(config.memory_sizes),
                "oracle_threshold": oracle_threshold, "policy_threshold": policy_threshold, "n_traj": n_traj}
     np.save(f"{config.out_dir}/grids.npy", summary, allow_pickle=True)
-    report(grids, oracle_threshold, policy_threshold)
 
 
 if __name__ == "__main__":
