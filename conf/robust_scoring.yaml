@@ -1,0 +1,36 @@
+detection_data:
+  _target_: src.typing.detection_data.DetectionData
+  amodal_directory: data/person_path/amodal
+  visible_directory: data/person_path/visible
+  video_directory: data/person_path/videos
+  load_frames: True
+  num_threads: 32
+
+person_path:
+  _target_: src.typing.person_path.PersonPath
+  main_directory: data/person_path
+  occlusion_ranges: [5, 150]
+  n_experiments: 1200
+  n_after_occlusion: 70
+  random_seed: 44
+  min_visible_ratio: 0.7
+  min_visible_area: 500
+  max_distractor_overlap: 0.30
+  non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person]
+
+# experiment parameters
+n_traj: 200
+memory_size: 16           # re-ID memory window scored against (SAM 2's own bank size is set in the oracle config)
+crop_size: 512
+max_frames: 300
+encoders: [perception_base]
+alphas: [0.0, 0.25, 0.5, 0.75, 1.0]   # anchor weight sweep (the x-axis)
+
+# candidate labels (each pass's predicted masks)
+corruption_p: 0.2
+label_positive: 0.5
+label_negative_target: 0.2
+label_negative_distractor: 0.5
+
+oracle_config: conf/trackers/baselines/memory_oracle.yaml
+out_dir: data/robust_scoring

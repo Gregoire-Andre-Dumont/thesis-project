@@ -361,23 +361,14 @@ class SAMV2Model(nn.Module):
                 main_memory = main_memory,
                 encoded_image_features_list = encoded_image_features_list)
 
-            # Mask selection: SAM's argmax-IoU by default, or an external re-ranker (e.g. pick the candidate
-            # with the highest Perception-Encoder identity score) when one is attached.
-            if getattr(self, "mask_reranker", None) is not None:
-                best_idx = self.mask_reranker(current_frame, mask_preds, iou_scores)
-            else:
-                best_idx = 1 + torch.argmax(iou_scores[:, 1:], dim=-1)
-            chosen_mask = mask_preds[:, best_idx, :, :]
-            chosen_pointer = object_pointers[:, best_idx, :]
 
-            # FORCE_OBJECT_PRESENT (experiment flag): the memory encoder adds a 'no-object' embedding to the
-            # stored encoding whenever object_score < 0, which disperses tracking under occlusion. Clamping to
-            # >= 0 suppresses that token so the memory always encodes the target as present. The returned
-            # object_score (used by the commit gate) is left untouched.
-            score_for_memory = object_score.clamp(min=0.0) if os.environ.get("FORCE_OBJECT_PRESENT") else object_score
+            best_idx = 1 + torch.argmax(iou_scores[:, 1:], dim=-1)
+            chosen_mask = mask_preds[:, best_idx, :, :]
+            
+            chosen_pointer = object_pointers[:, best_idx, :]
             chosen_encoding = self.memory_encoder(
                 mask_prediction = chosen_mask,
-                object_score = score_for_memory,
+                object_score = object_score,
                 lowres_image_encoding = lowres_imgenc)
 
         chosen_mask = chosen_mask.squeeze().to(torch.float64).cpu()      # logits; thresholded (>0) downstream

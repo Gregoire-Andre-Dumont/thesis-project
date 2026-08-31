@@ -20,35 +20,47 @@ ISTD = torch.tensor([.229, .224, .225]).view(1, 3, 1, 1)
 
 
 def _norm(crops, size, mean, std, dev, dtype):
-    imgs = np.stack([cv2.resize(c, (size, size), interpolation=cv2.INTER_CUBIC) for c in crops]).astype(np.float32) / 255
-    return ((torch.from_numpy(imgs).permute(0, 3, 1, 2) - mean) / std).to(dev).to(dtype)
+    resized = np.stack([cv2.resize(crop, (size, size), interpolation=cv2.INTER_CUBIC) for crop in crops]).astype(np.float32) / 255
+    channels_first = torch.from_numpy(resized).permute(0, 3, 1, 2)
+    return ((channels_first - mean) / std).to(dev).to(dtype)
 
 
 def _hiera_stage2(model, crops, dev, dtype):
     """Stage-2 tokens (input/16 -> 32x32 at 512) for a timm Hiera features_only backbone: (n, 32*32, dim).
     timm hiera features_only returns channels-first (n, C, 32, 32)."""
-    feats = model(_norm(crops, 512, IMEAN, ISTD, dev, dtype))[2]          # (n, C, 32, 32)
-    f = feats.permute(0, 2, 3, 1)                                         # (n, 32, 32, C)
-    return f.reshape(f.shape[0], GRID * GRID, f.shape[-1]).float()
+    stage2 = model(_norm(crops, 512, IMEAN, ISTD, dev, dtype))[2]         # (n, C, 32, 32) channels-first
+    grid = stage2.permute(0, 2, 3, 1)                                     # (n, 32, 32, C)
+    return grid.reshape(grid.shape[0], GRID * GRID, grid.shape[-1]).float()
 
 
 def _load_hiera_mae(dev, dtype):
     """Hiera-L MAE backbone at 512 (features_only). timm won't interpolate the pos_embed on load,
     so we bicubic-resize the pretrained 56x56 stage-0 grid to 128x128 and load with the 'model.' prefix."""
-    src = timm.create_model("hiera_large_224.mae", pretrained=True).state_dict()
-    pe = src["pos_embed"]                                                 # (1, 56*56, dim)
-    s, d = int(pe.shape[1] ** .5), pe.shape[2]
-    src["pos_embed"] = F.interpolate(pe.reshape(1, s, s, d).permute(0, 3, 1, 2).float(),
-                                     size=(GRID * 4, GRID * 4), mode="bicubic", align_corners=False
-                                     ).permute(0, 2, 3, 1).reshape(1, (GRID * 4) ** 2, d)
+    
+    state = timm.create_model("hiera_large_224.mae", pretrained=True).state_dict()
+
+    pos_embed = state["pos_embed"]                                        # (1, 56*56, dim)
+    source_grid = int(pos_embed.shape[1] ** 0.5)                          # 56 (pretrained stage-0 grid)
+    target_grid = GRID * 4                                                # 128 (stage-0 grid at 512)
+    dim = pos_embed.shape[2]
+
+    source_map = pos_embed.reshape(1, source_grid, source_grid, dim).permute(0, 3, 1, 2).float()   # (1, dim, 56, 56)
+    target_map = F.interpolate(source_map, size=(target_grid, target_grid), mode="bicubic", align_corners=False)
+    state["pos_embed"] = target_map.permute(0, 2, 3, 1).reshape(1, target_grid * target_grid, dim)
+
     model = timm.create_model("hiera_large_224.mae", pretrained=False, img_size=512, features_only=True)
-    model.load_state_dict({"model." + k: v for k, v in src.items()}, strict=False)
+    model.load_state_dict({"model." + key: value for key, value in state.items()}, strict=False)
     return model.eval().to(dev).to(dtype)
 
 
 def _build_perception(dev, dtype):
     pe = timm.create_model("vit_pe_spatial_large_patch14_448.fb", pretrained=True, num_classes=0).eval().to(dev).to(dtype)
     return lambda crops: pe.forward_features(_norm(crops, 448, HALF, HALF, dev, dtype))[:, pe.num_prefix_tokens:].float()
+
+
+def _build_perception_base(dev, dtype):
+    pe = timm.create_model("vit_pe_spatial_base_patch16_512.fb", pretrained=True, num_classes=0).eval().to(dev).to(dtype)
+    return lambda crops: pe.forward_features(_norm(crops, 512, HALF, HALF, dev, dtype))[:, pe.num_prefix_tokens:].float()
 
 
 def _build_dino(dev, dtype):
@@ -68,6 +80,7 @@ def _build_hiera_mae(dev, dtype):
 
 ENCODER_BUILDERS = {
     "perception": _build_perception,
+    "perception_base": _build_perception_base,
     "dino": _build_dino,
     "hiera_sam": _build_hiera_sam,
     "hiera_mae": _build_hiera_mae,
@@ -102,59 +115,69 @@ def crop_around_masks(frames, masks, crop_resize=512, pad_ratio=0.25, size_floor
     return zeros. Returns crop images (n, cr, cr, 3) uint8 and crop masks (n, cr, cr) float32
     (binary, thresholded after the resize)."""
 
-    n = len(masks)
-    cf = np.zeros((n, crop_resize, crop_resize, 3), np.uint8)
-    cm = np.zeros((n, crop_resize, crop_resize), np.float32)
+    count = len(masks)
+    crop_images = np.zeros((count, crop_resize, crop_resize, 3), np.uint8)
+    crop_masks = np.zeros((count, crop_resize, crop_resize), np.float32)
     for i, (frame, mask) in enumerate(zip(frames, masks)):
-        mask = cv2.resize(mask.astype(np.float32), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+        frame_height, frame_width = frame.shape[0], frame.shape[1]
+        mask = cv2.resize(mask.astype(np.float32), (frame_width, frame_height), interpolation=cv2.INTER_LINEAR)
+
         coords = cv2.findNonZero((mask > 0.0).astype(np.uint8))
-        if coords is None:
+        if coords is None:                                               # empty mask -> leave zeros
             continue
-        x, y, w, h = cv2.boundingRect(coords)
-        side = min(int(round(max(w, h, 1, size_floor) * (1 + 2 * pad_ratio))), frame.shape[1], frame.shape[0])
+
+        x, y, width, height = cv2.boundingRect(coords)
+        padded_side = int(round(max(width, height, 1, size_floor) * (1 + 2 * pad_ratio)))
+        side = min(padded_side, frame_width, frame_height)        
         half = side / 2
-        x0, y0 = int(round(x + w / 2 - half)), int(round(y + h / 2 - half))
+        center_x, center_y = x + width / 2, y + height / 2
+
+        x0 = min(max(int(round(center_x - half)), 0), frame_width - side)  
+        y0 = min(max(int(round(center_y - half)), 0), frame_height - side)
         x1, y1 = x0 + side, y0 + side
-        if x0 < 0: x1 -= x0; x0 = 0
-        if y0 < 0: y1 -= y0; y0 = 0
-        if x1 > frame.shape[1]: x0 -= x1 - frame.shape[1]; x1 = frame.shape[1]
-        if y1 > frame.shape[0]: y0 -= y1 - frame.shape[0]; y1 = frame.shape[0]
-        cf[i] = cv2.resize(frame[y0:y1, x0:x1], (crop_resize, crop_resize), interpolation=cv2.INTER_CUBIC)
-        m = cv2.resize(mask[y0:y1, x0:x1], (crop_resize, crop_resize), interpolation=cv2.INTER_CUBIC)
-        cm[i] = (m > 0.0).astype(np.float32)
-    return cf, cm
+
+        crop_images[i] = cv2.resize(frame[y0:y1, x0:x1], (crop_resize, crop_resize), interpolation=cv2.INTER_CUBIC)
+        resized_mask = cv2.resize(mask[y0:y1, x0:x1], (crop_resize, crop_resize), interpolation=cv2.INTER_CUBIC)
+        crop_masks[i] = (resized_mask > 0.0).astype(np.float32)
+    return crop_images, crop_masks
 
 
 def _patch_masks(crop_masks, device):
     """Crop masks (n, cr, cr) -> per-patch foreground mask on the 32x32 grid (n, 1024) bool."""
-    m = torch.from_numpy(crop_masks).to(device).unsqueeze(1)
-    return (F.interpolate(m, size=(GRID, GRID), mode="nearest") > 0.5).flatten(1)
+    masks = torch.from_numpy(crop_masks).to(device).unsqueeze(1)
+    patch_grid = F.interpolate(masks, size=(GRID, GRID), mode="nearest")
+    return (patch_grid > 0.5).flatten(1)
 
 
 def _split_fg_bg(tokens, patch_mask):
     """Foreground/background token views; masked-out patches set to a -5 sentinel (SamaraHieraModel)."""
-    pm = patch_mask.bool().unsqueeze(-1)
-    pad = torch.tensor(-5.0, device=tokens.device, dtype=tokens.dtype)
-    return torch.where(pm, tokens, pad), torch.where(~pm, tokens, pad)
+    is_foreground = patch_mask.bool().unsqueeze(-1)
+    sentinel = torch.tensor(-5.0, device=tokens.device, dtype=tokens.dtype)
+    foreground = torch.where(is_foreground, tokens, sentinel)
+    background = torch.where(~is_foreground, tokens, sentinel)
+    return foreground, background
 
 
 def _patch_similarities(reference, target, chunk=16):
     """Per target patch, best cosine similarity to the valid reference patches (-5 excluded).
     reference (R, P, D), target (T, Q, D) -> (T, R, Q). Copied from SamaraHieraModel."""
-    ref_valid = ~(reference == -5).all(dim=-1)
-    ref_mask = ref_valid[:, None, :, None]
-    all_ref_invalid = ~ref_valid.any(dim=-1)
-    refn = F.normalize(reference, dim=-1)
-    out = []
-    for s in range(0, target.shape[0], chunk):
-        tc = target[s:s + chunk]
-        tvalid = ~(tc == -5).all(dim=-1)
-        tn = F.normalize(tc, dim=-1)
-        sim = torch.einsum("rpd,tqd->rtpq", refn, tn).masked_fill(~ref_mask, float("-inf")).amax(dim=2)
-        if all_ref_invalid.any():
-            sim[all_ref_invalid] = 0.0
-        out.append(sim * tvalid[None].to(sim.dtype))
-    return torch.cat(out, dim=1).float().cpu().numpy().transpose(1, 0, 2)
+    reference_valid = ~(reference == -5).all(dim=-1)
+    reference_valid_mask = reference_valid[:, None, :, None]
+    all_reference_invalid = ~reference_valid.any(dim=-1)
+    reference_normalized = F.normalize(reference, dim=-1)
+
+    chunks = []
+    for start in range(0, target.shape[0], chunk):
+        target_chunk = target[start:start + chunk]
+        target_valid = ~(target_chunk == -5).all(dim=-1)
+        target_normalized = F.normalize(target_chunk, dim=-1)
+
+        similarities = torch.einsum("rpd,tqd->rtpq", reference_normalized, target_normalized)
+        similarities = similarities.masked_fill(~reference_valid_mask, float("-inf")).amax(dim=2)
+        if all_reference_invalid.any():
+            similarities[all_reference_invalid] = 0.0
+        chunks.append(similarities * target_valid[None].to(similarities.dtype))
+    return torch.cat(chunks, dim=1).float().cpu().numpy().transpose(1, 0, 2)
 
 
 def encode_tokens(token_fn, crop_frames, enc_chunk=16):
@@ -169,18 +192,18 @@ def similarity_feature_map(tokens, crop_masks, reference_foreground):
     background patches'. `reference_foreground` is (1, 1024, dim) foreground tokens (-5 elsewhere).
 
     This is the single shared feature the calibrator consumes at dataset-creation AND deployment."""
-    n = tokens.shape[0]
+    count = tokens.shape[0]
     patch_mask = _patch_masks(crop_masks, tokens.device)
-    fg, bg = _split_fg_bg(tokens, patch_mask)
-    fg_sim = _patch_similarities(reference_foreground, fg)[:, 0].reshape(n, 1, GRID, GRID)
-    bg_sim = _patch_similarities(reference_foreground, bg)[:, 0].reshape(n, 1, GRID, GRID)
-    return np.stack([fg_sim, bg_sim], axis=-1).astype(np.float16)
+    foreground, background = _split_fg_bg(tokens, patch_mask)
+    foreground_similarity = _patch_similarities(reference_foreground, foreground)[:, 0].reshape(count, 1, GRID, GRID)
+    background_similarity = _patch_similarities(reference_foreground, background)[:, 0].reshape(count, 1, GRID, GRID)
+    return np.stack([foreground_similarity, background_similarity], axis=-1).astype(np.float16)
 
 
 def anchor_foreground(tokens, crop_masks):
     """Foreground token view of the anchor crop (index 0), the reference for similarity_feature_map."""
-    fg, _ = _split_fg_bg(tokens[0:1], _patch_masks(crop_masks[0:1], tokens.device))
-    return fg
+    foreground, _ = _split_fg_bg(tokens[0:1], _patch_masks(crop_masks[0:1], tokens.device))
+    return foreground
 
 
 def encode_trajectory(encoders, crop_frames, crop_masks, enc_chunk=16):

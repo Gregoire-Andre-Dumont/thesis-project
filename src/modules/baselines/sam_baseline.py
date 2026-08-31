@@ -15,7 +15,7 @@ class SAMBaseline:
     model: SamaraHieraModel | None = None
     iou_threshold: float | None = None
     main_memory: MainMemory | None = None
-    label_mask_iou: bool = True        # set False to skip the pseudo-GT mask-IoU label (a per-frame mask decode) when it is not needed
+    label_mask_iou: bool = True  
 
     def __post_init__(self):
         """Load and initialize the SAM 2 model with quantization."""

@@ -34,6 +34,23 @@ def load_clean_boxes_by_frame(visible_path, target_id, non_targets=NON_TARGETS):
     return out
 
 
+def load_clean_boxes_by_person(visible_path, target_id, non_targets=NON_TARGETS):
+    """{person_id: {frame_idx: box_norm}} for every clean OTHER person -- keeps identity so one distractor can be
+    followed across frames."""
+    data = json.load(open(visible_path))
+    w = int(data["metadata"]["resolution"]["width"])
+    h = int(data["metadata"]["resolution"]["height"])
+    out = {}
+    for e in data["entities"]:
+        if e["id"] == target_id or any(lbl in non_targets for lbl in e["labels"]):
+            continue
+        bx, by, bw, bh = e["bb"]
+        if bw <= 0 or bh <= 0:
+            continue
+        out.setdefault(e["id"], {})[e["blob"]["frame_idx"]] = np.array([bx / w, by / h, bw / w, bh / h], np.float32)
+    return out
+
+
 def _centroid_norm(mask):
     """Normalized (cx, cy) of a boolean mask, or None if empty."""
     ys, xs = np.nonzero(mask)
