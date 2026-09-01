@@ -59,7 +59,21 @@ def _build_perception(dev, dtype):
 
 
 def _build_perception_base(dev, dtype):
-    pe = timm.create_model("vit_pe_spatial_base_patch16_512.fb", pretrained=True, num_classes=0).eval().to(dev).to(dtype)
+    # Fully local load (pretrained=False, then load the tm/ safetensors) -- NEVER touches HuggingFace, so it can't
+    # 429. Checks several absolute candidate paths for the weights and errors clearly if none is found.
+    from pathlib import Path
+    from safetensors.torch import load_file
+    candidates = [
+        Path(__file__).resolve().parents[2] / "tm" / "pe_spatial_base_512.safetensors",
+        Path("/workspace/thesis-project/tm/pe_spatial_base_512.safetensors"),
+        Path("tm/pe_spatial_base_512.safetensors"),
+    ]
+    weights = next((p for p in candidates if p.exists()), None)
+    if weights is None:
+        raise FileNotFoundError(f"PE weights not found; put pe_spatial_base_512.safetensors in tm/ (looked in {candidates})")
+    pe = timm.create_model("vit_pe_spatial_base_patch16_512.fb", pretrained=False, num_classes=0)
+    pe.load_state_dict(load_file(str(weights)), strict=False)
+    pe = pe.eval().to(dev).to(dtype)
     return lambda crops: pe.forward_features(_norm(crops, 512, HALF, HALF, dev, dtype))[:, pe.num_prefix_tokens:].float()
 
 
