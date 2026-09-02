@@ -19,17 +19,12 @@ person_path:
   non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person]
 
 # experiment parameters
-n_traj: 200
-memory_size: 16
-crop_size: 512
+n_traj: 300
 max_frames: 300
-encoders: [perception_base]
-alphas: [0.0, 0.25, 0.5, 0.75, 1.0]
+first_occ_min: 5                        # require a clean run-in: first occlusion strictly after this frame
+thresholds: [0.1, 0.2, 0.3, 0.4, 0.5]   # oracle commit-gate box-IoU thresholds to sweep (memory + mask oracle)
+n_bins: 4                               # occlusion-frame-count bins for the x-axis
 
-corruption_p: 0.2
-label_positive: 0.5
-label_negative_target: 0.2
-label_negative_distractor: 0.5
-
-oracle_config: conf/trackers/baselines/mask_oracle.yaml
+oracle_config: conf/trackers/baselines/memory_oracle.yaml
+mask_oracle_config: conf/trackers/baselines/mask_oracle.yaml
 out_dir: data/robust_scoring

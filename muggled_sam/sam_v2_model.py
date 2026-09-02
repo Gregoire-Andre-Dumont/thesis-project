@@ -378,3 +378,30 @@ class SAMV2Model(nn.Module):
         return (chosen_mask, chosen_pointer, chosen_encoding, object_score, iou_score,
                 iou_token_out, obj_token_out, encoded_image_features_list)
 
+    def propose_masks(self, current_frame: NDArray[np.uint8], main_memory: MainMemory,encoded_image_features_list=None):
+        """Run one memory-conditioned step and return EVERY candidate mask without applying SAM's argmax
+        selection, so the caller can choose the mask itself (e.g. an oracle picking by true IoU). Returns
+        `(mask_preds, iou_scores, object_pointers, object_score, lowres_imgenc, encoded_image_features_list)`,
+        where `mask_preds` is BxKxHxW logits and `object_score` is the raw (pre-sigmoid) score the memory
+        encoder expects. Pair with `commit_candidate` to turn a chosen index into a memory entry."""
+
+        bgr_current_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR)
+        with torch.inference_mode():
+            if encoded_image_features_list is None:
+                encoded_image_features_list, _, _ = self.encode_image(bgr_current_frame)
+            lowres_imgenc, *_ = encoded_image_features_list
+            mask_preds, iou_scores, object_pointers, object_score, _, _ = self.step_video_masking(
+                main_memory=main_memory, encoded_image_features_list=encoded_image_features_list)
+        return mask_preds, iou_scores, object_pointers, object_score, lowres_imgenc, encoded_image_features_list
+
+    def commit_candidate(self, mask_preds, best_idx, object_pointers, object_score, lowres_imgenc):
+        """Build `(chosen_mask_logits_cpu, chosen_pointer, chosen_encoding)` for one chosen candidate index --
+        the same encoding path as `select_best_mask`, but for an externally chosen mask."""
+
+        with torch.inference_mode():
+            chosen_mask = mask_preds[:, best_idx:best_idx + 1, :, :]      # keep the (B, 1, H, W) shape the encoder expects
+            chosen_pointer = object_pointers[:, best_idx:best_idx + 1, :]
+            chosen_encoding = self.memory_encoder(
+                mask_prediction=chosen_mask, object_score=object_score, lowres_image_encoding=lowres_imgenc)
+        return chosen_mask.squeeze().to(torch.float64).cpu(), chosen_pointer, chosen_encoding
+

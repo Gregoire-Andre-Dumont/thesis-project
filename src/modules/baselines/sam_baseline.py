@@ -48,8 +48,7 @@ class SAMBaseline:
         self.update_memory = torch.zeros(n_frames, dtype=torch.int)
         self.object_pointers = torch.zeros((n_frames, 256), dtype=torch.float64)
 
-        # Optional per-frame embedding cache shared with another tracker over the same frames: the
-        # full-frame image encoding is target-independent, so it is encoded once and reused.
+        # Optional per-frame image-embedding cache (target-independent), shared across rollouts over the same frames.
         cache = getattr(self, "frame_cache", None)
 
         for idx, current_frame in enumerate(detection_data.frames):

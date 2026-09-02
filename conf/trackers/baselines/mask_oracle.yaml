@@ -1,11 +1,13 @@
 tracker:
-  _target_: src.modules.baselines.sam_baseline.SAMBaseline
-  iou_threshold: 0.5
+  _target_: src.modules.baselines.mask_oracle.MaskOracle
+  iou_threshold: 0.2
+  oracle_mask_selection: true
   model:
     _target_: src.modules.samara_hiera_model.SamaraHieraModel
     sam_model_path: tm/sam_large.pt
-    crop_resize: 384
+    crop_resize: 512
     pad_ratio: 1.0
+
   main_memory:
     _target_: src.modules.memories.main_memory.MainMemory
     max_memory_history: 6
@@ -14,5 +16,5 @@ tracker:
 experiment:
   _target_: src.experiments.tracking_experiment.TrackingExperiment
   resolution: 1024
-  experiment_name: sam_baseline
-  video_path: data/visualize/sam_baseline
+  experiment_name: mask oracle
+  video_path: data/visualize

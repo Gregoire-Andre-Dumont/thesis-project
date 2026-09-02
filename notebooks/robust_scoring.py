@@ -25,6 +25,9 @@ import warnings
 from collections import defaultdict
 from pathlib import Path
 
+os.environ.setdefault("HF_HUB_OFFLINE", "1")                 # use the local HF cache; dodge HuggingFace 429s
+os.environ.setdefault("HF_HOME", "/root/.cache/huggingface")  # pin cache path (detached launches lose HOME)
+
 import hydra
 import matplotlib
 matplotlib.use("Agg")
