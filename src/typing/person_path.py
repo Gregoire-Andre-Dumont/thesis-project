@@ -47,12 +47,13 @@ def _nearest_index(sorted_values: np.ndarray, target: int) -> int:
 def _anchor_video_frame(amodal: list[dict], visible: list[dict], boxes_by_frame: dict, person_id: int,
                         min_visible_ratio: float, min_area: float, max_overlap: float,
                         min_overlap: float = 0.0, max_area: float = float("inf")):
-    """First visible frame that makes a clean reference: box of between `min_area` and `max_area` pixels, covering
-    at least `min_visible_ratio` of the nearest amodal box on BOTH sides (width and height), and with
-    the closest other person's box covering between `min_overlap` and `max_overlap` of it. The upper
-    bound keeps the box prompt unambiguous; the lower bound (default 0) can instead REQUIRE a nearby
-    distractor, to study the confident-drift regime. Requiring each side rather than area stops a target
-    occluded along one dimension from qualifying by being oversized on the other. `None` if none qualify."""
+    """First visible frame that makes a clean reference: AMODAL box area between `min_area` and `max_area` pixels
+    (true person size), not fully occluded, and with the closest other person's box covering between
+    `min_overlap` and `max_overlap` of
+    it. The upper overlap bound keeps the box prompt unambiguous; the lower bound (default 0) can instead REQUIRE
+    a nearby distractor, to study the confident-drift regime. (`min_visible_ratio` is no longer a filter -- the
+    visible/amodal area ratio is still computed and returned for post-hoc analysis.) Returns
+    (frame, closest-distractor-overlap, visible-area-ratio), or `None` if none qualify."""
 
     if not amodal or not visible:
         return None
@@ -66,19 +67,18 @@ def _anchor_video_frame(amodal: list[dict], visible: list[dict], boxes_by_frame:
     for entity in sorted(visible, key=frame_of):
         frame = int(frame_of(entity))
         visible_wh = np.array(entity["bb"][2:4], dtype=np.float64)
-        if frame in occluded or np.any(visible_wh <= 0) or not (min_area <= np.prod(visible_wh) <= max_area):
+        if frame in occluded or np.any(visible_wh <= 0):
             continue
-        amodal_wh_here = amodal_wh[_nearest_index(amodal_frames, frame)]
-        if np.any(amodal_wh_here <= 0):
+        amodal_area = float(np.prod(amodal_wh[_nearest_index(amodal_frames, frame)]))
+        if not (min_area <= amodal_area <= max_area):           # size gate on the AMODAL box (true person size)
             continue
-        if not np.all(visible_wh / amodal_wh_here >= min_visible_ratio):
-            continue
+        visible_ratio = float(np.prod(visible_wh) / amodal_area) if amodal_area > 0 else float("nan")  # stored only
         covers = [_covered_fraction(entity["bb"], other)
                   for other_id, other in boxes_by_frame.get(frame, []) if other_id != person_id]
         closest = max(covers) if covers else 0.0
         if closest > max_overlap or closest < min_overlap:
             continue
-        return frame
+        return frame, float(closest), visible_ratio
     return None
 
 
@@ -95,6 +95,7 @@ class PersonPath:
     non_targets: list[str] | None = None
     occlusion_ranges: list[int] | None = None
     n_after_occlusion: int | None = None
+    first_occ_min: int = 0                 # require the first occlusion strictly after this frame past the anchor
     n_experiments: int | None = None
     min_visible_ratio: float = 0.9
     resize_resolution: int = 1024          # working resolution the min-area threshold is measured at
@@ -108,6 +109,8 @@ class PersonPath:
     selected_video_names: list[str] | None = None
     selected_person_ids: list[int] | None = None
     selected_anchor_video_frames: list[int] | None = None
+    selected_anchor_overlaps: list[float] | None = None      # closest-distractor overlap at each anchor frame
+    selected_anchor_visible_ratios: list[float] | None = None  # anchor visible/amodal size ratio (binding axis)
 
     def __post_init__(self):
         """Resolve dataset paths, then enumerate and sample the target trajectories."""
@@ -126,13 +129,16 @@ class PersonPath:
         return not any(label in self.non_targets for label in entity["labels"])
 
     def _passes_occlusion(self, occlusions: np.ndarray) -> bool:
-        """True when the occlusion count lands strictly inside `occlusion_ranges` and more than
-        `n_after_occlusion` visible frames follow the first occlusion."""
+        """True when the occlusion count lands strictly inside `occlusion_ranges`, the first occlusion happens
+        strictly after `first_occ_min` frames past the anchor (a clean run-in), and more than `n_after_occlusion`
+        visible frames follow the first occlusion."""
 
         n_occluded = int(occlusions.sum())
         if not (self.occlusion_ranges[0] < n_occluded < self.occlusion_ranges[-1]):
             return False
         first = int(np.argmax(occlusions > 0))
+        if first <= self.first_occ_min:
+            return False
         return int(np.sum(occlusions[first:] == 0)) > self.n_after_occlusion
 
     def select_targets(self, video_names: list[str]):
@@ -160,22 +166,23 @@ class PersonPath:
 
             for person_id in list(amodal_ids & visible_ids):
                 entities = (amodal_by_id.get(person_id, []), visible_by_id.get(person_id, []))
-                anchor = _anchor_video_frame(*entities, boxes_by_frame, person_id, self.min_visible_ratio,
-                                             min_area, self.max_distractor_overlap,
-                                             self.min_distractor_overlap, max_area)
-                if anchor is None:
+                found = _anchor_video_frame(*entities, boxes_by_frame, person_id, self.min_visible_ratio,
+                                            min_area, self.max_distractor_overlap, self.min_distractor_overlap, max_area)
+                if found is None:
                     continue
-                # Occlusion conditions apply to the tracked segment, which starts at the anchor.
-                if not self._passes_occlusion(_occlusion_array(*entities, since=anchor)):
-                    continue
-                candidates.append((video_name, person_id, anchor))
+                    
+                anchor, overlap, visible_ratio = found
+                if self._passes_occlusion(_occlusion_array(*entities, since=anchor)):
+                    candidates.append((video_name, person_id, anchor, overlap, visible_ratio))
 
         rng = np.random.default_rng(self.random_seed)
         chosen = rng.choice(len(candidates), size=min(self.n_experiments, len(candidates)), replace=False)
         selected = [candidates[i] for i in chosen]
         rng.shuffle(selected)
 
-        videos, pids, anchors = zip(*selected) if selected else ((), (), ())
+        videos, pids, anchors, overlaps, ratios = zip(*selected) if selected else ((), (), (), (), ())
         self.selected_video_names = np.array(videos)
         self.selected_person_ids = np.array(pids)
         self.selected_anchor_video_frames = np.array(anchors, dtype=np.int64)
+        self.selected_anchor_overlaps = np.array(overlaps, dtype=np.float64)
+        self.selected_anchor_visible_ratios = np.array(ratios, dtype=np.float64)

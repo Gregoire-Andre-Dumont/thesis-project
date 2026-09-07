@@ -160,8 +160,9 @@ def causal_recent(positions, tokens, frame, memory_size):
 
 
 def load_window(detection_data, trajectory, max_frames):
-    """Load only the frames the tracker needs -- the warmup frame plus `max_frames` from the anchor -- into
-    `detection_data`. Returns (warmup, anchor_index), or None if the anchor is missing."""
+    """Load only the frames the tracker needs -- `max_frames` starting AT the anchor -- into `detection_data`.
+    Returns (warmup, anchor_index), or None if the anchor is missing. warmup is 0: the clip begins at the
+    anchor (the memory reference, at clip index 0), so nothing before the anchor is tracked or scored."""
 
     video, person, anchor_frame = trajectory
     detection_data.load_frames = False
@@ -169,8 +170,8 @@ def load_window(detection_data, trajectory, max_frames):
     anchor_index = anchor_trajectory_index(detection_data, anchor_frame)
     if anchor_index is None:
         return None
-    warmup = 1 if anchor_index >= 1 else 0
-    window = detection_data.frame_indices[anchor_index - warmup:anchor_index - warmup + warmup + max_frames]
+    warmup = 0
+    window = detection_data.frame_indices[anchor_index:anchor_index + max_frames]
     detection_data.load_frames = True
     detection_data.initialize_target(video, person, frame_indices=window)
     return warmup, anchor_index

@@ -1,13 +1,19 @@
-from dataclasses import dataclass
+import numpy as np
 
+from dataclasses import dataclass
 from src.modules.baselines.memory_oracle import MemoryOracle
+from src.utils.compute_iou import compute_iou
 
 
 @dataclass
 class MaskOracle(MemoryOracle):
-    """A MemoryOracle that also picks the mask by the oracle: among SAM 2's proposals it keeps the one with the
-    highest true box IoU vs the GT box (an upper bound on per-frame mask selection), instead of SAM 2's own IoU
-    token. The memory-commit gate (true box IoU > `iou_threshold`, visible frames only) is identical to the
-    MemoryOracle -- only mask selection differs. All behaviour lives in MemoryOracle; this just flips the default."""
+    """MemoryOracle with oracle mask SELECTION: on visible frames it keeps the proposal whose bounding box has the
+    highest true BOX IoU vs the GT box (an upper bound on per-frame selection), instead of SAM 2's IoU token. On
+    occluded frames it falls back to the baseline selection. The GT-verified commit gate is inherited unchanged."""
 
-    oracle_mask_selection: bool = True
+    def select_index(self, mask_preds, iou_scores, bboxes_norm, visible):
+        if not visible:
+            return super().select_index(mask_preds, iou_scores, bboxes_norm, visible)
+        candidates = (mask_preds[0, 1:] > 0.0).cpu().numpy()
+        ious = compute_iou(np.repeat(bboxes_norm[None, :], candidates.shape[0], axis=0), candidates)
+        return 1 + int(np.argmax(ious))

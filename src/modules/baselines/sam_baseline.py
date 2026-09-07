@@ -34,9 +34,9 @@ class SAMBaseline:
         """Predict the masks of the target object with the baseline SAM 2."""
 
         # Reset and initialize the memory bank with the new target (the anchor, same as the oracle --
-        # after warmup slicing the anchor is at index 1, so use initialize_references' default).
+        # the clip now starts AT the anchor, so it is at index 0).
         self.main_memory.reset_memory()
-        self.main_memory.initialize_references(self.model, detection_data)
+        self.main_memory.initialize_references(self.model, detection_data, anchor_index=0)
 
         n_frames = detection_data.frames.shape[0]
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)
@@ -52,13 +52,12 @@ class SAMBaseline:
         cache = getattr(self, "frame_cache", None)
 
         for idx, current_frame in enumerate(detection_data.frames):
-            reuse = [e.to(self.device) for e in cache[idx]] \
-                if cache is not None and idx in cache else None
-            (chosen_mask, pointer, encoding, object_scores, iou_scores,
-             _, _, image_features) = self.model.select_best_mask(
+            reuse = [e.to(self.device) for e in cache[idx]] if cache is not None and idx in cache else None
+            (chosen_mask, pointer, encoding, object_scores, iou_scores, _, _, image_features) = self.model.select_best_mask(
                 main_memory = self.main_memory,
                 current_frame = current_frame,
                 encoded_image_features_list = reuse)
+
             if cache is not None and idx not in cache:
                 cache[idx] = [e.detach().cpu() for e in image_features]
 
@@ -66,8 +65,8 @@ class SAMBaseline:
             if self.should_commit(object_scores, iou_scores, chosen_mask, current_frame):
                 self.main_memory.update_memory(pointer, encoding)
                 self.update_memory[idx] = 1
+                
             self.predicted_masks[idx] = chosen_mask
-
             self.object_scores[idx] = object_scores
             self.iou_scores[idx] = iou_scores
             self.object_pointers[idx] = pointer.squeeze().to(torch.float32).cpu()

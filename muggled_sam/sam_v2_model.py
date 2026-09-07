@@ -361,7 +361,6 @@ class SAMV2Model(nn.Module):
                 main_memory = main_memory,
                 encoded_image_features_list = encoded_image_features_list)
 
-
             best_idx = 1 + torch.argmax(iou_scores[:, 1:], dim=-1)
             chosen_mask = mask_preds[:, best_idx, :, :]
             
@@ -390,6 +389,8 @@ class SAMV2Model(nn.Module):
             if encoded_image_features_list is None:
                 encoded_image_features_list, _, _ = self.encode_image(bgr_current_frame)
             lowres_imgenc, *_ = encoded_image_features_list
+
+    
             mask_preds, iou_scores, object_pointers, object_score, _, _ = self.step_video_masking(
                 main_memory=main_memory, encoded_image_features_list=encoded_image_features_list)
         return mask_preds, iou_scores, object_pointers, object_score, lowres_imgenc, encoded_image_features_list
