@@ -15,7 +15,13 @@ class SAMBaseline:
     model: SamaraHieraModel | None = None
     iou_threshold: float | None = None
     main_memory: MainMemory | None = None
-    label_mask_iou: bool = True  
+    label_mask_iou: bool = True
+
+    # Memory-bank corruption (claim_2): identical injection to the oracles -- at each commit, with probability
+    # `corruption_p`, a CLEAN nearby distractor is written into the bank instead of the target.
+    corruption_p: float = 0.0
+    corruption_boxes: list | None = None
+    corruption_seed: int = 0
 
     def __post_init__(self):
         """Load and initialize the SAM 2 model with quantization."""
@@ -23,6 +29,21 @@ class SAMBaseline:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         self.model = self.model.to(device=self.device, dtype=self.dtype)
+
+    def commit_corruption(self, idx, image_features, rng):
+        """With probability `corruption_p`, box-prompt the nearest distractor and push THAT into the memory bank.
+        Runs on EVERY frame, independent of `should_commit` -- same injection the oracles use, so all arms face
+        identical corruption events."""
+
+        if self.corruption_p <= 0.0 or self.corruption_boxes is None:
+            return False
+        box = self.corruption_boxes[idx] if idx < len(self.corruption_boxes) else None
+        if box is None or float(rng.random()) >= self.corruption_p:
+            return False
+        _, encoding, pointer = self.model.initialize_video_masking(
+            image_features, convert_bbox(np.asarray(box, dtype=np.float32)))
+        self.main_memory.update_memory(pointer, encoding)
+        return True
 
     def should_commit(self, object_scores, iou_scores, chosen_mask, frame):
         """Whether to write this frame into the memory bank. Baseline gate = SAM's own confidence.
@@ -44,9 +65,11 @@ class SAMBaseline:
         # Storage for the predicted IoU and occlusion scores
         self.object_scores = torch.zeros(n_frames, dtype=torch.float64)
         self.iou_scores = torch.zeros(n_frames, dtype=torch.float64)
-        self.mask_iou_scores = torch.zeros(n_frames, dtype=torch.float64)   # pseudo-GT mask IoU = label
         self.update_memory = torch.zeros(n_frames, dtype=torch.int)
         self.object_pointers = torch.zeros((n_frames, 256), dtype=torch.float64)
+
+        self.corrupted_frames = []                                        # frames where a distractor was committed
+        corruption_rng = np.random.default_rng(self.corruption_seed)
 
         # Optional per-frame image-embedding cache (target-independent), shared across rollouts over the same frames.
         cache = getattr(self, "frame_cache", None)
@@ -65,21 +88,17 @@ class SAMBaseline:
             if self.should_commit(object_scores, iou_scores, chosen_mask, current_frame):
                 self.main_memory.update_memory(pointer, encoding)
                 self.update_memory[idx] = 1
-                
+
+            # Corruption is independent of the gate above: it fires on EVERY frame, occluded or visible, so all
+            # arms face the same injected errors regardless of where each one chooses to commit.
+            if self.commit_corruption(idx, image_features, corruption_rng):
+                self.corrupted_frames.append(idx)
+
+
             self.predicted_masks[idx] = chosen_mask
             self.object_scores[idx] = object_scores
             self.iou_scores[idx] = iou_scores
             self.object_pointers[idx] = pointer.squeeze().to(torch.float32).cpu()
-
-            # Label the frame with pseudo-GT mask IoU, reusing the encoding just computed for tracking.
-            gt = detection_data.bboxes_norm[idx]
-            if self.label_mask_iou and detection_data.occlusions[idx] <= 0.5 and float(gt[2]) != 0.0:
-                mask, _, _ = self.model.initialize_video_masking(
-                    image_features, convert_bbox(np.asarray(gt, dtype=np.float32)))
-                target = (mask.squeeze() > 0.0).cpu().numpy()
-                predicted = chosen_mask.numpy() > 0
-                union = (predicted | target).sum()
-                self.mask_iou_scores[idx] = float((predicted & target).sum() / union) if union > 0 else 0.0
 
         return self.predicted_masks
     

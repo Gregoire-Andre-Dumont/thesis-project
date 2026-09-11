@@ -18,28 +18,59 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from robust_scoring import load_window
+from create_anchor_dataset import anchor_trajectory_index
 from src.utils.compute_iou import compute_iou
 
 SUCCESS_IOU = 0.5                                                   # a frame is covered when box IoU >= this
 SAM_CONFIG = "conf/trackers/baselines/sam_baseline.yaml"
 
 
-def test_trajectories(person_path, n_traj, random_seed=42):
-    """Draw `n_traj` trajectories as a single seeded held-out test set, returned in shuffled order.
-    Taking one random subset (never back-filling from the train split) and not grouping by video
-    means no video is over-represented -- the sample is representative of the selection pool."""
+BASE_DRAW = 400          # size of the original sample; growing n_traj EXTENDS it rather than redrawing
 
-    triples = [(v, int(p), int(a), float(o), float(r)) for v, p, a, o, r in zip(
+
+def test_trajectories(person_path, n_traj, random_seed=42, base=BASE_DRAW):
+    """Draw `n_traj` trajectories as a seeded held-out test set, returned in shuffled order.
+    Taking one random subset (never back-filling from the train split) and not grouping by video
+    means no video is over-represented -- the sample is representative of the selection pool.
+
+    The draw is NESTED in `n_traj`: the first `base` are exactly the original train_test_split sample,
+    and larger `n_traj` appends a deterministic, disjoint remainder. sklearn's train_test_split gives an
+    unrelated draw for every `test_size`, so without this an extended run would union two different
+    samples -- keeping already-computed clips that are no longer in the draw and overshooting the target."""
+
+    triples = [(v, int(p), int(a), float(o)) for v, p, a, o in zip(
         person_path.selected_video_names.tolist(),
         person_path.selected_person_ids.tolist(),
         person_path.selected_anchor_video_frames.tolist(),
-        person_path.selected_anchor_overlaps.tolist(),
-        person_path.selected_anchor_visible_ratios.tolist())]
+        person_path.selected_anchor_overlaps.tolist())]
 
     n_test = min(n_traj, len(triples))
-    _, test_indices = train_test_split(np.arange(len(triples)), test_size=n_test, random_state=random_seed, shuffle=True)
-    return [triples[i] for i in test_indices]
+    _, first = train_test_split(np.arange(len(triples)), test_size=min(base, len(triples)),
+                                random_state=random_seed, shuffle=True)
+    if n_test <= len(first):
+        return [triples[i] for i in first[:n_test]]
+
+    remaining = np.setdiff1d(np.arange(len(triples)), first)
+    np.random.default_rng(random_seed).shuffle(remaining)
+    return [triples[i] for i in np.concatenate([first, remaining[:n_test - len(first)]])]
+
+
+def load_window(detection_data, trajectory, max_frames):
+    """Load only the frames the tracker needs -- `max_frames` starting AT the anchor -- into `detection_data`.
+    Returns (warmup, anchor_index), or None if the anchor is missing. warmup is 0: the clip begins at the
+    anchor (the memory reference, at clip index 0), so nothing before the anchor is tracked or scored."""
+
+    video, person, anchor_frame = trajectory
+    detection_data.load_frames = False
+    detection_data.initialize_target(video, person)
+    anchor_index = anchor_trajectory_index(detection_data, anchor_frame)
+    if anchor_index is None:
+        return None
+    warmup = 0
+    window = detection_data.frame_indices[anchor_index:anchor_index + max_frames]
+    detection_data.load_frames = True
+    detection_data.initialize_target(video, person, frame_indices=window)
+    return warmup, anchor_index
 
 
 # ---------------------------------------------------------------------------------------
@@ -52,8 +83,11 @@ def first_occlusion_frame(occlusions):
 
 
 def visible_frames(occlusions, boxes, start):
-    """Frames at or after `start` where the target is visible"""
-    return [f for f in range(start, len(occlusions)) if occlusions[f] < 0.5]
+    """Frames at or after `start` that are SCORABLE: the target is not occluded and has a real annotated box.
+
+    Requiring a box is what excludes unannotated gaps -- frames absent from the visible file but never labelled
+    `fully_occluded`. Their GT box is empty, so scoring them would measure the tracker against nothing."""
+    return [f for f in range(start, len(occlusions)) if occlusions[f] < 0.5 and boxes[f][2] > 0]
 
 def frame_ious(predicted, occlusions, boxes, first_occlusion):
     """Box IoU (predicted mask vs GT box) on each visible post-first-occlusion frame; empty if none.
@@ -112,7 +146,7 @@ def run(config: DictConfig):
         return out
 
     for trajectory in test_trajectories(person_path, config.n_traj):
-        video, person, _, overlap, visible_ratio = trajectory
+        video, person, _, overlap = trajectory
         if (video, person) in processed:
             continue
 
@@ -135,7 +169,6 @@ def run(config: DictConfig):
         record = {
             "video": video, "person": person,
             "distractor_overlap": float(overlap),
-            "anchor_visible_ratio": float(visible_ratio),
             "n_frames": int(len(occlusions)),
             "first_occlusion": int(first_occlusion),
             "occ_count": int((occlusions >= 0.5).sum()),

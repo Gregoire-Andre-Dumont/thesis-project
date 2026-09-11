@@ -10,7 +10,7 @@ tracker:
   main_memory: 
     _target_: src.modules.memories.main_memory.MainMemory
     max_memory_history: 6
-    max_pointer_history: 15
+    max_pointer_history: 6
 
 experiment:
   _target_: src.experiments.tracking_experiment.TrackingExperiment

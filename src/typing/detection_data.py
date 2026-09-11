@@ -32,6 +32,7 @@ class DetectionData:
     frames: NDArray[np.float32] | None = None
     bboxes_norm: NDArray[np.float32] | None = None
     frame_indices: NDArray[np.int64] | None = None
+    annotated: NDArray[np.bool_] | None = None        # False = unannotated gap: state unknown, never scored
 
     def __post_init__(self):
         """Convert the different directories to pathlib."""
@@ -70,9 +71,13 @@ class DetectionData:
             self.occlusions = self.occlusions[positions]
             self.bboxes_norm = self.bboxes_norm[positions]
 
-        # Treat every box-less frame (fully occluded or unannotated) as occluded.
-        self.bboxes_norm[self.occlusions > 0.05] = [0, 0, 0, 0]
-        self.occlusions = (self.bboxes_norm[:, 2] <= 0).astype(np.float32)
+        # Three states, not two. A frame is OCCLUDED only when the dataset says so (`fully_occluded`);
+        # a frame with a visible box is VISIBLE; a frame that is neither -- absent from the visible file but
+        # never labelled occluded -- is UNANNOTATED: we do not know where the target is, so it must not be
+        # scored and must not be counted as an occlusion. ~22% of box-less frames are these annotation gaps.
+        self.occlusions = (self.occlusions > 0.5).astype(np.float32)
+        self.bboxes_norm[self.occlusions > 0.5] = [0, 0, 0, 0]      # occluded => the target is genuinely absent
+        self.annotated = (self.bboxes_norm[:, 2] > 0) | (self.occlusions > 0.5)
 
         video_read = VideoReader(self.video_path, ctx=cpu(0), num_threads=self.num_threads)
         if self.load_frames:

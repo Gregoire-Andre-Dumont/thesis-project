@@ -16,7 +16,6 @@ person_path:
   n_experiments: 1200
   n_after_occlusion: 50
   random_seed: 44
-  min_visible_ratio: 0.7
   resize_resolution: 1024
   min_visible_area: 500
   max_visible_area: null

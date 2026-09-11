@@ -52,6 +52,17 @@ class SamaraHieraModel(SAMV2Model):
             self._feature_token_fn = load_dataset_encoders([feature_encoder], device, dtype)[feature_encoder]
         self.eval()
 
+    def commit_mask(self, mask_logits, pointer, object_score, lowres_imgenc):
+        """`commit_candidate` for an EDITED mask: same memory-encoder path, but the mask is handed over
+        directly instead of being sliced out of the proposal stack by index. Used to commit a
+        connected-component subset of a proposal; the pointer still comes from that parent proposal."""
+
+        with torch.inference_mode():
+            chosen_mask = mask_logits[None, None]                  # (H, W) -> (B, 1, H, W) the encoder expects
+            chosen_encoding = self.memory_encoder(
+                mask_prediction=chosen_mask, object_score=object_score, lowres_image_encoding=lowres_imgenc)
+        return chosen_mask.squeeze().to(torch.float64).cpu(), pointer, chosen_encoding
+
     # -------------------------------------------------------------------------------
     # Calibrator-driven mask scoring
     # -------------------------------------------------------------------------------
