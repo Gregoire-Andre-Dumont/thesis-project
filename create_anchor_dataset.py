@@ -82,7 +82,8 @@ def rollout_features(tracker, label_model, token_fn, detection_data, clean_boxes
     predicted_masks = tracker.predict_masks(detection_data).numpy()
     box_iou = compute_iou(detection_data.bboxes_norm, predicted_masks)
     box_iou[detection_data.occlusions > 0.5] = 0.0
-    predicted_iou = tracker.iou_scores.numpy()
+    predicted_iou = tracker.iou_scores.numpy()          # chosen proposal's IoU token
+    object_score = tracker.object_scores.numpy()        # raw pre-sigmoid presence logit
 
     keep = slice(warmup, None)
     predicted_masks = predicted_masks[keep]
@@ -92,10 +93,17 @@ def rollout_features(tracker, label_model, token_fn, detection_data, clean_boxes
     frame_indices = detection_data.frame_indices[keep]
     box_iou = box_iou[keep]
     predicted_iou = predicted_iou[keep]
+    object_score = object_score[keep]
 
     # Labels: proposal-mask pseudo-IoU vs the target and its 3 nearest clean distractors (box-prompted).
+    cache = getattr(tracker, "frame_cache", None)
+    precomputed = None
+    if cache is not None and all(t + warmup in cache for t in range(len(frames))):
+        precomputed = {t: cache[t + warmup] for t in range(len(frames))}
+
     target_iou, distractor_iou = pseudo_iou_labels(
-        label_model, frames, predicted_masks, bboxes, clean_boxes, frame_indices, occlusions)
+        label_model, frames, predicted_masks, bboxes, clean_boxes, frame_indices, occlusions,
+        precomputed_features=precomputed)
 
     # Features: crop once around each proposal (floored at the anchor box size, matching deployment), then
     size_floor = anchor_size_pixels(bboxes[0], frames[0].shape)
@@ -109,7 +117,8 @@ def rollout_features(tracker, label_model, token_fn, detection_data, clean_boxes
         "distractor_iou": distractor_iou.astype(np.float32),   # (n, 3) nearest-distractor pseudo IoU
         "box_iou":       box_iou.astype(np.float32),
         "occlusions":    occlusions.astype(np.float32),
-        "predicted_iou": predicted_iou.astype(np.float32),
+        "predicted_iou": predicted_iou.astype(np.float32),     # SAM's IoU token for the CHOSEN proposal
+        "object_score":  object_score.astype(np.float32),      # SAM's raw presence logit (signed)
         "true_bboxes":   bboxes.astype(np.float32),
     }
     return metadata, features

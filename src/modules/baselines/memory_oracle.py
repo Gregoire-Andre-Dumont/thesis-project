@@ -109,7 +109,10 @@ class MemoryOracle:
 
         n_frames = detection_data.frames.shape[0]
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)
-        self.iou_scores = torch.zeros(n_frames, dtype=torch.float64)      # SAM 2's own predicted IoU (diagnostic)
+        # SAM 2's own two per-frame confidences, for the CHOSEN proposal -- diagnostic here, but they are the
+        # signals any learned gate has to beat, so they are recorded alongside it rather than recomputed.
+        self.iou_scores = torch.zeros(n_frames, dtype=torch.float64)      # predicted IoU of the chosen mask
+        self.object_scores = torch.zeros(n_frames, dtype=torch.float64)   # raw pre-sigmoid "object present" logit
         self.commit_iou = torch.zeros(n_frames, dtype=torch.float64)      # chosen mask vs ground truth (visible frames)
 
         self.committed_frames = []
@@ -135,7 +138,12 @@ class MemoryOracle:
                 mask_preds, best_idx, object_pointers, object_score, lowres_imgenc)
 
             self.predicted_masks[idx] = self.reported_mask(mask_preds, best_idx, chosen_mask)
-            self.iou_scores[idx] = float(iou_scores.max())
+
+            # The CHOSEN proposal's score, not the best available one: the features and labels describe the
+            # mask that was selected and committed, so its own confidence is what they must line up with.
+            # These differ whenever selection disagrees with SAM's ranking -- always, for the mask oracle.
+            self.iou_scores[idx] = float(iou_scores.reshape(-1)[best_idx])
+            self.object_scores[idx] = float(torch.as_tensor(object_score).reshape(-1)[0])
 
             # Commit gate: the chosen mask's IoU vs ground truth, on visible frames only.
             if bool(detection_data.occlusions[idx] <= 0.5) and float(bboxes_norm[2]) > 0:
