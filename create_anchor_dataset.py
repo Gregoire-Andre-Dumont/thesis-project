@@ -2,6 +2,7 @@ import logging
 import os
 import pickle
 import warnings
+import zlib
 from collections import defaultdict
 from pathlib import Path
 
@@ -13,16 +14,17 @@ from tqdm import tqdm
 from src.experiments.dataset_experiment import DatasetExperiment
 from src.utils.compute_iou import compute_iou
 from src.offline_training.dataset_encoders import (
-    load_dataset_encoders, crop_around_masks, encode_trajectory, anchor_size_pixels)
+    load_dataset_encoders, crop_around_masks, anchor_size_pixels,
+    encode_tokens, anchor_foreground, similarity_feature_map)
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame, pseudo_iou_labels
+from src.utils.corruption import nearest_distractor_boxes
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["HYDRA_FULL_ERROR"] = "1"
 
-# The four LARGE (~212-304M) backbones the calibrator dataset is built for (one token set each, no variants).
-ENCODER_NAMES = ("perception", "dino", "hiera_sam", "hiera_mae")
+ENCODER_NAME = "perception"
 
 
 def shard_by_video(person_path, shard_index, num_shards):
@@ -60,29 +62,22 @@ def slice_detection_data_for_tracker(detection_data, anchor_index):
     return warmup_count
 
 
-def encoder_path(dataset_path, encoder_name, stem):
-    """Output file path for one encoder's features of a trajectory: <dataset_path>/<encoder>/<stem>.pkl."""
+def trajectory_path(dataset_path, corruption_p, stem):
+    """Output file for one trajectory at one corruption probability:
+    <dataset_path>/p<probability>/<stem>.pkl. Its existence is what makes the run resumable.
 
-    return Path(dataset_path) / encoder_name / f"{stem}.pkl"
+    One folder per probability rather than one file per trajectory: the corruption changes the tracking
+    rollout itself, so every probability produces different proposal masks, different features and
+    different labels. They are separate datasets, not separate columns of one."""
+
+    return Path(dataset_path) / f"p{float(corruption_p):.2f}" / f"{stem}.pkl"
 
 
-def trajectory_is_complete(dataset_path, stem):
-    """True when every encoder file for this trajectory already exists (skip on resume)."""
+def rollout_features(tracker, label_model, token_fn, detection_data, clean_boxes, warmup, config):
+    """One tracking pass at the tracker's current corruption setting -> (metadata, features).
 
-    return all(encoder_path(dataset_path, name, stem).exists() for name in ENCODER_NAMES)
-
-
-def process_trajectory(tracker, label_model, encoders, detection_data, video_name,
-                       person_id, anchor_video_frame, visible_directory, config):
-    """Track the trajectory once, then per frame build the four encoders' anchor-similarity maps and
-    the target + 3-nearest-distractor pseudo-IoU labels. Returns (metadata, features_by_encoder) or
-    None when the anchor is missing."""
-
-    detection_data.initialize_target(video_name, person_id)
-    anchor_index = anchor_trajectory_index(detection_data, anchor_video_frame)
-    if anchor_index is None:
-        return None
-    warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
+    Everything downstream of the rollout depends on the proposal masks it produced, so labels and features
+    are both recomputed per pass -- that is the whole point of sweeping the corruption probability."""
 
     predicted_masks = tracker.predict_masks(detection_data).numpy()
     box_iou = compute_iou(detection_data.bboxes_norm, predicted_masks)
@@ -99,16 +94,14 @@ def process_trajectory(tracker, label_model, encoders, detection_data, video_nam
     predicted_iou = predicted_iou[keep]
 
     # Labels: proposal-mask pseudo-IoU vs the target and its 3 nearest clean distractors (box-prompted).
-    clean_boxes = load_clean_boxes_by_frame(Path(visible_directory) / f"{video_name}.json", person_id)
     target_iou, distractor_iou = pseudo_iou_labels(
         label_model, frames, predicted_masks, bboxes, clean_boxes, frame_indices, occlusions)
 
-    # Features: crop once around each proposal (floored at the anchor box size, matching deployment),
-    # then re-encode with every backbone at the shared 32x32 grid. frames[0]/bboxes[0] are the anchor.
+    # Features: crop once around each proposal (floored at the anchor box size, matching deployment), then
     size_floor = anchor_size_pixels(bboxes[0], frames[0].shape)
-    crop_frames, crop_masks = crop_around_masks(
-        frames, predicted_masks, config.crop_resize, config.pad_ratio, size_floor)
-    features_by_encoder = encode_trajectory(encoders, crop_frames, crop_masks)
+    crop_frames, crop_masks = crop_around_masks(frames, predicted_masks, config.crop_resize, config.pad_ratio, size_floor)
+    tokens = encode_tokens(token_fn, crop_frames)
+    features = similarity_feature_map(tokens, crop_masks, anchor_foreground(tokens, crop_masks))
 
     metadata = {
         "frame_indices": frame_indices.astype(np.int64),
@@ -119,31 +112,62 @@ def process_trajectory(tracker, label_model, encoders, detection_data, video_nam
         "predicted_iou": predicted_iou.astype(np.float32),
         "true_bboxes":   bboxes.astype(np.float32),
     }
-    return metadata, features_by_encoder
+    return metadata, features
 
 
-def save_encoder_features(dataset_path, stem, video_name, person_id, metadata, features_by_encoder):
-    """Write one DatasetExperiment per encoder; existing files are left untouched."""
+def process_trajectory(tracker, label_model, token_fn, detection_data, video_name, person_id,
+                       anchor_video_frame, visible_directory, config, probabilities):
+    """Roll the trajectory out once per corruption probability. Returns {probability: (metadata, features)},
+    or None when the anchor is missing or the clip has no distractor to inject.
 
-    for encoder_name, features in features_by_encoder.items():
-        output_path = encoder_path(dataset_path, encoder_name, stem)
-        if output_path.exists():
-            continue
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        dataset = DatasetExperiment(video_name=video_name, person_id=person_id, features=features, **metadata)
-        output_path.write_bytes(pickle.dumps(dataset))
+    The frame cache is shared across the sweep, so SAM's image embeddings are computed once for the clip
+    however many probabilities are swept -- only the memory bank and what follows from it differ. The
+    corruption seed is derived from the clip id so the injected identities are identical across launches
+    and across probabilities, which makes the sweep a nested series rather than independent draws."""
+
+    detection_data.initialize_target(video_name, person_id)
+    anchor_index = anchor_trajectory_index(detection_data, anchor_video_frame)
+    if anchor_index is None:
+        return None
+    warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
+
+    clean_boxes = load_clean_boxes_by_frame(Path(visible_directory) / f"{video_name}.json", person_id)
+    corruption_boxes = nearest_distractor_boxes(detection_data, clean_boxes)
+    if not any(box is not None for box in corruption_boxes):
+        return None                                    # no distractor anywhere: nothing to corrupt
+
+    tracker.frame_cache = {}
+    tracker.corruption_boxes = corruption_boxes
+    tracker.corruption_seed = zlib.crc32(f"{video_name}:{person_id}".encode())
+    try:
+        by_probability = {}
+        for probability in probabilities:
+            tracker.corruption_p = float(probability)
+            by_probability[probability] = rollout_features(
+                tracker, label_model, token_fn, detection_data, clean_boxes, warmup, config)
+        return by_probability
+    finally:
+        tracker.frame_cache = None
+        tracker.corruption_boxes = None
+        tracker.corruption_p = 0.0
 
 
 @hydra.main(config_path="conf", config_name="create_anchor_dataset", version_base=None)
 def create_anchor_dataset(config: DictConfig):
-    """Build one calibrator dataset per backbone from a single tracking pass (oracle or baseline).
-    Each encoder re-encodes the shared proposal masks at the fixed 32x32 grid; labels are the target
-    and 3-nearest-distractor pseudo-IoU, box-prompted with the tracker's SAM model."""
+    """Build one calibrator dataset per memory-corruption probability, from the mask oracle.
+
+    The mask oracle picks the best available proposal every frame, so without corruption its memory bank is
+    close to clean -- which is exactly the regime where a calibrator sees no negatives to learn from.
+    Sweeping `corruption_probabilities` injects a controlled rate of clean nearby distractors into the bank
+    (identity errors, not quality errors), giving one dataset per rate. Every proposal mask is cropped and
+    encoded to its anchor-similarity map; labels are the target and 3-nearest-distractor pseudo-IoU,
+    box-prompted with the tracker's SAM model."""
 
     detection_data = hydra.utils.instantiate(config.detection_data)
     person_path = hydra.utils.instantiate(config.person_path)
     tracker = hydra.utils.instantiate(config.tracker.tracker)
-    encoders = load_dataset_encoders()
+    token_fn = load_dataset_encoders([ENCODER_NAME])[ENCODER_NAME]
+    probabilities = [float(p) for p in config.corruption_probabilities]
 
     dataset_path = config.dataset_path
     visible_directory = config.detection_data.visible_directory
@@ -151,13 +175,22 @@ def create_anchor_dataset(config: DictConfig):
 
     for video_name, person_id, anchor_video_frame in tqdm(pairs, desc=f"shard {config.shard_index}"):
         stem = f"{video_name}_{person_id}"
-        if trajectory_is_complete(dataset_path, stem):
+        missing = [p for p in probabilities if not trajectory_path(dataset_path, p, stem).exists()]
+        if not missing:
             continue
-        result = process_trajectory(tracker, tracker.model, encoders, detection_data,
-                                    video_name, person_id, anchor_video_frame, visible_directory, config)
-        if result is not None:
-            metadata, features_by_encoder = result
-            save_encoder_features(dataset_path, stem, video_name, person_id, metadata, features_by_encoder)
+
+        # Swept together even when only some probabilities are missing: the rollouts share one frame cache,
+        results = process_trajectory(tracker, tracker.model, token_fn, detection_data, video_name,
+                    person_id, anchor_video_frame, visible_directory, config, missing)
+        
+        if results is None:
+            continue
+
+        for probability, (metadata, features) in results.items():
+            output_path = trajectory_path(dataset_path, probability, stem)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            dataset = DatasetExperiment(video_name=video_name, person_id=person_id, features=features, **metadata)
+            output_path.write_bytes(pickle.dumps(dataset))
 
 
 if __name__ == "__main__":

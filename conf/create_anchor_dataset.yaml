@@ -1,5 +1,5 @@
 defaults:
-  - trackers@tracker: baselines/memory_oracle
+  - trackers@tracker: baselines/mask_oracle
 
 detection_data:
   _target_: src.typing.detection_data.DetectionData
@@ -12,25 +12,23 @@ detection_data:
 person_path:
   _target_: src.typing.person_path.PersonPath
   main_directory: data/person_path
-  occlusion_ranges: [2, 150]
   n_experiments: 1200
-  n_after_occlusion: 50
   random_seed: 44
-  resize_resolution: 1024
-  min_visible_area: 500
-  max_distractor_overlap: 0.30
-  min_distractor_overlap: 0.00
-  non_targets:
-    - "crowd"
-    - "person_in_vehicle"
-    - "reflection"
-    - "person_in_background"
-    - "severly_occluded_person"
+  first_occ_min: 4
+  border_inset: 8  
+  n_after_occlusion: 30 
+  min_visible_area: 1024
+  min_visible_ratio: 0.90
+  occlusion_ranges: [5, 75] 
+  max_distractor_overlap: 0.40 
+  non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person, sitting_person, person_on_open_vehicle]
 
-dataset_path: data/memory_oracle
+
+dataset_path: data/mask_oracle
 shard_index: 0
 num_shards: 1
+corruption_probabilities: [0.0, 0.05, 0.1, 0.15, 0.2]
 
-crop_resize: 512
+crop_resize: 448
 pad_ratio: 0.25
 random_seed: 42
