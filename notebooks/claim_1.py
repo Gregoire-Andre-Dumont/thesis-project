@@ -99,6 +99,39 @@ def frame_ious(predicted, occlusions, boxes, first_occlusion):
     return compute_iou(boxes[frames], predicted[frames]).astype(np.float32)
 
 
+def frame_record(predicted, occlusions, boxes, first_occlusion):
+    """Per-frame IoU from the first occlusion onward, keeping OCCLUDED frames in place rather than dropping
+    them, so a metric can score what an arm does while the target is hidden.
+
+    `compute_iou` builds the GT rectangle from the box, so a frame with no box would score a meaningless 0
+    against whatever was predicted; those entries are NaN and each metric decides what to do with them."""
+
+    span = slice(first_occlusion, len(occlusions))
+    masks = predicted[span]
+    has_box = np.asarray(boxes[span][:, 2] > 0)
+
+    ious = np.full(len(masks), np.nan, dtype=np.float32)
+    if has_box.any():
+        ious[has_box] = compute_iou(boxes[span][has_box], masks[has_box])
+    return ious
+
+
+def commit_flags(tracker, n_frames):
+    """Per-frame memory-commit decisions, however the arm records them: the oracles keep a list of committed
+    frame indices, the baseline a per-frame flag array.
+
+    The oracles gate inside `if visible:`, so their flags are necessarily False on every occluded frame --
+    stored anyway, so a metric that scores commit behaviour reads it rather than assuming it."""
+
+    if hasattr(tracker, "committed_frames"):
+        flags = np.zeros(n_frames, dtype=bool)
+        committed = np.asarray(tracker.committed_frames, dtype=int)
+        if committed.size:
+            flags[committed] = True
+        return flags
+    return np.asarray(tracker.update_memory.numpy(), dtype=bool)
+
+
 def coverage(ious, threshold=SUCCESS_IOU):
     """Fraction of a clip's frame IoUs at or above `threshold`; NaN when the clip has no scorable frame."""
     return float(np.mean(np.asarray(ious) >= threshold)) if len(ious) else np.nan
@@ -132,18 +165,22 @@ def run(config: DictConfig):
     results_path = out_dir / "results.pkl"
     processed, clips = load_results(results_path)
 
-    def rollout_ious(tracker):
-        predicted = tracker.predict_masks(detection_data).numpy()[warmup:]
-        return frame_ious(predicted, occlusions, boxes, first_occlusion)
+    def rollout(tracker):
+        """Per-frame IoUs over the scored span (occluded frames kept, NaN where there is no GT box) and the
+        arm's own per-frame memory-commit decisions, sliced to the same span."""
 
-    def sweep_ious(tracker):
+        predicted = tracker.predict_masks(detection_data).numpy()
+        flags = commit_flags(tracker, predicted.shape[0])[warmup + first_occlusion:]
+        return frame_record(predicted[warmup:], occlusions, boxes, first_occlusion), flags
+
+    def sweep(tracker):
         """Roll the oracle out once per commit-gate threshold; the shared frame cache means the image
         encodings are computed once and reused across every threshold. Keyed by threshold."""
-        out = {}
+        ious, commits = {}, {}
         for thr in thresholds:
             tracker.iou_threshold = thr
-            out[thr] = rollout_ious(tracker)
-        return out
+            ious[thr], commits[thr] = rollout(tracker)
+        return ious, commits
 
     for trajectory in test_trajectories(person_path, config.n_traj):
         video, person, _, overlap = trajectory
@@ -166,6 +203,13 @@ def run(config: DictConfig):
         cache = {}
         sam.frame_cache = memory_oracle.frame_cache = mask_oracle.frame_cache = cache
 
+        sam_ious, sam_commit = rollout(sam)                        # sam's gate is its own confidence (not swept)
+        memory_ious, memory_commit = sweep(memory_oracle)          # {threshold: per-frame array}
+        mask_ious, mask_commit = sweep(mask_oracle)
+        sam.frame_cache = memory_oracle.frame_cache = mask_oracle.frame_cache = None
+
+        # The scored span starts at the first occlusion, so these line up index for index with the arrays.
+        span = slice(first_occlusion, len(occlusions))
         record = {
             "video": video, "person": person,
             "distractor_overlap": float(overlap),
@@ -173,17 +217,21 @@ def run(config: DictConfig):
             "first_occlusion": int(first_occlusion),
             "occ_count": int((occlusions >= 0.5).sum()),
             "occlusions": np.asarray(occlusions, dtype=np.float32),
-            "sam": rollout_ious(sam),                              # sam's gate is its own confidence (not swept)
-            "memory": sweep_ious(memory_oracle),                  # {threshold: per-frame IoUs}
-            "mask": sweep_ious(mask_oracle),                      # {threshold: per-frame IoUs}
+            "occluded": np.asarray(occlusions[span] >= 0.5, dtype=bool),
+            "has_box": np.asarray(boxes[span][:, 2] > 0, dtype=bool),
+            "sam": sam_ious, "sam_commit": sam_commit,
+            "memory": memory_ious, "memory_commit": memory_commit,
+            "mask": mask_ious, "mask_commit": mask_commit,
         }
-        sam.frame_cache = memory_oracle.frame_cache = mask_oracle.frame_cache = None
         clips.append(record)
+
         t0 = thresholds[0]
+        visible = record["has_box"] & ~record["occluded"]
+        held = lambda ious: float((ious[visible] >= SUCCESS_IOU).mean()) if visible.any() else float("nan")
         print(f"{len(clips):3d}  occ_frames={record['occ_count']:3d}  "
-              f"cov@0.5 (thr={t0}) sam={coverage(record['sam']):.3f} "
-              f"mem={coverage(record['memory'][t0]):.3f} "
-              f"mask={coverage(record['mask'][t0]):.3f}", flush=True)
+              f"cov@{SUCCESS_IOU:g} (thr={t0}) sam={held(sam_ious):.3f} "
+              f"mem={held(memory_ious[t0]):.3f} "
+              f"mask={held(mask_ious[t0]):.3f}", flush=True)
 
         pickle.dump({"processed": processed, "n_bins": int(config.n_bins),
                      "thresholds": thresholds, "clips": clips}, open(results_path, "wb"))

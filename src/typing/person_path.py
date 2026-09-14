@@ -16,13 +16,17 @@ def _group_entities_by_person_id(entities: list[dict]) -> dict[int, list[dict]]:
     return entities_by_person_id
 
 
-def _occlusion_flags(amodal_entities: list[dict], visible_entities: list[dict], since_frame: int = None) -> np.ndarray:
+def _occlusion_flags(amodal_entities: list[dict], visible_entities: list[dict], since_frame: int = None,
+                     gaps_as_occlusion: bool = False) -> np.ndarray:
     """Per-annotated-frame occlusion flag over the sorted amodal-union-visible frames (from `since_frame`
-    onwards), matching DetectionData: a frame is occluded ONLY when the dataset labels it `fully_occluded`.
+    onwards): a frame is occluded when the dataset labels it `fully_occluded`, and -- with
+    `gaps_as_occlusion` -- also when it simply carries no visible box.
 
-    A frame that is merely absent from the visible annotations is an unannotated gap, not an occlusion --
-    ~22% of box-less frames dataset-wide. Counting those inflated occlusion runs and made trajectory
-    selection partly a function of annotation sparsity."""
+    Those two are NOT the same thing. A frame absent from the visible annotations is an unannotated gap:
+    the target's state there is unknown, not known-hidden. ~22% of box-less frames dataset-wide are such
+    gaps, so counting them lengthens occlusion runs and makes trajectory selection partly a function of
+    annotation sparsity rather than of the tracking problem. Off by default for that reason; on when the
+    question is 'the target is not visible' regardless of why."""
 
     all_entities = (*amodal_entities, *visible_entities)
     annotated_frames = np.unique([entity["blob"]["frame_idx"] for entity in all_entities])
@@ -31,8 +35,11 @@ def _occlusion_flags(amodal_entities: list[dict], visible_entities: list[dict], 
 
     fully_occluded_frames = {entity["blob"]["frame_idx"] for entity in amodal_entities
                              if "fully_occluded" in entity["labels"]}
+    boxed_frames = {entity["blob"]["frame_idx"] for entity in visible_entities
+                    if float(entity["bb"][2]) > 0} if gaps_as_occlusion else None
 
-    is_occluded = [frame in fully_occluded_frames for frame in annotated_frames]
+    is_occluded = [frame in fully_occluded_frames or (gaps_as_occlusion and frame not in boxed_frames)
+                   for frame in annotated_frames]
     return np.array(is_occluded, dtype=np.int32)
 
 
@@ -66,23 +73,25 @@ def _nearest_index(sorted_frames: np.ndarray, target_frame: int) -> int:
     return min(candidate_indices, key=lambda index: abs(sorted_frames[index] - target_frame))
 
 
-def _anchor_video_frame(amodal_entities: list[dict], visible_entities: list[dict], boxes_by_frame: dict, person_id: int,
-                        min_area: float, max_distractor_overlap: float,
+def _anchor_video_frame(amodal_entities: list[dict], visible_entities: list[dict], boxes_by_frame: dict,
+                        person_id: int, min_area: float, max_distractor_overlap: float,
                         min_distractor_overlap: float = 0.0, max_area: float = float("inf"),
                         min_visible_ratio: float = 0.0, border_inset: float = 0.0,
                         frame_size: tuple | None = None):
     """First visible frame that makes a clean reference: not fully occluded, with a valid box, the target's
-    VISIBLE box area within [`min_area`, `max_area`] pixels, and the closest
-    other person's box covering between `min_distractor_overlap` and `max_distractor_overlap` of it. The upper
-    overlap bound keeps the box prompt unambiguous; the lower bound (default 0) can instead REQUIRE a nearby
-    distractor, to study the confident-drift regime. Every condition -- size and distractor overlap
-    -- is evaluated per frame, so the search walks forward to the first frame that satisfies them all; the
-    trajectory is skipped only if no frame qualifies. Returns (frame, closest-distractor-overlap), or `None`.
+    VISIBLE box area within [`min_area`, `max_area`] pixels, and the closest other person's box covering
+    between `min_distractor_overlap` and `max_distractor_overlap` of it. The upper overlap bound keeps the box
+    prompt unambiguous; the lower bound (default 0) can instead REQUIRE a nearby distractor, to study the
+    confident-drift regime. Every condition is evaluated per frame, so the search walks forward to the first
+    frame that satisfies them all; the trajectory is skipped only if no frame qualifies. Returns
+    (frame, closest-distractor-overlap), or `None`.
 
-    `min_visible_ratio` > 0 additionally requires visible_area / amodal_area to reach it, i.e. the anchor is at
-    most partly occluded. It is OFF by default (0.0) because it reads amodal GEOMETRY, which is unreliable --
-    7.3% of amodal boxes are smaller than the visible box they must contain, with outliers up to 194x -- so a
-    ratio gate partly filters on corrupt numbers. Set it deliberately, knowing that.
+    `min_visible_ratio` > 0 additionally requires visible_area / amodal_area -- the ratio of the two box AREAS,
+    width x height each -- to reach it, i.e. the anchor is at most partly occluded. It reads amodal GEOMETRY,
+    which is unreliable: 7.3% of amodal boxes are smaller than the visible box they must contain, with
+    outliers up to 194x, so a ratio gate partly filters on corrupt numbers. It also only ever sees occlusion
+    the dataset ANNOTATED, which is person-on-person -- a target behind a table, a railing or a pillar has
+    amodal == visible and reads as perfectly clean at any setting. Set it deliberately, knowing both.
 
     `border_inset` > 0 (pixels, needs `frame_size`) rejects frames whose box touches the image border, so the
     search walks on to the first frame holding the target WHOLE. This is the only way to catch a target sliced
@@ -131,8 +140,7 @@ def _anchor_video_frame(amodal_entities: list[dict], visible_entities: list[dict
         distractor_coverages = [_covered_fraction(visible_entity["bb"], box) for box in other_boxes]
         closest_distractor_overlap = max(distractor_coverages) if distractor_coverages else 0.0
 
-        overlap_in_range = min_distractor_overlap <= closest_distractor_overlap <= max_distractor_overlap
-        if not overlap_in_range:
+        if not (min_distractor_overlap <= closest_distractor_overlap <= max_distractor_overlap):
             continue
 
         return frame, closest_distractor_overlap
@@ -144,7 +152,7 @@ class PersonPath:
     """Selects target trajectories from the PersonPath dataset -- valid targets, occluded within
     `occlusion_ranges`, each with a clean anchor frame -- and samples `n_experiments` of them into the
     `selected_*` arrays (aligned per-trajectory: video name, person id, anchor video-frame index, and the
-    anchor's distractor overlap and visible-area ratio)."""
+    anchor's closest-distractor overlap)."""
 
     main_directory: str | None = None
     random_seed: float | None = None
@@ -158,10 +166,12 @@ class PersonPath:
     resize_resolution: int = 1024          # working resolution the min-area threshold is measured at
     min_visible_area: float = 1024         # min anchor VISIBLE box area in px² at `resize_resolution` (COCO small = 32²)
     max_visible_area: float | None = None  # max anchor VISIBLE box area in px² at `resize_resolution` (None = no cap)
-    max_distractor_overlap: float = 0.5    # max fraction of the anchor box another person may cover
+    max_distractor_overlap: float = 1.0    # max fraction of the anchor box another person may cover (1 = off)
     min_distractor_overlap: float = 0.0    # min such fraction -- require a nearby distractor at the anchor
-    min_visible_ratio: float = 0.0         # min anchor visible/amodal area ratio (0 = off; reads amodal geometry)
-    border_inset: float = 0.0              # px the anchor box must keep clear of every image border (0 = off)
+    min_visible_ratio: float = 0.0         # min anchor visible/amodal BOX-AREA ratio (0 = off; amodal geometry)
+    border_inset: float = 0.0              # px at `resize_resolution` the anchor box must keep clear of every
+                                           # image border (0 = off)
+    gaps_as_occlusion: bool = False        # count box-less UNANNOTATED frames as occluded when selecting
 
     # Chosen targets
     total_experiments: int | None = None
@@ -222,8 +232,13 @@ class PersonPath:
             longest_side = max(resolution["width"], resolution["height"])
             resize_scale = self.resize_resolution / longest_side
 
+            # Every length condition is stated at `resize_resolution` and converted to this video's native
+            # pixels here -- areas by the square of the scale, the border inset (a length) by the scale
+            # itself. Stating one of them in native pixels instead would make it mean different things on
+            # different videos, which is what a 1080p-vs-4K mix would silently do to the selection.
             min_area_pixels = self.min_visible_area / resize_scale ** 2
             max_area_pixels = self.max_visible_area / resize_scale ** 2 if self.max_visible_area else float("inf")
+            border_inset_pixels = self.border_inset / resize_scale
 
             boxes_by_frame = {}                                          # every annotated box, to spot distractors
             for entity in visible_entities:
@@ -234,21 +249,22 @@ class PersonPath:
             for person_id in target_person_ids:
                 person_amodal_entities = amodal_entities_by_id.get(person_id, [])
                 person_visible_entities = visible_entities_by_id.get(person_id, [])
-                anchor = _anchor_video_frame(person_amodal_entities, person_visible_entities, boxes_by_frame,
-                        person_id, min_area_pixels, self.max_distractor_overlap,
-                        self.min_distractor_overlap, max_area_pixels, self.min_visible_ratio,
-                        self.border_inset, (resolution["width"], resolution["height"]))
+                anchor = _anchor_video_frame(
+                    person_amodal_entities, person_visible_entities, boxes_by_frame, person_id,
+                    min_area_pixels, self.max_distractor_overlap, self.min_distractor_overlap,
+                    max_area_pixels, self.min_visible_ratio, border_inset_pixels,
+                    (resolution["width"], resolution["height"]))
 
                 if anchor is None:
                     continue
 
                 anchor_frame, distractor_overlap = anchor
-                occlusion_flags = _occlusion_flags(person_amodal_entities, person_visible_entities, anchor_frame)
+                occlusion_flags = _occlusion_flags(person_amodal_entities, person_visible_entities, anchor_frame,
+                                                   self.gaps_as_occlusion)
                 if not self._passes_occlusion(occlusion_flags):
                     continue
 
-                trajectory = (video_name, person_id, anchor_frame, distractor_overlap)
-                candidate_trajectories.append(trajectory)
+                candidate_trajectories.append((video_name, person_id, anchor_frame, distractor_overlap))
 
         random_generator = np.random.default_rng(self.random_seed)
         sample_size = min(self.n_experiments, len(candidate_trajectories))
@@ -264,5 +280,4 @@ class PersonPath:
         self.selected_video_names = np.array(video_names)
         self.selected_person_ids = np.array(person_ids)
         self.selected_anchor_video_frames = np.array(anchor_frames, dtype=np.int64)
-
         self.selected_anchor_overlaps = np.array(overlaps, dtype=np.float64)
