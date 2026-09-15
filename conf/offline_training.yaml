@@ -10,10 +10,7 @@ detection_data:
   load_frames: True
   num_threads: 32
 
-deploy_controller: True
-
-# offline_training.py: 5-fold cross-validation over trajectories. The held-out fold doubles as the
-# early-stopping set, so every trajectory is held out exactly once across the five folds.
+deploy_controller: False
 folds: 5
 commit_threshold: 0.4
 
