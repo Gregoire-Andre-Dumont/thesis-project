@@ -128,11 +128,13 @@ ENCODER_BUILDERS = {
 }
 
 
-def load_dataset_encoders(names=None, device="cuda", dtype=torch.bfloat16):
-    """{name: token_function}; each maps crops (n, H, W, 3) -> (n, 1024, dim) float tokens."""
+def load_dataset_encoders(names=None, dev="cuda", dtype=torch.bfloat16):
+    """{name: token_function}; each maps crops (n, H, W, 3) -> (n, 1024, dim) float tokens.
+
+    The device parameter is `dev` because callers pass it by keyword; renaming it breaks them."""
 
     names = list(ENCODER_BUILDERS) if names is None else names
-    return {name: ENCODER_BUILDERS[name](device, dtype) for name in names}
+    return {name: ENCODER_BUILDERS[name](dev, dtype) for name in names}
 
 
 # ---------------------------------------------------------------------------------------

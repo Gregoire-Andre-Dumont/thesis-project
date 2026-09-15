@@ -48,16 +48,27 @@ def anchor_trajectory_index(detection_data, anchor_video_frame):
     return int(positions[0]) if len(positions) else None
 
 
-def slice_detection_data_for_tracker(detection_data, anchor_index):
-    """Trim the leading frames so the anchor lands where the tracker starts reading.
-    Returns how many warmup frames were dropped, either zero or one."""
+def load_window(detection_data, video_name, person_id, anchor_video_frame, max_frames):
+    """Load only the frames the tracker needs -- `max_frames` starting AT the anchor, plus one warmup frame
+    before it. Returns the warmup count, or None when the anchor is not in the trajectory.
+
+    The annotations are read first with `load_frames` off so the window can be chosen without decoding
+    anything; only then are those frames decoded. Trimming after a full load would not help: one trajectory
+    holds its decoded frames plus the SAM encodings cached across all five corruption levels, and on a long
+    clip that alone exceeds the container's memory."""
+
+    detection_data.load_frames = False
+    detection_data.initialize_target(video_name, person_id)
+    anchor_index = anchor_trajectory_index(detection_data, anchor_video_frame)
+    if anchor_index is None:
+        return None
 
     warmup_count = 1 if anchor_index >= 1 else 0
     start = anchor_index - warmup_count
-    detection_data.frames = detection_data.frames[start:]
-    detection_data.bboxes_norm = detection_data.bboxes_norm[start:]
-    detection_data.occlusions = detection_data.occlusions[start:]
-    detection_data.frame_indices = detection_data.frame_indices[start:]
+    window = detection_data.frame_indices[start:start + warmup_count + max_frames]
+
+    detection_data.load_frames = True
+    detection_data.initialize_target(video_name, person_id, frame_indices=window)
     return warmup_count
 
 
@@ -72,7 +83,7 @@ def trajectory_path(dataset_path, corruption_p, stem):
     return Path(dataset_path) / f"p{float(corruption_p):.2f}" / f"{stem}.pkl"
 
 
-def rollout_features(tracker, label_model, token_fn, detection_data, clean_boxes, warmup, config):
+def rollout_features(tracker, label_model, token_fn, detection_data, clean_boxes, warmup, config, truth_cache=None):
     """One tracking pass at the tracker's current corruption setting -> (metadata, features).
 
     Everything downstream of the rollout depends on the proposal masks it produced, so labels and features
@@ -116,7 +127,7 @@ def rollout_features(tracker, label_model, token_fn, detection_data, clean_boxes
 
     distractor_boxes = distractor_boxes_per_frame(clean_boxes, frame_indices)
     label_arguments = (label_model, frames, proposal_masks, bboxes, distractor_boxes, occlusions)
-    target_iou, distractor_iou = pseudo_iou_labels(*label_arguments, precomputed_features=precomputed)
+    target_iou, distractor_iou = pseudo_iou_labels(*label_arguments, precomputed_features=precomputed, truth_cache=truth_cache)
 
     # Features: each proposal cropped around its OWN mask, floored at the anchor box size as at deployment.
     # The reference is the proposal the arm tracked with on frame 0 -- what the memory bank was seeded from.
@@ -149,11 +160,9 @@ def process_trajectory(tracker, label_model, token_fn, detection_data, video_nam
     corruption seed is derived from the clip id so the corrupted frames are identical across launches and
     nested across probabilities, which makes the sweep a series rather than independent draws."""
 
-    detection_data.initialize_target(video_name, person_id)
-    anchor_index = anchor_trajectory_index(detection_data, anchor_video_frame)
-    if anchor_index is None:
+    warmup = load_window(detection_data, video_name, person_id, anchor_video_frame, config.max_frames)
+    if warmup is None:
         return None
-    warmup = slice_detection_data_for_tracker(detection_data, anchor_index)
 
     # The same clean-person pool serves both roles: the corruption injects the nearest of them into the bank,
     visible_path = Path(visible_directory) / f"{video_name}.json"
@@ -166,11 +175,14 @@ def process_trajectory(tracker, label_model, token_fn, detection_data, video_nam
     tracker.frame_cache = {}
     tracker.corruption_boxes = corruption_boxes
     tracker.corruption_seed = zlib.crc32(f"{video_name}:{person_id}".encode())
+    # A box's pseudo-GT depends on the frame and the box, neither of which the corruption changes, so the
+    # sweep decodes each one once instead of once per probability.
+    truth_cache = {}
     try:
         by_probability = {}
         for probability in probabilities:
             tracker.corruption_p = float(probability)
-            rollout = rollout_features(tracker, label_model, token_fn, detection_data, clean_boxes, warmup, config)
+            rollout = rollout_features(tracker, label_model, token_fn, detection_data, clean_boxes, warmup, config, truth_cache)
             by_probability[probability] = rollout
         return by_probability
     finally:

@@ -24,9 +24,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src` and create_anchor_dataset
 
 from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, load_dataset_encoders, _normalise_crops, _patch_masks, HALF
-from src.offline_training.dataset_labels import load_clean_boxes_by_frame, _box_center as box_center
+from src.offline_training.dataset_labels import load_clean_boxes_by_frame, _box_centre as box_center
 from src.utils.load_bboxes import convert_bbox, load_bboxes
-from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
+from create_anchor_dataset import anchor_trajectory_index
 
 
 logging.getLogger("timm").setLevel(logging.ERROR)
@@ -38,6 +38,19 @@ DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)   # CLIP / OWL-ViT normalization
 CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
 
+
+
+def slice_detection_data_for_tracker(detection_data, anchor_index):
+    """Trim the leading frames so the anchor lands where the tracker starts reading.
+    Returns how many warmup frames were dropped, either zero or one."""
+
+    warmup_count = 1 if anchor_index >= 1 else 0
+    start = anchor_index - warmup_count
+    detection_data.frames = detection_data.frames[start:]
+    detection_data.bboxes_norm = detection_data.bboxes_norm[start:]
+    detection_data.occlusions = detection_data.occlusions[start:]
+    detection_data.frame_indices = detection_data.frame_indices[start:]
+    return warmup_count
 
 def test_trajectories(person_path, n_traj, test_size=0.20, random_seed=42):
     """List the selected trajectories, held-out test split first, extended with the rest up to n_traj.
@@ -54,6 +67,12 @@ def test_trajectories(person_path, n_traj, test_size=0.20, random_seed=42):
     return ordered[:n_traj]
 
 
+# The mirror re-uploaded sam3.safetensors on 2026-08-21 in Meta's raw naming; this revision is the
+# earlier HF-converted upload, whose keys match Sam3VisionModel directly. Pinned so the encoder cannot
+# change under the experiment again.
+SAM3_REVISION = "f055b060a4"
+
+
 def load_sam3_encoder(sam3_config, sam3_input):
     """Load SAM 3's frozen vision encoder as a token function.
     Built from the bundled config plus the ungated 1038lab/sam3 mirror weights."""
@@ -64,7 +83,7 @@ def load_sam3_encoder(sam3_config, sam3_input):
 
     config = json.load(open(sam3_config))
     model = Sam3VisionModel(Sam3VisionConfig(**{**config, "image_size": sam3_input}))
-    weights = load_file(hf_hub_download("1038lab/sam3", "sam3.safetensors"))
+    weights = load_file(hf_hub_download("1038lab/sam3", "sam3.safetensors", revision=SAM3_REVISION))
     prefix = "detector_model.vision_encoder."
     model.load_state_dict({k[len(prefix):]: v for k, v in weights.items() if k.startswith(prefix)})
     model = model.eval().to(DEVICE).to(DTYPE)
@@ -257,67 +276,6 @@ def auc(samples):
     return roc_auc_score(labels, scores) if 0 < labels.sum() < len(labels) else float("nan")
 
 
-def binned_auc(samples, edges, min_bin_samples):
-    """Target-vs-distractor AUC per bin of the candidate's own distance from the anchor; NaN for thin bins."""
-
-    bin_aucs = []
-    for low, high in zip(edges[:-1], edges[1:]):
-        in_bin = []
-        for sample in samples:
-            candidate_distance = sample[0]
-            if low <= candidate_distance < high:
-                in_bin.append(sample)
-        bin_aucs.append(auc(in_bin) if len(in_bin) >= min_bin_samples else np.nan)
-    return bin_aucs
-
-
-def quantile_edges(results, n_bins):
-    """Equal-count distance-bin edges from the pooled candidate distances (identical across backbones),
-    so each bin holds the same number of samples. None until there are enough samples to bin."""
-
-    samples = next(iter(results.values()), [])
-    if len(samples) < n_bins:
-        return None
-    distances = np.array([sample[0] for sample in samples])
-    edges = np.quantile(distances, np.linspace(0, 1, n_bins + 1))
-    edges[-1] += 1e-9                                    # make the top edge inclusive
-    return edges
-
-
-def plot_auc(results, group, edges, colors, min_bin_samples, n_traj, plot_path, npy_path, metric="foreground similarity"):
-    """Plot one group's backbones' AUC vs candidate distance from anchor, and save the figure and curves."""
-
-    curves = {name: binned_auc(results[name], edges, min_bin_samples) for name in group if name in results}
-
-    # Place each point at its bin's median distance (bins are equal-count, so unevenly spaced in distance).
-    reference = next((results[name] for name in group if name in results), [])
-    reference_distances = np.array([sample[0] for sample in reference])
-    centers = []
-    for low, high in zip(edges[:-1], edges[1:]):
-        in_bin = (reference_distances >= low) & (reference_distances < high)
-        if in_bin.any():
-            centers.append(np.median(reference_distances[in_bin]))
-        else:
-            centers.append((low + high) / 2)
-
-    figure, axis = plt.subplots(figsize=(8.5, 5.4))
-    for name, curve in curves.items():
-        axis.plot(centers, curve, marker="o", markersize=5, color=colors.get(name), label=name)
-    axis.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="chance (0.50)")
-
-    axis.set_xlabel("candidate distance from anchor (pixels @1024, equal-count bins)")
-    axis.set_ylabel("target-vs-distractor AUC")
-    axis.set_title(f"Re-ID via {metric}  |  {n_traj} trajectories", fontsize=10)
-    axis.set_ylim(0.45, 1.02)
-    axis.grid(alpha=0.3)
-    axis.legend(loc="lower left", fontsize=8)
-
-    figure.tight_layout()
-    figure.savefig(plot_path, dpi=120)
-    plt.close(figure)
-    np.save(npy_path, {"edges": edges, "curves": curves, "n_traj": n_traj}, allow_pickle=True)
-
-
 def load_checkpoint(path):
     """Load (results_bi, results_uni, per_traj, done) from the checkpoint, or empties when there is none.
     results_bi/uni are the bidirectional/unidirectional chamfer samples; per_traj maps trajectory key ->
@@ -338,13 +296,13 @@ def save_checkpoint(path, results_bi, results_uni, per_traj, done):
     tmp.write_bytes(pickle.dumps({"results_bi": dict(results_bi), "results_uni": dict(results_uni),
                                   "per_traj": per_traj, "done": list(done)}))
     tmp.replace(path)
-    np.save("data/pe_reid_per_traj.npy", per_traj, allow_pickle=True)
+    np.save("data/claim_3/per_trajectory_auc.npy", per_traj, allow_pickle=True)
 
 
-@hydra.main(config_path="../conf", config_name="pe_reid", version_base=None)
+@hydra.main(config_path="../conf", config_name="experiments/claim_3", version_base=None)
 def run_reid(config: DictConfig):
     """Score every backbone's foreground similarity as re-ID against distractors, on the test trajectories.
-    Resumes from a checkpoint and refreshes the two comparison figures after each trajectory."""
+    Resumable: the checkpoint is the result, and claim_3_visualize.py draws from it."""
 
     detection_data = hydra.utils.instantiate(config.detection_data)
     person_path = hydra.utils.instantiate(config.person_path)
@@ -375,16 +333,6 @@ def run_reid(config: DictConfig):
         per_traj[key] = {name: auc(samples) for name, samples in this_traj.items()}
         done.add(key)
 
-        edges = quantile_edges(results_bi, config.n_bins)
-        if edges is None:
-            continue
-        # Four figures: each group (hiera, clip) drawn in both chamfer directions (bidirectional, unidirectional).
-        for direction, results in (("bidirectional", results_bi), ("unidirectional", results_uni)):
-            for group_name, group in groups.items():
-                plot_auc(results, group, edges, colors, config.min_bin_samples, len(done),
-                         f"data/pe_reid_{group_name}_{direction}.png",
-                         f"data/pe_reid_{group_name}_{direction}.npy",
-                         metric=f"{direction} chamfer")
         if completed % config.checkpoint_every == 0:
             save_checkpoint(config.checkpoint, results_bi, results_uni, per_traj, done)
         if DEVICE == "cuda":

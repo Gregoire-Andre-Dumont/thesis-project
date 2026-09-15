@@ -145,7 +145,7 @@ def _image_features(model, frames, precomputed_features, chunk):
 
 
 @torch.inference_mode()
-def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, distractor_boxes, occlusions, k=3, chunk=4, precomputed_features=None, include_occluded=False):
+def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, distractor_boxes, occlusions, k=3, chunk=4, precomputed_features=None, include_occluded=False, truth_cache=None):
     """target_iou (n, proposals) and distractor_iou (n, proposals, k).
 
     `predicted_masks` is (n, proposals, h, w), or (n, h, w) read as a single proposal. `distractor_boxes`
@@ -155,6 +155,13 @@ def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, distractor_b
     which proposal it is measured against, so each box is prompted once per frame and intersected with all
     of them. The distractors are likewise picked once per frame, which is what makes column j the same
     person for every proposal and the labels comparable across them.
+
+    `truth_cache` extends that same reasoning across a corruption sweep. A box's pseudo-GT depends only on
+    the frame and the box, neither of which the corruption touches -- the target box is identical in every
+    rollout and the nearest distractors are usually the same people -- so a dict shared between calls turns
+    five identical decodes into one. These decodes are individually tiny and unbatched, so the pipeline
+    spends its time in launch overhead rather than on the GPU; removing most of them is the cheapest
+    speedup available, and the masks returned are bit-identical either way.
 
     `include_occluded` keeps occluded frames for distractor scoring only -- the target has no box there, but
     a distractor overlap while it is hidden is an unambiguous capture."""
@@ -166,6 +173,17 @@ def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, distractor_b
     target_iou = np.zeros((frame_count, proposal_count), np.float32)
     distractor_iou = np.zeros((frame_count, proposal_count, k), np.float32)
 
+    def ground_truth(frame, image_features, box):
+        """This box's pseudo-GT on this frame, taken from the cache once the sweep has decoded it."""
+
+        if truth_cache is None:
+            return _pseudo_ground_truth(model, image_features, box)
+
+        key = (frame, np.asarray(box, np.float32).tobytes())
+        if key not in truth_cache:
+            truth_cache[key] = _pseudo_ground_truth(model, image_features, box)
+        return truth_cache[key]
+
     for frame, image_features in enumerate(_image_features(model, frames, precomputed_features, chunk)):
         if occlusions[frame] > 0.5 and not include_occluded:
             continue
@@ -173,7 +191,7 @@ def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, distractor_b
         proposals = masks[frame] > 0
         target_box = target_boxes[frame]
         if float(target_box[2]) > 0.0:
-            target_truth = _pseudo_ground_truth(model, image_features, target_box)
+            target_truth = ground_truth(frame, image_features, target_box)
             target_iou[frame] = _mask_ious(proposals, target_truth)
 
         centre = _search_centre(proposals, target_box)
@@ -181,7 +199,7 @@ def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, distractor_b
             continue
 
         for column, box in enumerate(_nearest_boxes(distractor_boxes[frame], centre, k)):
-            distractor_truth = _pseudo_ground_truth(model, image_features, box)
+            distractor_truth = ground_truth(frame, image_features, box)
             distractor_iou[frame, :, column] = _mask_ious(proposals, distractor_truth)
 
     return target_iou, distractor_iou

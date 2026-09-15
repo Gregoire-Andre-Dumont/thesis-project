@@ -10,8 +10,10 @@ and differ only in how they cope; each arm's own commits proceed unchanged along
 image-embedding cache, the same per-frame distractor boxes, and a per-clip seed derived with crc32 (not `hash`,
 which Python salts per interpreter run), so the corruption pattern is reproducible across launches.
 
-`out_dir/results.pkl` holds one record per trajectory with the raw per-frame box IoUs of every rollout, so
-coverage at any IoU threshold and any slice is a post-hoc computation. Checkpointed per clip (resumable).
+`out_dir/results.pkl` holds one record per trajectory with per-frame box IoUs over the whole post-occlusion
+span (NaN where there is no GT box) plus each rollout's per-frame memory-commit flags, so metrics that score
+the occluded half on commit behaviour are available post-hoc alongside plain coverage. Coverage at any IoU
+threshold and any slice is likewise a post-hoc computation.
 """
 import sys
 import pickle
@@ -24,7 +26,7 @@ from omegaconf import DictConfig, OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from claim_1 import (test_trajectories, load_window, first_occlusion_frame, visible_frames,
-                     frame_ious, coverage, load_results)
+                     frame_record, commit_flags, load_results)
 from src.utils.corruption import nearest_distractor_boxes
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame
 
@@ -78,19 +80,27 @@ def run(config: DictConfig):
             tracker.corruption_boxes = corruption_boxes
             tracker.corruption_seed = seed
 
+        # The scored span starts at the first occlusion; `occluded` and `has_box` line up index for index
+        # with every arm's per-frame array, so a metric can score the occluded half on commit behaviour
+        # rather than dropping it.
+        span = slice(first_occlusion, len(occlusions))
         record = {
             "video": video, "person": person,
             "n_frames": int(len(occlusions)),
             "first_occlusion": int(first_occlusion),
             "occ_count": int((occlusions >= 0.5).sum()),
             "occlusions": np.asarray(occlusions, dtype=np.float32),
+            "occluded": np.asarray(occlusions[span] >= 0.5, dtype=bool),
+            "has_box": np.asarray(boxes[span][:, 2] > 0, dtype=bool),
             "corruptible": int(sum(box is not None for box in corruption_boxes)),
         }
         for name, tracker in arms:
             for probability in probabilities:
                 tracker.corruption_p = probability
-                predicted = tracker.predict_masks(detection_data).numpy()[warmup:]
-                record[(name, probability)] = frame_ious(predicted, occlusions, boxes, first_occlusion)
+                predicted = tracker.predict_masks(detection_data).numpy()
+                flags = commit_flags(tracker, predicted.shape[0])[warmup + first_occlusion:]
+                record[(name, probability)] = frame_record(predicted[warmup:], occlusions, boxes, first_occlusion)
+                record[(name, probability, "commit")] = flags
                 record[(name, probability, "corrupted")] = len(getattr(tracker, "corrupted_frames", []))
 
         for _, tracker in arms:
@@ -103,8 +113,10 @@ def run(config: DictConfig):
                      "commit_threshold": float(config.commit_threshold), "clips": clips},
                     open(results_path, "wb"))
         low, high = probabilities[0], probabilities[-1]
+        visible = record["has_box"] & ~record["occluded"]
+        held = lambda ious: float((ious[visible] >= 0.5).mean()) if visible.any() else float("nan")
         print(f"{len(clips):3d}  occ={record['occ_count']:3d}  " +
-              "  ".join(f"{name} {coverage(record[(name, low)]):.3f}->{coverage(record[(name, high)]):.3f}"
+              "  ".join(f"{name} {held(record[(name, low)]):.3f}->{held(record[(name, high)]):.3f}"
                         f" ({record[(name, high, 'corrupted')]:2d} bad)" for name, _ in arms), flush=True)
 
 

@@ -32,7 +32,9 @@ class MainDataset(Dataset):
     addresses a trajectory, not a file, and pulls it from every selected folder at once -- so a clip's
     near-identical copies cannot be split across a train/validation boundary.
 
-    `initialize(indices)` stacks those trajectories onto the GPU, leaving `__getitem__` a pure slice."""
+    `initialize(indices)` stacks those trajectories into CPU tensors. They stay on the host so the loader's
+    workers can prefetch batches -- a worker cannot touch a CUDA tensor, so GPU-resident storage forces
+    `num_workers: 0`. The training loop moves each batch to the device itself."""
 
     dataset_path: str | None = None
     probabilities: list[float] = field(default_factory=lambda: [0.0])
@@ -109,9 +111,8 @@ class MainDataset(Dataset):
                 features.append(per_proposal)
                 labels.append(iou_scores[keep].reshape(-1))
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._features = torch.from_numpy(np.concatenate(features, axis=0)).to(device)
-        self._labels = torch.from_numpy(np.concatenate(labels, axis=0)).to(device)
+        self._features = torch.from_numpy(np.concatenate(features, axis=0))
+        self._labels = torch.from_numpy(np.concatenate(labels, axis=0))
 
     def __len__(self):
         """Number of proposal samples: three per labelled frame, per corruption level."""
@@ -126,5 +127,5 @@ class MainDataset(Dataset):
     def __getitems__(self, indices):
         """Batched fetch for the DataLoader: one indexing op, pre-collated for `collate_fn`."""
 
-        selection = torch.as_tensor(indices, device=self._features.device)
+        selection = torch.as_tensor(indices)
         return self._features[selection], self._labels[selection]

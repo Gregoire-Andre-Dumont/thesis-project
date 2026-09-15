@@ -13,9 +13,3 @@ detection_data:
 deploy_controller: False
 folds: 5
 commit_threshold: 0.4
-
-# run_experiment.py selectors (override on CLI, e.g. experiment=5 size=tiny max_test_trajectories=20)
-experiment: 1
-size: null
-tracker_name: null
-max_test_trajectories: null

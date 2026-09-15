@@ -221,9 +221,9 @@ def train_models(config: DictConfig):
         overlap = f"{len(test_videos & seen_videos)}/{len(test_videos)} test videos also trained on"
         print(f"fold {fold + 1}/{folds}: {len(train_index)} train / {len(test_index)} held-out ({overlap})", flush=True)
 
+
         trainer = hydra.utils.instantiate(config.offline_trainers.main_trainer)
-        trainer._fold = fold
-        trainer.custom_train(x=stems, y=stems, train_indices=list(train_index), validation_indices=list(test_index))
+        trainer.custom_train(x=stems, y=stems, train_indices=list(train_index), validation_indices=list(test_index), fold=fold)
         held_out = stems[test_index]
 
         for level in levels:
@@ -237,8 +237,8 @@ def train_models(config: DictConfig):
                                 "cnn": calibrator_score, "sam": token_score}
             predictions[level].append(fold_predictions)
 
-            report = f"cnn {calibrator['agree']:.1%} (regret {calibrator['regret']:.3f}, R2 {calibrator['R2']:.3f})"
-            against = f"sam {token['agree']:.1%} (regret {token['regret']:.3f}, R2 {token['R2']:.3f})"
+            report = f"cnn {calibrator['agree']:.1%} regret {calibrator['regret']:.3f} R2 {calibrator['R2']:.3f}/{calibrator['R2 in']:.3f}"
+            against = f"sam {token['agree']:.1%} regret {token['regret']:.3f} R2 {token['R2']:.3f}/{token['R2 in']:.3f}"
             print(f"      p{level:.2f}: {report}   {against}   n={calibrator['n']}", flush=True)
 
         if config.deploy_controller:

@@ -1,6 +1,6 @@
 """Layer-wise re-ID sweep for the detector-fine-tuning pairs: clip vs owlvit vs pe_spatial vs pe_sam3.
 
-Same tracker-free setup as pe_reid_longrange (SAM box-prompt -> mask -> crop -> foreground tokens), but
+Same tracker-free setup as claim_3 (SAM box-prompt -> mask -> crop -> foreground tokens), but
 instead of the final layer we read patch tokens every LAYER_STEP transformer blocks (the last block always
 included) and score foreground chamfer at each. Only candidates farther than MIN_DISTANCE px (@1024) from the
 anchor are used -- the long-range regime. Two figures (uni- and bidirectional chamfer) plot, per model,
@@ -33,9 +33,9 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src` and create_anchor_dataset
 
-from pe_reid_longrange import (test_trajectories, box_prompt_masks, chamfer_scores, distance, to_pixel,
+from claim_3 import (test_trajectories, box_prompt_masks, chamfer_scores, distance, to_pixel,
                                clean_distractors, DEVICE, DTYPE)
-from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
+from create_anchor_dataset import anchor_trajectory_index
 from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, _normalise_crops, HALF
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame
 from src.utils.load_bboxes import load_bboxes
@@ -54,6 +54,19 @@ DIRECTIONS = {"unidirectional": 1, "bidirectional": 2}          # column of a (l
 OUTPUT_DIR = "data/pe_layer_sweep"
 CHECKPOINT_PATH = f"{OUTPUT_DIR}/checkpoint.pkl"
 
+
+
+def slice_detection_data_for_tracker(detection_data, anchor_index):
+    """Trim the leading frames so the anchor lands where the tracker starts reading.
+    Returns how many warmup frames were dropped, either zero or one."""
+
+    warmup_count = 1 if anchor_index >= 1 else 0
+    start = anchor_index - warmup_count
+    detection_data.frames = detection_data.frames[start:]
+    detection_data.bboxes_norm = detection_data.bboxes_norm[start:]
+    detection_data.occlusions = detection_data.occlusions[start:]
+    detection_data.frame_indices = detection_data.frame_indices[start:]
+    return warmup_count
 
 def sampled_layers(depth):
     """Block indices sampled every LAYER_STEP, always including the last block."""
@@ -300,7 +313,7 @@ def save_checkpoint(path, samples, done):
     tmp.replace(path)
 
 
-@hydra.main(config_path="../conf", config_name="pe_reid", version_base=None)
+@hydra.main(config_path="../conf", config_name="experiments/claim_3", version_base=None)
 def run(config: DictConfig):
     """Sweep per-layer foreground chamfer over the test trajectories and draw the uni/bi AUC-vs-layer figures."""
 

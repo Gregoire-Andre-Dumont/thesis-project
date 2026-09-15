@@ -29,8 +29,8 @@ class MainTrainer(TorchTrainer, Logger):
 
         losses = []
         self.model.train()
-        pbar = tqdm(dataloader, unit="batch",
-                    desc=f"Epoch {epoch} Train ({self.initialized_optimizer.param_groups[0]['lr']:0.8f})")
+        learning_rate = self.initialized_optimizer.param_groups[0]["lr"]
+        pbar = tqdm(dataloader, unit="batch", desc=f"Epoch {epoch} Train ({learning_rate:0.8f})")
         for batch in pbar:
             X_batch, y_batch = batch
             X_batch = batch_to_device(X_batch, self.x_tensor_type, self.device)

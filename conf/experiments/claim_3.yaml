@@ -1,5 +1,6 @@
+# @package _global_
 defaults:
-  - trackers@tracker: baselines/sam_baseline
+  - /trackers@tracker: baselines/sam_baseline
 
 detection_data:
   _target_: src.typing.detection_data.DetectionData
@@ -12,21 +13,17 @@ detection_data:
 person_path:
   _target_: src.typing.person_path.PersonPath
   main_directory: data/person_path
-  occlusion_ranges: [2, 150]
   n_experiments: 1200
-  n_after_occlusion: 50
   random_seed: 44
-  resize_resolution: 1024
-  min_visible_area: 500
-  max_visible_area: null
-  max_distractor_overlap: 0.30
-  min_distractor_overlap: 0.00
-  non_targets:
-    - "crowd"
-    - "person_in_vehicle"
-    - "reflection"
-    - "person_in_background"
-    - "severly_occluded_person"
+  first_occ_min: 8
+  border_inset: 8  
+  n_after_occlusion: 30
+  min_visible_area: 900
+  min_visible_ratio: 0.90
+  occlusion_ranges: [2, 50] 
+  max_distractor_overlap: 0.6
+  non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person, sitting_person, person_on_open_vehicle]
+
 
 # re-id parameters
 n_traj: 300
@@ -38,10 +35,9 @@ n_distractors: 3
 max_frames: 250    
 min_bin_samples: 20
 checkpoint_every: 5 
-
-         
+  
 sam3_vision_config: conf/sam3_vision_config.json
-checkpoint: data/pe_reid_6bb_checkpoint.pkl 
+checkpoint: data/claim_3/results.pkl
 clip_input: 448   
 owlvit_input: 840
 groups:

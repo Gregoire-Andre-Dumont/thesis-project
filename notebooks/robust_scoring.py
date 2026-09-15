@@ -41,7 +41,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src` and create_anchor_dataset
 
-from pe_reid_longrange import test_trajectories, box_prompt_masks, chamfer_scores, distance, to_pixel, DEVICE, DTYPE
+from claim_3 import test_trajectories, box_prompt_masks, chamfer_scores, distance, to_pixel, DEVICE, DTYPE
 from create_anchor_dataset import anchor_trajectory_index
 from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, load_dataset_encoders
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame

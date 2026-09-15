@@ -28,6 +28,7 @@ dataset_path: data/mask_oracle
 shard_index: 0
 num_shards: 1
 corruption_probabilities: [0.0, 0.05, 0.1, 0.15, 0.2]
+max_frames: 300
 
 crop_resize: 448
 pad_ratio: 0.25

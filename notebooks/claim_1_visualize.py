@@ -305,14 +305,20 @@ def draw(values, xlabel, title, filename, arms=None, ylabel=None, tick="{:.0f}")
     print(f"saved {filename}  (n={len(baseline_scores)})")
 
 
-TITLE = METRIC.capitalize()
-
-draw(occlusions, "occluded frames",
-     f"{TITLE} by occlusion length", f"data/claim_1/fig_occlusion{SUFFIX}.png")
-
-# These two covariates are not occlusion length, so the occluded frames can be scored on commit behaviour
-# without the circularity that rules it out for the figure above.
 HYGIENE_TITLE = "Coverage + memory hygiene"
+
+# Binned by occlusion length, this metric is circular and the curve has to be read with that in mind: the
+# occluded half scores higher than the visible half for every arm (1.0 by construction for the oracles,
+# ~0.81 for the baseline), so a longer-occlusion bin draws more of its score from the easier half and
+# flattens for reasons unrelated to tracking. `fig_occlusion_visible` is the same binning on visible frames
+# only, where that effect cannot arise -- read the pair together.
+draw(occlusions, "occluded frames",
+     f"{HYGIENE_TITLE} by occlusion length", f"data/claim_1/fig_occlusion{SUFFIX}.png",
+     arms=HYGIENE, ylabel=HYGIENE_YLABEL)
+
+TITLE = METRIC.capitalize()
+draw(occlusions, "occluded frames",
+     f"{TITLE} by occlusion length", f"data/claim_1/fig_occlusion_visible{SUFFIX}.png")
 
 # How far the target travels from where the bank was seeded -- the still-vs-moving question, without
 # depending on an annotation label.
