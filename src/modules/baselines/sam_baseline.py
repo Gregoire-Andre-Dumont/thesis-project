@@ -30,20 +30,22 @@ class SAMBaseline:
         self.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         self.model = self.model.to(device=self.device, dtype=self.dtype)
 
-    def commit_corruption(self, idx, image_features, rng):
-        """With probability `corruption_p`, box-prompt the nearest distractor and push THAT into the memory bank.
-        Runs on EVERY frame, independent of `should_commit` -- same injection the oracles use, so all arms face
-        identical corruption events."""
+    def corruption_draw(self, idx, rng):
+        """True when a commit on frame `idx` should write the nearest distractor INSTEAD of the target.
+        Drawn on every frame so the stream stays aligned across a probability sweep -- same contract as
+        MemoryOracle, so all arms face the same candidate corruption events."""
 
-        if self.corruption_p <= 0.0 or self.corruption_boxes is None:
-            return False
-        box = self.corruption_boxes[idx] if idx < len(self.corruption_boxes) else None
-        if box is None or float(rng.random()) >= self.corruption_p:
-            return False
+        value = float(rng.random())
+        box = self.corruption_boxes[idx] if (self.corruption_boxes is not None
+                                             and idx < len(self.corruption_boxes)) else None
+        return box is not None and value < self.corruption_p
+
+    def distractor_memory(self, idx, image_features):
+        """(pointer, encoding) for the nearest distractor on this frame, box-prompted through SAM."""
+
         _, encoding, pointer = self.model.initialize_video_masking(
-            image_features, convert_bbox(np.asarray(box, dtype=np.float32)))
-        self.main_memory.update_memory(pointer, encoding)
-        return True
+            image_features, convert_bbox(np.asarray(self.corruption_boxes[idx], dtype=np.float32)))
+        return pointer, encoding
 
     def should_commit(self, object_scores, iou_scores, chosen_mask, frame):
         """Whether to write this frame into the memory bank. Baseline gate = SAM's own confidence.
@@ -84,15 +86,21 @@ class SAMBaseline:
             if cache is not None and idx not in cache:
                 cache[idx] = [e.detach().cpu() for e in image_features]
 
-            # Update the memory bank with the embeddings and store the mask
-            if self.should_commit(object_scores, iou_scores, chosen_mask, current_frame):
+            # Corruption SUBSTITUTES for a commit rather than adding one, so the bank takes the same number of
+            # writes at every `corruption_p` and only their identity changes. An extra write would vary memory
+            # turnover alongside identity, and turnover is a large effect in its own right.
+            corrupt = self.corruption_draw(idx, corruption_rng)
+            gated = bool(self.should_commit(object_scores, iou_scores, chosen_mask, current_frame))
+
+            # A corruption event always writes: it replaces the target where the gate would have committed,
+            # and goes in anyway where the gate would have refused. Same contract as MemoryOracle.
+            if corrupt:
+                pointer, encoding = self.distractor_memory(idx, image_features)
+                self.corrupted_frames.append(idx)
+
+            if corrupt or gated:
                 self.main_memory.update_memory(pointer, encoding)
                 self.update_memory[idx] = 1
-
-            # Corruption is independent of the gate above: it fires on EVERY frame, occluded or visible, so all
-            # arms face the same injected errors regardless of where each one chooses to commit.
-            if self.commit_corruption(idx, image_features, corruption_rng):
-                self.corrupted_frames.append(idx)
 
 
             self.predicted_masks[idx] = chosen_mask

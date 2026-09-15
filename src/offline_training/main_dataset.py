@@ -1,7 +1,13 @@
+"""The calibrator's training set: one sample per PROPOSAL, labelled with that proposal's true mask IoU.
+
+SAM emits three competing masks a frame and the tracker keeps one. All three are samples -- the two it
+rejected are the only examples of a bad mask the dataset holds. The target is the IoU itself, not a
+pass/fail flag, because ranking three masks needs an ordering and a thresholded label carries none.
+"""
 import os
 import pickle
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -9,8 +15,7 @@ from torch.utils.data import Dataset
 
 
 def collate_fn(batch):
-    """Stack `(feature, label)` pairs into batched tensors. When `__getitems__` already returns
-    a pre-gathered `(features, labels)` batch, pass it straight through."""
+    """Stack `(feature, label)` pairs; pass a pre-gathered batch from `__getitems__` straight through."""
 
     if isinstance(batch, tuple) and len(batch) == 2 and torch.is_tensor(batch[0]):
         return batch
@@ -20,52 +25,106 @@ def collate_fn(batch):
 
 @dataclass
 class MainDataset(Dataset):
-    """Per-frame calibrator dataset.
+    """Per-proposal calibrator dataset, indexed by TRAJECTORY.
 
-    `initialize(indices)` reads the trajectory pickles at `indices` and stacks every frame's
-    precomputed similarity features and its `iou > iou_threshold` label into one tensor, held
-    on the GPU when CUDA is available. All the I/O happens there, so `__getitem__` is a pure
-    in-memory slice with no per-frame disk read."""
+    `dataset_path` holds one subfolder per memory-corruption probability (`p0.00`, `p0.05`, ...), each with
+    the same trajectories rolled out at that rate; `probabilities` picks which to draw from. An index
+    addresses a trajectory, not a file, and pulls it from every selected folder at once -- so a clip's
+    near-identical copies cannot be split across a train/validation boundary.
+
+    `initialize(indices)` stacks those trajectories onto the GPU, leaving `__getitem__` a pure slice."""
 
     dataset_path: str | None = None
-    iou_threshold: float = 0.5
+    probabilities: list[float] = field(default_factory=lambda: [0.0])
 
-    _features: torch.Tensor | None = None      # (N, 1, H, W, C) float32
-    _labels: torch.Tensor | None = None        # (N,) float32
+    _features: torch.Tensor | None = None     # (samples, 1, grid, grid, channels) float32
+    _labels: torch.Tensor | None = None       # (samples,) float32, the proposal's true mask IoU
+
+    # ---------------------------------------------------------------------------------------
+    # what the dataset is made of
+    # ---------------------------------------------------------------------------------------
+
+    def folders(self):
+        """The corruption folders this dataset draws from, in the order given."""
+
+        return [Path(self.dataset_path) / f"p{float(probability):.2f}" for probability in self.probabilities]
+
+    def trajectories(self):
+        """Trajectory stems present in EVERY selected folder, sorted -- what indices address.
+
+        Intersecting rather than unioning matters while the dataset is still being written: a trajectory
+        finished at one corruption level but not another would otherwise be drawn inconsistently."""
+
+        listings = [{Path(name).stem for name in os.listdir(folder)} for folder in self.folders()]
+        return sorted(set.intersection(*listings)) if listings else []
+
+    @staticmethod
+    def labelled(experiment):
+        """Frames carrying a real label: target visible, with an annotated box.
+
+        Occluded and unannotated frames are excluded because the labelling pass never scores them -- their
+        IoU is zero by construction, and training on it would teach that a good mask deserves nothing."""
+
+        occlusions = np.asarray(experiment.occlusions, float)
+        has_box = np.asarray(experiment.true_bboxes)[:, 2] > 0
+        return (occlusions < 0.5) & has_box
+
+    @staticmethod
+    def scorable(experiment):
+        """The evaluation subset: labelled frames from the first occlusion on, minus the anchor.
+
+        Narrower than what the model trains on. The anchor is the reference every similarity map is measured
+        against, so its crop scores a perfect match; and post-occlusion is the regime the claim is about."""
+
+        keep = MainDataset.labelled(experiment).copy()
+        occlusions = np.asarray(experiment.occlusions, float)
+        occluded = occlusions > 0.5
+        first_occlusion = int(np.argmax(occluded)) if occluded.any() else len(occlusions)
+        keep[:first_occlusion] = False
+        keep[0] = False
+        return keep
+
+    # ---------------------------------------------------------------------------------------
+    # torch Dataset
+    # ---------------------------------------------------------------------------------------
 
     def initialize(self, indices):
-        """Load the trajectories at `indices` (positions into the sorted listing of
-        `dataset_path`) and stack all their frames into the feature and label tensors."""
+        """Load the trajectories at `indices` from every selected folder and stack their proposals."""
 
-        directory = Path(self.dataset_path)
-        paths = sorted(directory / filename for filename in os.listdir(directory))
-
+        stems = self.trajectories()
         features, labels = [], []
         for index in indices:
-            experiment = pickle.load(open(paths[index], "rb"))
-            features.append(np.asarray(experiment.features, dtype=np.float32))
-            labels.append(np.asarray(experiment.iou_scores, dtype=np.float32) > self.iou_threshold)
+            for folder in self.folders():
+                experiment = pickle.load(open(folder / f"{stems[index]}.pkl", "rb"))
+                iou_scores = np.asarray(experiment.iou_scores, dtype=np.float32)
+                if iou_scores.ndim != 2:              # single-proposal pickle from an older schema
+                    continue
+                keep = self.labelled(experiment)
+                if not keep.any():
+                    continue
 
-        stacked_features = np.concatenate(features, axis=0)
-        stacked_labels = np.concatenate(labels, axis=0).astype(np.float32)
+                # (frames, proposals, grid, grid, channels) -> one sample per proposal, in label order.
+                similarity_maps = np.asarray(experiment.features, dtype=np.float32)[keep]
+                per_proposal = similarity_maps.reshape(-1, 1, *similarity_maps.shape[2:])
+                features.append(per_proposal)
+                labels.append(iou_scores[keep].reshape(-1))
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._features = torch.from_numpy(stacked_features).to(device)
-        self._labels = torch.from_numpy(stacked_labels).to(device)
+        self._features = torch.from_numpy(np.concatenate(features, axis=0)).to(device)
+        self._labels = torch.from_numpy(np.concatenate(labels, axis=0)).to(device)
 
     def __len__(self):
-        """Number of frames in the dataset, one training sample per frame."""
+        """Number of proposal samples: three per labelled frame, per corruption level."""
 
         return len(self._features)
 
-    def __getitem__(self, idx):
-        """Return one frame's feature tensor (all channels) and its label."""
+    def __getitem__(self, index):
+        """One proposal's similarity map and its true IoU."""
 
-        return self._features[idx], self._labels[idx]
+        return self._features[index], self._labels[index]
 
     def __getitems__(self, indices):
-        """Batched fetch hook for PyTorch's DataLoader: gather the whole batch in one indexing
-        op and return a pre-collated `(features, labels)` tuple consumed by `collate_fn`."""
+        """Batched fetch for the DataLoader: one indexing op, pre-collated for `collate_fn`."""
 
         selection = torch.as_tensor(indices, device=self._features.device)
         return self._features[selection], self._labels[selection]

@@ -1,5 +1,5 @@
 defaults:
-  - offline_trainers: experiment_2/cnn_fixed_samara_large
+  - offline_trainers: cnn_fixed_samara
   - trackers@tracker: baselines/memory_oracle
   
 detection_data:
@@ -10,9 +10,11 @@ detection_data:
   load_frames: True
   num_threads: 32
 
-train_test_split: 0.25
 deploy_controller: True
-dataset_path: data/memory_oracle_large/memory
+
+# offline_training.py: 5-fold cross-validation over trajectories. The held-out fold doubles as the
+# early-stopping set, so every trajectory is held out exactly once across the five folds.
+folds: 5
 commit_threshold: 0.4
 
 # run_experiment.py selectors (override on CLI, e.g. experiment=5 size=tiny max_test_trajectories=20)

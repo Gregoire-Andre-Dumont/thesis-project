@@ -1,10 +1,11 @@
-"""Per-frame pseudo-IoU labels for the calibrator dataset: how well the tracker's proposed mask
-matches the box-prompted pseudo-GT of the TARGET and of its K nearest clean DISTRACTORS.
+"""Per-proposal pseudo-IoU labels: how well each mask SAM proposes matches the box-prompted pseudo-GT of the
+TARGET, and of its nearest clean DISTRACTORS.
 
-A high target IoU means the proposal is on the right person; a high distractor IoU means it has been
-captured by a confuser. Distractors are the clean (target-eligible) other persons annotated in that
-frame, ranked by how close their box centre is to the proposal's centroid, box-prompted with the same
-SAM model as the target so the pseudo-GT masks are comparable."""
+A high target IoU means the proposal is on the right person, a high distractor IoU that a confuser has taken
+it. PersonPath annotates boxes rather than masks, so both ground truths come from the annotated box prompted
+through the tracker's own SAM -- comparable to each other and to the proposals, at the cost of inheriting
+SAM's own segmentation errors.
+"""
 import json
 
 import cv2
@@ -13,110 +14,174 @@ import torch
 
 from src.utils.load_bboxes import convert_bbox
 
-# Labels that mark an annotation as not a clean person (mirrors the PersonPath selection).
+# Labels marking an annotation as not a clean person, mirroring the PersonPath selection.
 NON_TARGETS = ("crowd", "person_in_vehicle", "reflection", "person_in_background", "severly_occluded_person")
 
 
-def load_clean_boxes_by_frame(visible_path, target_id, non_targets=NON_TARGETS):
-    """{frame_idx: [box_norm, ...]} for every clean OTHER person, boxes normalized [x, y, w, h]."""
+# ---------------------------------------------------------------------------------------
+# the clean people a proposal could have drifted onto
+# ---------------------------------------------------------------------------------------
+
+def _normalised_boxes(visible_path, target_id, non_targets):
+    """(entity, normalised box) for every clean OTHER person: the target and non-target labels dropped."""
+
     data = json.load(open(visible_path))
-    w = int(data["metadata"]["resolution"]["width"])
-    h = int(data["metadata"]["resolution"]["height"])
-    out = {}
-    for e in data["entities"]:
-        if e["id"] == target_id or any(lbl in non_targets for lbl in e["labels"]):
+    width = int(data["metadata"]["resolution"]["width"])
+    height = int(data["metadata"]["resolution"]["height"])
+
+    for entity in data["entities"]:
+        if entity["id"] == target_id or any(label in non_targets for label in entity["labels"]):
             continue
-        bx, by, bw, bh = e["bb"]
-        if bw <= 0 or bh <= 0:
+        left, top, box_width, box_height = entity["bb"]
+        if box_width <= 0 or box_height <= 0:
             continue
-        out.setdefault(e["blob"]["frame_idx"], []).append(
-            np.array([bx / w, by / h, bw / w, bh / h], np.float32))
-    return out
+        normalised = [left / width, top / height, box_width / width, box_height / height]
+        yield entity, np.array(normalised, np.float32)
+
+
+def load_clean_boxes_by_frame(visible_path, target_id, non_targets=NON_TARGETS):
+    """{frame_index: [box_norm, ...]} for every clean other person."""
+
+    boxes_by_frame = {}
+    for entity, box in _normalised_boxes(visible_path, target_id, non_targets):
+        boxes_by_frame.setdefault(entity["blob"]["frame_idx"], []).append(box)
+    return boxes_by_frame
 
 
 def load_clean_boxes_by_person(visible_path, target_id, non_targets=NON_TARGETS):
-    """{person_id: {frame_idx: box_norm}} for every clean OTHER person -- keeps identity so one distractor can be
-    followed across frames."""
-    data = json.load(open(visible_path))
-    w = int(data["metadata"]["resolution"]["width"])
-    h = int(data["metadata"]["resolution"]["height"])
-    out = {}
-    for e in data["entities"]:
-        if e["id"] == target_id or any(lbl in non_targets for lbl in e["labels"]):
-            continue
-        bx, by, bw, bh = e["bb"]
-        if bw <= 0 or bh <= 0:
-            continue
-        out.setdefault(e["id"], {})[e["blob"]["frame_idx"]] = np.array([bx / w, by / h, bw / w, bh / h], np.float32)
-    return out
+    """{person_id: {frame_index: box_norm}} -- keeps identity, so one distractor can be followed."""
+
+    boxes_by_person = {}
+    for entity, box in _normalised_boxes(visible_path, target_id, non_targets):
+        boxes_by_person.setdefault(entity["id"], {})[entity["blob"]["frame_idx"]] = box
+    return boxes_by_person
 
 
-def _centroid_norm(mask):
-    """Normalized (cx, cy) of a boolean mask, or None if empty."""
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
+def distractor_boxes_per_frame(clean_boxes_by_frame, frame_indices):
+    """The clean boxes for each frame of a trajectory, in trajectory order.
+
+    Resolves video frame numbering once, so the labelling below never has to know about it."""
+
+    return [clean_boxes_by_frame.get(int(index), []) for index in frame_indices]
+
+
+def _box_centre(box):
+    """Normalised (x, y) centre of a [left, top, width, height] box."""
+
+    return box[0] + box[2] / 2, box[1] + box[3] / 2
+
+
+def _mask_centroid(mask):
+    """Normalised (x, y) centre of a boolean mask, or None when it is empty."""
+
+    rows, columns = np.nonzero(mask)
+    if len(columns) == 0:
         return None
-    return xs.mean() / mask.shape[1], ys.mean() / mask.shape[0]
+    return columns.mean() / mask.shape[1], rows.mean() / mask.shape[0]
 
 
-def _box_center(b):
-    return b[0] + b[2] / 2, b[1] + b[3] / 2
+def _nearest_boxes(boxes, centre, k):
+    """The k boxes whose centres lie closest to `centre`, nearest first."""
+
+    distance = lambda box: sum((a - b) ** 2 for a, b in zip(_box_centre(box), centre))
+    return sorted(boxes, key=distance)[:k]
+
+
+def _search_centre(proposals, target_box):
+    """Where to look for distractors, or None when the frame offers nothing to look from.
+
+    Taken from where the proposals actually are, so a proposal that drifted onto a neighbour finds that
+    neighbour among its own k. Falls back to the annotated box when every proposal is empty."""
+
+    centre = _mask_centroid(proposals.any(axis=0))
+    if centre is not None:
+        return centre
+    return _box_centre(target_box) if float(target_box[2]) > 0.0 else None
+
+
+# ---------------------------------------------------------------------------------------
+# scoring the proposals against box-prompted pseudo-ground-truth
+# ---------------------------------------------------------------------------------------
+
+def _pseudo_ground_truth(model, image_features, box):
+    """SAM's segmentation of one annotated box, the mask a frame's proposals are scored against."""
+
+    prompt = convert_bbox(np.asarray(box, np.float32))
+    mask, _, _ = model.initialize_video_masking(image_features, prompt)
+    return (mask.squeeze() > 0.0).cpu().numpy()
+
+
+def _mask_ious(proposals, truth):
+    """IoU of each proposal against one pseudo-GT mask."""
+
+    scores = np.zeros(len(proposals), np.float32)
+    for index, proposal in enumerate(proposals):
+        if proposal.shape != truth.shape:
+            resized = cv2.resize(proposal.astype(np.uint8), truth.shape[::-1], interpolation=cv2.INTER_NEAREST)
+            proposal = resized > 0
+        union = (proposal | truth).sum()
+        scores[index] = float((proposal & truth).sum() / union) if union > 0 else 0.0
+    return scores
+
+
+def _image_features(model, frames, precomputed_features, chunk):
+    """One frame's SAM image encoding at a time: cached ones reused, the rest encoded in batches.
+
+    The tracker has already encoded these frames during its rollout, so reusing its cache is what keeps
+    labelling from costing a second pass over the image encoder."""
+
+    if precomputed_features is not None:
+        device = next(model.image_encoder.parameters()).device
+        for frame in range(len(frames)):
+            yield [features.to(device) for features in precomputed_features[frame]]
+        return
+
+    prepared = [model.image_encoder.prepare_image(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), 1024, True) for frame in frames]
+    for start in range(0, len(frames), chunk):
+        batch = torch.cat(prepared[start:start + chunk], dim=0)
+        encoded = model.image_encoder(batch)
+        for offset in range(encoded[0].shape[0]):
+            yield [features[offset:offset + 1] for features in encoded]
 
 
 @torch.inference_mode()
-def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, clean_boxes_by_frame,
-                      frame_indices, occlusions, k=3, chunk=4, precomputed_features=None, include_occluded=False):
-    """Return target_iou (n,) and distractor_iou (n, k). Each frame's proposal mask is scored against the
-    box-prompted pseudo-GT of the target and the k nearest clean distractors. Fewer than k distractors
-    leaves the remaining columns zero.
+def pseudo_iou_labels(model, frames, predicted_masks, target_boxes, distractor_boxes, occlusions, k=3, chunk=4, precomputed_features=None, include_occluded=False):
+    """target_iou (n, proposals) and distractor_iou (n, proposals, k).
 
-    include_occluded: if False (default), occluded frames stay zero. If True, occluded frames are still
-    scored for DISTRACTOR IoU (the target has no GT box so target_iou stays 0, but a distractor overlap is
-    an unambiguous capture) -- used to catch captures that happen while the target is occluded.
+    `predicted_masks` is (n, proposals, h, w), or (n, h, w) read as a single proposal. `distractor_boxes`
+    is one list of clean boxes per frame, from `distractor_boxes_per_frame`.
 
-    precomputed_features: optional {t: [lowres, hires_x2, hires_x4]} per-frame image encodings (B=1) to
-    reuse instead of re-running the SAM image encoder -- the same 3-map list the trackers cache."""
+    Scoring every proposal costs the same SAM decodes as scoring one: a box's pseudo-GT does not depend on
+    which proposal it is measured against, so each box is prompted once per frame and intersected with all
+    of them. The distractors are likewise picked once per frame, which is what makes column j the same
+    person for every proposal and the labels comparable across them.
 
-    n = len(frames)
-    target_iou = np.zeros(n, np.float32)
-    distractor_iou = np.zeros((n, k), np.float32)
+    `include_occluded` keeps occluded frames for distractor scoring only -- the target has no box there, but
+    a distractor overlap while it is hidden is an unambiguous capture."""
 
-    def prompt_iou(single, predicted, box):
-        mask, _, _ = model.initialize_video_masking(single, convert_bbox(np.asarray(box, np.float32)))
-        pseudo_gt = (mask.squeeze() > 0.0).cpu().numpy()
-        if predicted.shape != pseudo_gt.shape:
-            predicted = cv2.resize(predicted.astype(np.uint8), pseudo_gt.shape[::-1],
-                                   interpolation=cv2.INTER_NEAREST) > 0
-        union = (predicted | pseudo_gt).sum()
-        return float((predicted & pseudo_gt).sum() / union) if union > 0 else 0.0
+    masks = np.asarray(predicted_masks)
+    if masks.ndim == 3:
+        masks = masks[:, None]
+    frame_count, proposal_count = len(frames), masks.shape[1]
+    target_iou = np.zeros((frame_count, proposal_count), np.float32)
+    distractor_iou = np.zeros((frame_count, proposal_count, k), np.float32)
 
-    def score_frame(t, single):
-        if occlusions[t] > 0.5 and not include_occluded:
-            return
-        predicted = np.asarray(predicted_masks[t]) > 0
-        if float(target_boxes[t][2]) > 0.0:
-            target_iou[t] = prompt_iou(single, predicted, target_boxes[t])
+    for frame, image_features in enumerate(_image_features(model, frames, precomputed_features, chunk)):
+        if occlusions[frame] > 0.5 and not include_occluded:
+            continue
 
-        center = _centroid_norm(predicted)
-        if center is None:
-            if float(target_boxes[t][2]) <= 0.0:
-                return
-            center = _box_center(target_boxes[t])
-        boxes = clean_boxes_by_frame.get(int(frame_indices[t]), [])
-        nearest = sorted(boxes, key=lambda b: (_box_center(b)[0] - center[0]) ** 2
-                                              + (_box_center(b)[1] - center[1]) ** 2)[:k]
-        for j, box in enumerate(nearest):
-            distractor_iou[t, j] = prompt_iou(single, predicted, box)
+        proposals = masks[frame] > 0
+        target_box = target_boxes[frame]
+        if float(target_box[2]) > 0.0:
+            target_truth = _pseudo_ground_truth(model, image_features, target_box)
+            target_iou[frame] = _mask_ious(proposals, target_truth)
 
-    if precomputed_features is not None:                    # reuse cached encodings; no image-encoder pass
-        device = next(model.image_encoder.parameters()).device
-        for t in range(n):
-            score_frame(t, [f.to(device) for f in precomputed_features[t]])
-    else:
-        prepared = [model.image_encoder.prepare_image(cv2.cvtColor(f, cv2.COLOR_RGB2BGR), 1024, True) for f in frames]
-        for start in range(0, n, chunk):
-            feats = model.image_encoder(torch.cat(prepared[start:start + chunk], dim=0))
-            for i in range(feats[0].shape[0]):
-                score_frame(start + i, [f[i:i + 1] for f in feats])
+        centre = _search_centre(proposals, target_box)
+        if centre is None:
+            continue
+
+        for column, box in enumerate(_nearest_boxes(distractor_boxes[frame], centre, k)):
+            distractor_truth = _pseudo_ground_truth(model, image_features, box)
+            distractor_iou[frame, :, column] = _mask_ious(proposals, distractor_truth)
 
     return target_iou, distractor_iou

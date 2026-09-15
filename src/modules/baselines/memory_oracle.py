@@ -27,8 +27,10 @@ class MemoryOracle:
     main_memory: MainMemory | None = None
     use_mask_iou: bool = True          # score against a box-prompted pseudo-GT MASK, not the GT box
 
-    # Memory-bank corruption (claim_2): at each commit, with probability `corruption_p`, write a CLEAN nearby
-    # distractor into the bank instead of the target. `corruption_boxes` is per-frame (None = cannot corrupt).
+
+    # Memory-bank corruption: with probability `corruption_p`, commit a CLEAN nearby distractor instead of
+    # the target. `corruption_boxes` is per-frame (None = not corruptible), non-None from the first occlusion
+    # onward wherever another annotated person exists -- occluded frames included.
     corruption_p: float = 0.0
     corruption_boxes: list | None = None
     corruption_seed: int = 0
@@ -40,24 +42,28 @@ class MemoryOracle:
         self.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         self.model = self.model.to(device=self.device, dtype=self.dtype)
 
-    def commit_corruption(self, idx, image_features, rng):
-        """With probability `corruption_p`, box-prompt the nearest distractor on this frame and push THAT into the
-        memory bank. Returns True when the bank was corrupted.
+    def corruption_draw(self, idx, rng):
+        """True when frame `idx` is a corruption event: a commit here writes the nearest distractor, not the
+        target.
 
-        This runs on EVERY frame -- occluded or visible -- and is independent of the arm's own commit gate, so all
-        arms face the same corruption events rather than being poisoned wherever each happens to commit. The
-        injected entry is a clean, well-formed mask of a real person, so it corrupts the bank's IDENTITY, not its
-        mask quality."""
+        The draw happens on every frame regardless of `corruption_p` or whether a distractor exists, so the
+        random stream stays aligned across a probability sweep -- with one seed per clip the events at p=0.05
+        are a subset of those at p=0.20, making the sweep a nested series rather than five independent draws."""
 
-        if self.corruption_p <= 0.0 or self.corruption_boxes is None:
-            return False
-        box = self.corruption_boxes[idx] if idx < len(self.corruption_boxes) else None
-        if box is None or float(rng.random()) >= self.corruption_p:
-            return False
+        value = float(rng.random())
+        box = self.corruption_boxes[idx] if (self.corruption_boxes is not None
+                                             and idx < len(self.corruption_boxes)) else None
+        return box is not None and value < self.corruption_p
+
+    def distractor_memory(self, idx, image_features):
+        """(pointer, encoding) for the nearest distractor on this frame, box-prompted through SAM.
+
+        A clean, well-formed mask of a real person, so substituting it for the target corrupts the bank's
+        IDENTITY rather than its mask quality -- the error a re-ID gate is supposed to catch."""
+
         _, encoding, pointer = self.model.initialize_video_masking(
-            image_features, convert_bbox(np.asarray(box, dtype=np.float32)))
-        self.main_memory.update_memory(pointer, encoding)
-        return True
+            image_features, convert_bbox(np.asarray(self.corruption_boxes[idx], dtype=np.float32)))
+        return pointer, encoding
 
     @torch.inference_mode()
     def pseudo_truth(self, image_features, bboxes_norm):
@@ -68,8 +74,7 @@ class MemoryOracle:
         box-prompted pseudo-GT the labelling pipeline uses -- it is SAM's own segmentation of the GT box, so
         it inherits SAM's errors, but it is the only mask-level ground truth PersonPath admits."""
 
-        mask, _, _ = self.model.initialize_video_masking(
-            image_features, convert_bbox(np.asarray(bboxes_norm, dtype=np.float32)))
+        mask, _, _ = self.model.initialize_video_masking(image_features, convert_bbox(np.asarray(bboxes_norm, dtype=np.float32)))
         return mask.squeeze().to(torch.float64).cpu().numpy() > 0.0
 
     @staticmethod
@@ -88,7 +93,7 @@ class MemoryOracle:
             return self.mask_iou(truth, masks)
         return compute_iou(np.repeat(bboxes_norm[None, :], len(masks), axis=0), masks)
 
-    def choose(self, mask_preds, iou_scores, bboxes_norm, visible, truth=None):
+    def choose(self, mask_preds, iou_scores, bboxes_norm, visible, truth=None, proposal_iou=None):
         """Index of the proposal to track with. The memory oracle intervenes on MEMORY only, so this is SAM 2's
         own IoU-token argmax, identical to the baseline; the ground-truth arguments are here for subclasses
         that select on them (see MaskOracle)."""
@@ -109,11 +114,21 @@ class MemoryOracle:
 
         n_frames = detection_data.frames.shape[0]
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)
-        # SAM 2's own two per-frame confidences, for the CHOSEN proposal -- diagnostic here, but they are the
-        # signals any learned gate has to beat, so they are recorded alongside it rather than recomputed.
-        self.iou_scores = torch.zeros(n_frames, dtype=torch.float64)      # predicted IoU of the chosen mask
-        self.object_scores = torch.zeros(n_frames, dtype=torch.float64)   # raw pre-sigmoid "object present" logit
-        self.commit_iou = torch.zeros(n_frames, dtype=torch.float64)      # chosen mask vs ground truth (visible frames)
+
+        self.iou_scores = torch.zeros(n_frames, dtype=torch.float64)   
+        self.object_scores = torch.zeros(n_frames, dtype=torch.float64) 
+        self.commit_iou = torch.zeros(n_frames, dtype=torch.float64)      
+
+
+        self.proposal_iou_scores = torch.zeros((n_frames, 3), dtype=torch.float64)   # SAM's token per proposal
+        self.proposal_true_iou = torch.zeros((n_frames, 3), dtype=torch.float64)     # vs GT; 0 when not visible
+        self.chosen_index = torch.zeros(n_frames, dtype=torch.int64)                 # which proposal was kept, 0-2
+
+        # The two masks the arm DISCARDS, kept alongside the one it keeps. Tracking only ever needs the
+        # chosen mask, but a selector has to be trained and scored on the alternatives it was chosen over,
+        # so the rollout is the only place they can be captured. float16: these are logits read back through
+        # a `> 0` threshold, and at (n, 3, 256, 256) the full-precision copy is 8x the size for no gain.
+        self.proposal_masks = torch.zeros((n_frames, 3, 256, 256), dtype=torch.float16)
 
         self.committed_frames = []
         self.corrupted_frames = []                                         # frames where a distractor was committed
@@ -130,30 +145,42 @@ class MemoryOracle:
 
             bboxes_norm = detection_data.bboxes_norm[idx]
             visible = bool(detection_data.occlusions[idx] <= 0.5) and float(bboxes_norm[2]) > 0
-
             truth = self.pseudo_truth(image_features, bboxes_norm) if (visible and self.use_mask_iou) else None
-            best_idx = self.choose(mask_preds, iou_scores, bboxes_norm, visible, truth)
+
+            # Every proposal's true IoU, computed once: MaskOracle selects on it, corruption picks its argmin,
+            # and it is stored for offline selection analysis.
+            proposal_iou = (self.score((mask_preds[0, 1:] > 0.0).cpu().numpy(), bboxes_norm, truth)
+                            if visible else None)
+            self.proposal_iou_scores[idx] = iou_scores.reshape(-1)[1:4].to(torch.float64).cpu()
+            self.proposal_masks[idx] = mask_preds[0, 1:].to(torch.float16).cpu()
+            if proposal_iou is not None:
+                self.proposal_true_iou[idx] = torch.as_tensor(proposal_iou, dtype=torch.float64)
+
+            best_idx = self.choose(mask_preds, iou_scores, bboxes_norm, visible, truth, proposal_iou)
+            self.chosen_index[idx] = int(best_idx) - 1                   # 0-2 into the proposal arrays
 
             chosen_mask, pointer, encoding = self.model.commit_candidate(
                 mask_preds, best_idx, object_pointers, object_score, lowres_imgenc)
 
             self.predicted_masks[idx] = self.reported_mask(mask_preds, best_idx, chosen_mask)
-
-            # The CHOSEN proposal's score, not the best available one: the features and labels describe the
-            # mask that was selected and committed, so its own confidence is what they must line up with.
-            # These differ whenever selection disagrees with SAM's ranking -- always, for the mask oracle.
             self.iou_scores[idx] = float(iou_scores.reshape(-1)[best_idx])
             self.object_scores[idx] = float(torch.as_tensor(object_score).reshape(-1)[0])
 
+            corrupt = self.corruption_draw(idx, corruption_rng)
+
             # Commit gate: the chosen mask's IoU vs ground truth, on visible frames only.
-            if bool(detection_data.occlusions[idx] <= 0.5) and float(bboxes_norm[2]) > 0:
+            gated = False
+            if visible:
                 self.commit_iou[idx] = float(self.score((chosen_mask[None, :].numpy() > 0.0), bboxes_norm, truth)[0])
+                gated = bool(self.commit_iou[idx] > self.iou_threshold)
 
-                if self.commit_iou[idx] > self.iou_threshold:
-                    self.main_memory.update_memory(pointer, encoding)
-                    self.committed_frames.append(idx)
 
-            if self.commit_corruption(idx, image_features, corruption_rng):
+            if corrupt:
+                pointer, encoding = self.distractor_memory(idx, image_features)
                 self.corrupted_frames.append(idx)
+
+            if corrupt or gated:
+                self.main_memory.update_memory(pointer, encoding)
+                self.committed_frames.append(idx)
 
         return self.predicted_masks

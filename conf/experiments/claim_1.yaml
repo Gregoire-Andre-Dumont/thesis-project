@@ -12,13 +12,13 @@ person_path:
   main_directory: data/person_path
   n_experiments: 1200
   random_seed: 44
-  first_occ_min: 4
+  first_occ_min: 8
   border_inset: 8  
-  n_after_occlusion: 30 
-  min_visible_area: 1024
+  n_after_occlusion: 30
+  min_visible_area: 900
   min_visible_ratio: 0.90
-  occlusion_ranges: [5, 75] 
-  max_distractor_overlap: 0.40 
+  occlusion_ranges: [2, 50] 
+  max_distractor_overlap: 0.6
   non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person, sitting_person, person_on_open_vehicle]
 
 # experiment parameters

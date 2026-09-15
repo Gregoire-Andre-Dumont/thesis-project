@@ -23,6 +23,26 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+def anchor_area(video, person_id, anchor):
+    """Visible box area on the ANCHOR frame, px² at the 1024 working resolution.
+
+    The size of the target at the moment the memory bank is seeded, and the quantity `min_visible_area`
+    gates on -- so this bins clips by exactly what the selection controls. Anchor-frame only, deliberately:
+    it describes the reference encoding, not the trajectory. A target can clear the floor on its anchor and
+    be a quarter of that size for the remaining two hundred frames, so read it as a property of the seed."""
+
+    if video not in _visible_cache:
+        _visible_cache[video] = json.load(open(f"data/person_path/visible/{video}.json"))
+    visible = _visible_cache[video]
+    scale = 1024 / max(float(visible["metadata"]["resolution"]["width"]),
+                       float(visible["metadata"]["resolution"]["height"]))
+    for entity in visible["entities"]:
+        if entity["id"] == person_id and int(entity["blob"]["frame_idx"]) == int(anchor):
+            box = entity["bb"]
+            return float(box[2]) * float(box[3]) * scale ** 2 if float(box[2]) > 0 else np.nan
+    return np.nan
+
+
 COVERAGE_IOU = 0.5                           # a visible frame counts as held at this box IoU
 FAILURE_IOU = 0.1                            # below this the target is considered lost (VOT's threshold)
 N_BINS = 4
@@ -68,12 +88,43 @@ def visible(clip, ious):
     return ious[clip["has_box"] & ~clip["occluded"]] if "occluded" in clip else ious
 
 
-def coverage(clip, ious):
+def coverage(clip, ious, commits=None):
     """Fraction of visible post-occlusion frames held at box IoU >= COVERAGE_IOU. Credits a tracker that
     loses the target and re-finds it, and is indifferent to WHEN in the clip the held frames fall."""
 
     ious = visible(clip, ious)
     return float((ious >= COVERAGE_IOU).mean()) if len(ious) else np.nan
+
+
+def coverage_with_occlusion(clip, ious, commits):
+    """Coverage over ALL annotated post-occlusion frames, scoring the two kinds of frame by what the arm can
+    actually get right on each: a VISIBLE frame counts when box IoU >= COVERAGE_IOU, an OCCLUDED frame counts
+    when the arm did NOT write it to memory.
+
+    While the target is hidden there is nothing to track, so the only decision an arm makes is whether to
+    commit -- and committing then is exactly how a bank gets poisoned. Scoring it folds memory hygiene into
+    the same number as tracking quality, which is the thing the oracles are actually intervening on.
+
+    This must NOT be binned by occlusion length. The occluded half scores higher than the visible half for
+    every arm (1.0 by construction for the oracles, ~0.81 for the baseline), so a longer-occlusion bin gets
+    more of its score from the easy half and the curve flattens for reasons unrelated to tracking. Against
+    covariates that are not occlusion length -- anchor size, target motion -- that circularity does not
+    arise, and the metric is strictly more informative than visible-only coverage.
+
+    NaN for archives predating the commit flags."""
+
+    if commits is None or "occluded" not in clip:
+        return np.nan
+
+    ious = np.asarray(ious, dtype=float)
+    seen, hidden = clip["has_box"] & ~clip["occluded"], np.asarray(clip["occluded"])
+    scored = int(seen.sum() + hidden.sum())
+    if not scored:
+        return np.nan
+
+    held = float((ious[seen] >= COVERAGE_IOU).sum())
+    clean = float((~np.asarray(commits, dtype=bool)[hidden]).sum())
+    return (held + clean) / scored
 
 
 def robustness(clip, ious):
@@ -133,48 +184,73 @@ def mean_displacement(video, person_id, anchor, n_frames):
 
 score, YLABEL = {
     "coverage": (coverage, f"post-occlusion coverage  (box IoU ≥ {COVERAGE_IOU:g})"),
-    "robustness": (robustness, f"robustness  (fraction held before box IoU < {FAILURE_IOU:g})"),
+    "robustness": (robustness, (f"robustness  (fraction held before box IoU < {FAILURE_IOU:g})")),
 }[METRIC]
+
+# The occlusion figure keeps the visible-only metric (see `coverage_with_occlusion` for why it must); the
+# covariates that are not occlusion length get the occlusion-aware one.
+HYGIENE_YLABEL = (f"coverage  (visible: box IoU ≥ {COVERAGE_IOU:g}   ·   occluded: did not commit)")
 
 results = pickle.load(open(RESULTS, "rb"))
 thresholds = list(results["thresholds"])
 
-occlusions, motion, scored = [], [], []
+
+def arm_scores(clip, metric):
+    """(sam, [memory per threshold], [mask per threshold]) under one metric, with the matching commit flags."""
+
+    return (metric(clip, clip["sam"], clip.get("sam_commit")),
+            [metric(clip, clip["memory"][t], clip.get("memory_commit", {}).get(t)) for t in thresholds],
+            [metric(clip, clip["mask"][t], clip.get("mask_commit", {}).get(t)) for t in thresholds])
+
+
+occlusions, motion, areas, scored, scored_hygiene = [], [], [], [], []
 for clip in results["clips"]:
     anchor = anchor_of.get((clip["video"], int(clip["person"])))
     if not len(clip["sam"]) or anchor is None:
         continue
     displacement = mean_displacement(clip["video"], int(clip["person"]), anchor, int(clip["n_frames"]))
-    if not np.isfinite(displacement):
+    area = anchor_area(clip["video"], int(clip["person"]), anchor)
+    if not (np.isfinite(displacement) and np.isfinite(area)):
         continue
 
     occlusions.append(int(clip["occ_count"]))
     motion.append(displacement)                  # mean centre displacement from the anchor, px @1024
-    scored.append((score(clip, clip["sam"]),
-                   [score(clip, clip["memory"][t]) for t in thresholds],
-                   [score(clip, clip["mask"][t]) for t in thresholds]))
+    areas.append(area)                           # anchor visible box area, px² @1024
+    scored.append(arm_scores(clip, score))
+    scored_hygiene.append(arm_scores(clip, coverage_with_occlusion))
 
 occlusions = np.array(occlusions)
 motion = np.array(motion)
-sam = np.array([v[0] for v in scored])
-memory = np.array([v[1] for v in scored])        # (clips, thresholds)
-mask = np.array([v[2] for v in scored])
+areas = np.array(areas)
 
-# Each oracle at the threshold that maximises its own pooled coverage -- picked on this data, hence optimistic.
-MEMORY_THRESHOLD = int(np.nanmean(memory, axis=0).argmax())
-MASK_THRESHOLD = int(np.nanmean(mask, axis=0).argmax())
+
+def arm_arrays(rows):
+    """Stack the per-clip tuples into (sam (n,), memory (n, thresholds), mask (n, thresholds))."""
+    return (np.array([r[0] for r in rows]), np.array([r[1] for r in rows]), np.array([r[2] for r in rows]))
+
+
+ARMS = arm_arrays(scored)                        # visible-only coverage
+HYGIENE = arm_arrays(scored_hygiene)             # + occluded frames scored on commit behaviour
+sam = ARMS[0]
 
 
 # ---------------------------------------------------------------------------------------
 # figures
 # ---------------------------------------------------------------------------------------
 
-def draw(values, xlabel, title, filename, tick="{:.0f}"):
-    """One figure: the three arms' coverage across quantile bins of `values`, over every clip."""
+def draw(values, xlabel, title, filename, arms=None, ylabel=None, tick="{:.0f}"):
+    """One figure: the three arms' score across quantile bins of `values`, over every clip.
+    `arms` selects which metric's score arrays to plot -- ARMS (visible only) or HYGIENE."""
 
-    if len(sam) < 2:                             # early in a run there is nothing to bin yet
-        print(f"skipped {filename}  (n={len(sam)})")
+    baseline_scores, memory, mask = ARMS if arms is None else arms
+    if len(baseline_scores) < 2:                 # early in a run there is nothing to bin yet
+        print(f"skipped {filename}  (n={len(baseline_scores)})")
         return
+    # Each oracle at the threshold maximising its own pooled score UNDER THIS METRIC -- picked on this data,
+    # so the gap it shows is an upper bound rather than unbiased.
+    memory_best = int(np.nanmean(memory, axis=0).argmax())
+    mask_best = int(np.nanmean(mask, axis=0).argmax())
+
     edges = np.unique(np.quantile(values, np.linspace(0, 1, N_BINS + 1)))
     index = np.clip(np.digitize(values, edges[1:-1]), 0, len(edges) - 2)
     x = np.arange(len(edges) - 1)
@@ -182,14 +258,14 @@ def draw(values, xlabel, title, filename, tick="{:.0f}"):
     figure, axis = plt.subplots(figsize=(8.6, 5.4), facecolor=SURFACE)
     axis.set_facecolor(SURFACE)
 
-    baseline = np.array([sam[index == k].mean() for k in x])
+    baseline = np.array([baseline_scores[index == k].mean() for k in x])
     axis.plot(x, baseline, color=SAM, linewidth=2, marker="o", markersize=8,
               markeredgecolor=SURFACE, markeredgewidth=2, label="sam baseline", zorder=3)
     ends = [(baseline[-1], SAM, "sam")]
 
     for colour, values_by_threshold, label, short, featured in (
-            (MEMORY, memory, "memory oracle", "memory", MEMORY_THRESHOLD),
-            (MASK, mask, "mask oracle", "mask", MASK_THRESHOLD)):
+            (MEMORY, memory, "memory oracle", "memory", memory_best),
+            (MASK, mask, "mask oracle", "mask", mask_best)):
         per_bin = np.array([values_by_threshold[index == k, featured].mean() for k in x])
         axis.plot(x, per_bin, color=colour, linewidth=2, marker="o", markersize=8,
                   markeredgecolor=SURFACE, markeredgewidth=2,
@@ -209,7 +285,7 @@ def draw(values, xlabel, title, filename, tick="{:.0f}"):
     axis.set_xticklabels([f"{tick.format(edges[k])}-{tick.format(edges[k + 1])}"
                           f"\nn={int((index == k).sum())}" for k in x], fontsize=9, color=INK2)
     axis.set_xlabel(xlabel, fontsize=10, color=INK2)
-    axis.set_ylabel(YLABEL, fontsize=10, color=INK2)
+    axis.set_ylabel(YLABEL if ylabel is None else ylabel, fontsize=10, color=INK2)
     axis.set_title(title, fontsize=12, color=INK, pad=12, loc="left")
     axis.grid(axis="y", color=INK2, alpha=0.13, linewidth=0.8)
     axis.set_axisbelow(True)
@@ -221,11 +297,12 @@ def draw(values, xlabel, title, filename, tick="{:.0f}"):
     axis.tick_params(colors=INK2, labelsize=9)
     axis.set_xlim(-0.35, len(x) - 1 + 0.55)
     axis.legend(frameon=False, fontsize=10, loc="best")
-    figure.text(0.008, 0.955, f"n={len(sam)} clips  ·  each oracle at its own best threshold (chosen post-hoc)",
+    figure.text(0.008, 0.955,
+                f"n={len(baseline_scores)} clips  ·  each oracle at its own best threshold (chosen post-hoc)",
                 fontsize=9, color=INK2, ha="left")
     figure.tight_layout(rect=[0, 0, 1, 0.93])
     figure.savefig(filename, dpi=150, facecolor=SURFACE)
-    print(f"saved {filename}  (n={len(sam)})")
+    print(f"saved {filename}  (n={len(baseline_scores)})")
 
 
 TITLE = METRIC.capitalize()
@@ -233,12 +310,30 @@ TITLE = METRIC.capitalize()
 draw(occlusions, "occluded frames",
      f"{TITLE} by occlusion length", f"data/claim_1/fig_occlusion{SUFFIX}.png")
 
+# These two covariates are not occlusion length, so the occluded frames can be scored on commit behaviour
+# without the circularity that rules it out for the figure above.
+HYGIENE_TITLE = "Coverage + memory hygiene"
+
 # How far the target travels from where the bank was seeded -- the still-vs-moving question, without
 # depending on an annotation label.
 draw(motion, "mean displacement from the anchor  (px @1024)",
-     f"{TITLE} by target motion", f"data/claim_1/fig_motion{SUFFIX}.png")
+     f"{HYGIENE_TITLE} by target motion", f"data/claim_1/fig_motion{SUFFIX}.png",
+     arms=HYGIENE, ylabel=HYGIENE_YLABEL)
+
+# How big the target is where the memory bank is seeded -- the quantity `min_visible_area` gates on.
+draw(areas, "anchor visible box area  (px² @1024)",
+     f"{HYGIENE_TITLE} by anchor size", f"data/claim_1/fig_area{SUFFIX}.png",
+     arms=HYGIENE, ylabel=HYGIENE_YLABEL)
+
+
+def pooled(label, arms):
+    baseline, memory, mask = arms
+    best_memory, best_mask = int(np.nanmean(memory, 0).argmax()), int(np.nanmean(mask, 0).argmax())
+    print(f"   pooled {label:<22} sam {np.nanmean(baseline):.4f}   "
+          f"memory {np.nanmean(memory[:, best_memory]):.4f} (thr {thresholds[best_memory]:g})   "
+          f"mask {np.nanmean(mask[:, best_mask]):.4f} (thr {thresholds[best_mask]:g})")
+
 
 print(f"\nn={len(sam)} clips total")
-print(f"   pooled {METRIC}  sam {np.nanmean(sam):.4f}   "
-      f"memory {np.nanmean(memory[:, MEMORY_THRESHOLD]):.4f} (thr {thresholds[MEMORY_THRESHOLD]:g})   "
-      f"mask {np.nanmean(mask[:, MASK_THRESHOLD]):.4f} (thr {thresholds[MASK_THRESHOLD]:g})")
+pooled(METRIC, ARMS)
+pooled("coverage + hygiene", HYGIENE)

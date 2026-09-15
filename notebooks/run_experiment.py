@@ -30,13 +30,30 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+from sklearn.model_selection import train_test_split
+
 from src.utils.compute_iou import compute_iou
-from offline_training import build_trajectory_split
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["HYDRA_FULL_ERROR"] = "1"
+
+TEST_SIZE = 0.25           # single held-out split; the calibrator's own training is cross-validated instead
+
+
+def build_trajectory_split(dataset_path, test_size=TEST_SIZE, random_seed=42):
+    """List the trajectories in the dataset and split them into train and test sets.
+    The split is by trajectory and seeded so it stays the same across runs.
+
+    Lives here rather than in offline_training because that script cross-validates instead of holding out
+    one split; this is the per-tracker evaluation split the experiment sweep runs on."""
+
+    trajectory_paths = np.array([str(Path(dataset_path) / filename) for filename in sorted(os.listdir(dataset_path))])
+    indices = np.arange(len(trajectory_paths))
+    train_indices, test_indices = train_test_split(
+        indices, test_size=test_size, random_state=random_seed, shuffle=True)
+    return trajectory_paths, train_indices, test_indices
 
 
 def select_tracker_yamls(config, trackers_directory):
@@ -75,7 +92,7 @@ def resolve_split(tracker_config, config):
         split_dataset_path = config.dataset_path
 
     trajectory_paths, train_indices, test_indices = build_trajectory_split(
-        dataset_path=split_dataset_path, test_size=config.train_test_split)
+        dataset_path=split_dataset_path, test_size=config.get("train_test_split", TEST_SIZE))
     print(f"  split source: {split_dataset_path}  -> {len(test_indices)}/{len(trajectory_paths)} test trajectories")
     return trainer_config, trajectory_paths, train_indices, test_indices
 
@@ -91,7 +108,7 @@ def train_calibrator(trainer_config, config, trajectory_paths, train_indices, te
         if n_train > available_train:
             raise ValueError(
                 f"train_fraction={train_fraction} requires {n_train} train trajectories but only "
-                f"{available_train} are available with train_test_split={config.train_test_split}")
+                f"{available_train} are available with the {TEST_SIZE} test split")
         shuffled = np.random.RandomState(seed=43).permutation(train_indices)
         train_indices = np.sort(shuffled[:n_train])
         print(f"  train_fraction={train_fraction}: using {n_train}/{available_train} train trajectories")

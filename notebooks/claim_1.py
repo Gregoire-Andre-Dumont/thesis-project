@@ -45,8 +45,7 @@ def test_trajectories(person_path, n_traj, random_seed=42, base=BASE_DRAW):
         person_path.selected_anchor_overlaps.tolist())]
 
     n_test = min(n_traj, len(triples))
-    _, first = train_test_split(np.arange(len(triples)), test_size=min(base, len(triples)),
-                                random_state=random_seed, shuffle=True)
+    _, first = train_test_split(np.arange(len(triples)), test_size=min(base, len(triples)), random_state=random_seed, shuffle=True)
     if n_test <= len(first):
         return [triples[i] for i in first[:n_test]]
 

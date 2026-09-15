@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root
 from pe_reid_longrange import (test_trajectories, box_prompt_masks, chamfer_scores, distance, to_pixel,
                                clean_distractors, DEVICE, DTYPE)
 from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
-from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, _norm, HALF
+from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, _normalise_crops, HALF
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame
 from src.utils.load_bboxes import load_bboxes
 
@@ -86,7 +86,7 @@ def load_pe_timm(model_name, input_size):
 
     @torch.inference_mode()
     def encode(crops):
-        normalized = _norm(crops, input_size, HALF, HALF, DEVICE, DTYPE)
+        normalized = _normalise_crops(crops, input_size, HALF, HALF, DEVICE, DTYPE)
         intermediates = model.forward_intermediates(normalized, indices=layers, return_prefix_tokens=False,
                                                     norm=False, output_fmt="NLC", intermediates_only=True)
         return {layer: tokens.float() for layer, tokens in zip(layers, intermediates)}
@@ -109,7 +109,7 @@ def load_pe_sam3(sam3_config, input_size):
 
     @torch.inference_mode()
     def encode(crops):
-        normalized = _norm(crops, input_size, HALF, HALF, DEVICE, DTYPE)
+        normalized = _normalise_crops(crops, input_size, HALF, HALF, DEVICE, DTYPE)
         return layers_from_hidden_states(model(normalized, output_hidden_states=True).hidden_states)
     return encode
 
@@ -122,7 +122,7 @@ def load_hf_vision(model_class, model_name, input_size, mean, std):
 
     @torch.inference_mode()
     def encode(crops):
-        normalized = _norm(crops, input_size, mean, std, DEVICE, DTYPE)
+        normalized = _normalise_crops(crops, input_size, mean, std, DEVICE, DTYPE)
         return layers_from_hidden_states(model(normalized, interpolate_pos_encoding=True, output_hidden_states=True).hidden_states)
     return encode
 

@@ -12,12 +12,11 @@ class MaskOracle(MemoryOracle):
     IoU token. On occluded frames it falls back to the baseline selection, since there is nothing to verify
     against. The GT-verified commit gate is inherited unchanged."""
 
-    def choose(self, mask_preds, iou_scores, bboxes_norm, visible, truth=None):
-        if not visible:
-            return super().choose(mask_preds, iou_scores, bboxes_norm, visible, truth)
+    def choose(self, mask_preds, iou_scores, bboxes_norm, visible, truth=None, proposal_iou=None):
+        if not visible or proposal_iou is None:
+            return super().choose(mask_preds, iou_scores, bboxes_norm, visible, truth, proposal_iou)
 
-        candidates = (mask_preds[0, 1:] > 0.0).cpu().numpy()
-        return 1 + int(np.argmax(self.score(candidates, bboxes_norm, truth)))
+        return 1 + int(np.argmax(proposal_iou))
 
     def reported_mask(self, mask_preds, best_idx, chosen_mask):
         """Selection is this arm's intervention, so it is scored on exactly the mask it selected."""

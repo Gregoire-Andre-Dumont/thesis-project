@@ -23,7 +23,7 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src` and create_anchor_dataset
 
-from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, load_dataset_encoders, _norm, _patch_masks, HALF
+from src.offline_training.dataset_encoders import crop_around_masks, anchor_size_pixels, load_dataset_encoders, _normalise_crops, _patch_masks, HALF
 from src.offline_training.dataset_labels import load_clean_boxes_by_frame, _box_center as box_center
 from src.utils.load_bboxes import convert_bbox, load_bboxes
 from create_anchor_dataset import anchor_trajectory_index, slice_detection_data_for_tracker
@@ -71,7 +71,7 @@ def load_sam3_encoder(sam3_config, sam3_input):
 
     @torch.inference_mode()
     def tokens(crops):
-        output = model(_norm(crops, sam3_input, HALF, HALF, DEVICE, DTYPE))
+        output = model(_normalise_crops(crops, sam3_input, HALF, HALF, DEVICE, DTYPE))
         return (output.last_hidden_state if hasattr(output, "last_hidden_state") else output[0]).float()
     return tokens
 
@@ -84,7 +84,7 @@ def load_hf_vision(model_cls, name, size, mean, std):
 
     @torch.inference_mode()
     def tokens(crops):
-        hidden = model(_norm(crops, size, mean, std, DEVICE, DTYPE), interpolate_pos_encoding=True).last_hidden_state
+        hidden = model(_normalise_crops(crops, size, mean, std, DEVICE, DTYPE), interpolate_pos_encoding=True).last_hidden_state
         patches = hidden.shape[1]
         grid = round(patches ** 0.5)
         if grid * grid != patches:                          # drop the leading CLS token
