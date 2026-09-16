@@ -198,15 +198,17 @@ def to_pixel(box, width, height, scale):
     return cx * width * scale, cy * height * scale
 
 
-def clean_distractors(clean_boxes, n_distractors, min_norm_area, rng):
-    """Up to n_distractors clean people whose box is large enough (>= min_norm_area -- the same visible-area
-    floor the target satisfies), chosen at random rather than by proximity, so they are not biased toward
-    the target's local background."""
+def clean_distractors(clean_boxes, n_distractors, rng):
+    """Up to n_distractors clean people, chosen at random rather than by proximity so they are not biased
+    toward the target's local background.
 
-    pool = [box for box in clean_boxes if box[2] * box[3] >= min_norm_area]
-    if len(pool) <= n_distractors:
-        return pool
-    return [pool[i] for i in rng.choice(len(pool), size=n_distractors, replace=False)]
+    No size floor: every annotated person is eligible, however small. Filtering the small ones out would
+    hand the encoders a tidier problem than deployment gives them, where a confuser is whatever happens to
+    be in frame."""
+
+    if len(clean_boxes) <= n_distractors:
+        return list(clean_boxes)
+    return [clean_boxes[i] for i in rng.choice(len(clean_boxes), size=n_distractors, replace=False)]
 
 
 def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng):
@@ -244,10 +246,9 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng)
     height, width = frames[0].shape[:2]
     px_scale = 1024.0 / max(width, height)
     anchor_center = to_pixel(boxes[0], width, height, px_scale)
-    min_norm_area = config.person_path.min_visible_area / (width * height * px_scale ** 2)   # target's visible-area floor, in normalized area
 
     for t in range(1, len(frames), config.stride):
-        distractors = clean_distractors(clean_boxes.get(int(frame_indices[t]), []), config.n_distractors, min_norm_area, rng)
+        distractors = clean_distractors(clean_boxes.get(int(frame_indices[t]), []), config.n_distractors, rng)
         if occlusions[t] > 0.5 or float(boxes[t][2]) <= 0 or not distractors:
             continue
 
@@ -266,8 +267,8 @@ def evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng)
 
 
 def auc(samples):
-    """AUC separating target (label 1) from distractor (label 0) over samples (candidate_distance, label, score).
-    NaN if empty or single-class."""
+    """AUC separating target (label 1) from distractor (label 0) over samples
+    (candidate_distance, label, score, trajectory_key). NaN if empty or single-class."""
 
     if not samples:
         return float("nan")
@@ -326,8 +327,8 @@ def run_reid(config: DictConfig):
         for name, dists, bi_scores, uni_scores in evaluate_trajectory(sam, backbones, detection_data, trajectory, config, rng):
             for index, (candidate_distance, bi, uni) in enumerate(zip(dists, bi_scores, uni_scores)):
                 label = 1 if index == 0 else 0               # index 0 is the target, the rest are distractors
-                this_traj[name].append((candidate_distance, label, bi))
-                results_uni[name].append((candidate_distance, label, uni))
+                this_traj[name].append((candidate_distance, label, bi, key))
+                results_uni[name].append((candidate_distance, label, uni, key))
         for name, samples in this_traj.items():
             results_bi[name].extend(samples)
         per_traj[key] = {name: auc(samples) for name, samples in this_traj.items()}

@@ -34,6 +34,9 @@ from omegaconf import DictConfig
 from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src`
+
 from src.utils.compute_iou import compute_iou
 from src.metrics import coverage_auc
 
@@ -44,7 +47,6 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 
 MARGIN = 0.2               # a frame counts only when the best and second-best proposal differ by this much
 METRICS = ("agree", "regret", "picked", "R2", "R2 in")
-PREDICTIONS = Path("data/calibrator_cv_predictions.pkl")
 
 
 # ---------------------------------------------------------------------------------------
@@ -195,7 +197,7 @@ def deployed_coverage(config, model, held_out):
 # cross-validation
 # ---------------------------------------------------------------------------------------
 
-@hydra.main(config_path="conf", config_name="offline_training", version_base=None)
+@hydra.main(config_path="../conf", config_name="experiments/claim_4", version_base=None)
 def train_models(config: DictConfig):
     """Cross-validate the calibrator and report ranking quality at every corruption level."""
 
@@ -245,10 +247,11 @@ def train_models(config: DictConfig):
             coverage = deployed_coverage(config, trainer.model, held_out)
             print(f"      deployed coverage AUC: {coverage:.4f}", flush=True)
 
-    PREDICTIONS.parent.mkdir(parents=True, exist_ok=True)
-    PREDICTIONS.write_bytes(pickle.dumps(predictions))
+    destination = Path(config.predictions)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(pickle.dumps(predictions))
     summarise(rows, levels, trained_on, folds)
-    print(f"held-out predictions saved to {PREDICTIONS}")
+    print(f"held-out predictions saved to {destination}")
 
 
 if __name__ == "__main__":

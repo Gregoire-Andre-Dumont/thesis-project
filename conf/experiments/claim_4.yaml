@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - /offline_trainers: cnn_fixed_samara
+  - /trackers@tracker: baselines/memory_oracle
+
+detection_data:
+  _target_: src.typing.detection_data.DetectionData
+  amodal_directory: data/person_path/amodal
+  visible_directory: data/person_path/visible
+  video_directory: data/person_path/videos
+  load_frames: True
+  num_threads: 32
+
+# calibration parameters
+predictions: data/claim_4/predictions.pkl   # override per training mix, so runs do not overwrite each other
+folds: 5
+deploy_controller: False   # running the calibrator inside the tracker costs a full rollout per fold
+commit_threshold: 0.4

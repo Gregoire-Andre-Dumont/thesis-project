@@ -39,6 +39,12 @@ class MainDataset(Dataset):
     dataset_path: str | None = None
     probabilities: list[float] = field(default_factory=lambda: [0.0])
 
+    # Keep frames where the target is OCCLUDED, labelled 0. At deployment the calibrator scores every frame,
+    # occluded ones included, so excluding them trains it on a distribution it will not meet and leaves its
+    # score undefined exactly where a commit poisons the bank. The label is right, not a degenerate zero: the
+    # target is absent, so every proposal really is wrong and the gate should refuse.
+    include_occluded: bool = False
+
     _features: torch.Tensor | None = None     # (samples, 1, grid, grid, channels) float32
     _labels: torch.Tensor | None = None       # (samples,) float32, the proposal's true mask IoU
 
@@ -60,25 +66,28 @@ class MainDataset(Dataset):
         listings = [{Path(name).stem for name in os.listdir(folder)} for folder in self.folders()]
         return sorted(set.intersection(*listings)) if listings else []
 
-    @staticmethod
-    def labelled(experiment):
-        """Frames carrying a real label: target visible, with an annotated box.
+    def labelled(self, experiment):
+        """Frames carrying a real label.
 
-        Occluded and unannotated frames are excluded because the labelling pass never scores them -- their
-        IoU is zero by construction, and training on it would teach that a good mask deserves nothing."""
+        A VISIBLE frame with an annotated box is labelled with its true IoU. An OCCLUDED frame is labelled 0
+        -- correct, since the target is absent -- and is kept only when `include_occluded` is set.
+
+        An UNANNOTATED frame is excluded either way: no box and not marked occluded means the target may
+        well be there and simply was not labelled, so its zero would teach that a good mask deserves
+        nothing. Those annotation gaps are a fifth of this dataset's apparent occlusions."""
 
         occlusions = np.asarray(experiment.occlusions, float)
         has_box = np.asarray(experiment.true_bboxes)[:, 2] > 0
-        return (occlusions < 0.5) & has_box
+        visible = (occlusions < 0.5) & has_box
+        return visible | (occlusions > 0.5) if self.include_occluded else visible
 
-    @staticmethod
-    def scorable(experiment):
+    def scorable(self, experiment):
         """The evaluation subset: labelled frames from the first occlusion on, minus the anchor.
 
         Narrower than what the model trains on. The anchor is the reference every similarity map is measured
         against, so its crop scores a perfect match; and post-occlusion is the regime the claim is about."""
 
-        keep = MainDataset.labelled(experiment).copy()
+        keep = self.labelled(experiment).copy()
         occlusions = np.asarray(experiment.occlusions, float)
         occluded = occlusions > 0.5
         first_occlusion = int(np.argmax(occluded)) if occluded.any() else len(occlusions)

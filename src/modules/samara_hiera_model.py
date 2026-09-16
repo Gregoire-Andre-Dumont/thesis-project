@@ -35,6 +35,10 @@ class SamaraHieraModel(SAMV2Model):
             memory_fusion_model=sam_model.memory_fusion)
 
         self.controller = controller
+        # Optional SECOND model owning the commit gate, trained on the binary 'worth committing' target.
+        # None -> the gate reads the selector's own gate column (a composite head), or its predicted IoU
+        # when the selector has only one output.
+        self.gate_controller = None
         self.crop_resize = crop_resize
         self.pad_ratio = pad_ratio
         self.token_source = token_source
@@ -69,7 +73,7 @@ class SamaraHieraModel(SAMV2Model):
 
     def _score_masks(self, current_frame, candidate_masks_raw, reference_foreground, reference_background):
         """Crop each candidate mask and build its anchor-similarity features.
-        Returns the calibrator's IoU predictions plus the tokens and features."""
+        Returns ((predicted IoU, commit probability), foreground, background, features)."""
 
         candidate_masks = candidate_masks_raw.to(torch.float64).cpu().numpy()   # keep logits; extract_crops thresholds
         frames = np.repeat(np.asarray(current_frame)[None], len(candidate_masks), axis=0)
@@ -86,21 +90,46 @@ class SamaraHieraModel(SAMV2Model):
         return self._run_controller(features), foreground, background, features
 
     def _run_controller(self, features):
-        """Run the calibrator on the features and return per-mask IoU probabilities.
+        """(predicted IoU, commit probability) per mask, each (n_masks,).
+
+        The IoU is column 0 of the selector, a REGRESSED value returned as-is; squashing it through a sigmoid
+        would push every value into [0.5, 0.731] and silently disable any gate thresholded on it.
+
+        The commit probability comes from the first of these that exists: a separate `gate_controller`
+        trained only on the binary target, the selector's own gate column (a composite head), or -- with a
+        plain single-output regressor -- the predicted IoU itself.
+
         Autocast is disabled so a bf16 context can't corrupt the float32 calibrator."""
 
         with torch.autocast("cuda", enabled=False):
-            logits = self.controller(features.float())
-        return torch.sigmoid(logits)[:, 0].cpu().numpy()
+            outputs = self.controller(features.float())
+            gate_logits = self.gate_controller(features.float()) if self.gate_controller is not None else None
+
+        predicted_iou = outputs[:, 0].clamp(0.0, 1.0).cpu().numpy()
+        if gate_logits is not None:
+            return predicted_iou, torch.sigmoid(gate_logits[:, 0]).cpu().numpy()
+        if outputs.shape[1] < 2:
+            return predicted_iou, predicted_iou
+        return predicted_iou, torch.sigmoid(outputs[:, 1]).cpu().numpy()
+
+    @torch.inference_mode()
+    def score_proposals(self, current_frame, candidate_masks, reference_foreground, reference_background):
+        """Per candidate mask: (predicted IoU for RANKING, commit probability for the GATE), each (n_masks,).
+
+        Both come from one forward pass over the same similarity features -- the two heads disagree on what
+        they optimise, not on what they see."""
+
+        (scores, commit_probabilities), _, _, _ = self._score_masks(
+            current_frame, candidate_masks, reference_foreground, reference_background)
+        return scores, commit_probabilities
 
     @torch.inference_mode()
     def select_best_mask_gated(self, current_frame, main_memory, reference_foreground, reference_background):
         """Pick SAM 2's highest-IoU candidate and score it with the calibrator for the
         memory-commit gate. Selection is plain SAM argmax, with no SAMARA re-ranking."""
 
-        chosen_mask, chosen_pointer, chosen_encoding, object_score, iou_score, _, _, _ = self.select_best_mask(
-            current_frame, main_memory)
-        samara_ious, foreground, background, calibrator_features = self._score_masks(
+        chosen_mask, chosen_pointer, chosen_encoding, object_score, iou_score, _, _, _ = self.select_best_mask(current_frame, main_memory)
+        (samara_ious, commit_probabilities), foreground, background, calibrator_features = self._score_masks(
             current_frame, chosen_mask[None], reference_foreground, reference_background)
 
         return {
@@ -109,6 +138,7 @@ class SamaraHieraModel(SAMV2Model):
             "encoding": chosen_encoding,
             "iou_score": float(iou_score),
             "samara_iou": float(samara_ious[0]),
+            "commit_probability": float(commit_probabilities[0]),
             "object_score": float(object_score),
             "target_foreground": foreground[0],
             "target_background": background[0],
