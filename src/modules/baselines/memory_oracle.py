@@ -4,7 +4,7 @@ import torch
 from dataclasses import dataclass
 from src.typing.detection_data import DetectionData
 from src.modules.memories.main_memory import MainMemory
-from src.modules.samara_hiera_model import SamaraHieraModel
+from src.modules.samara_model import SamaraModel
 from src.utils.compute_iou import compute_iou
 from src.utils.load_bboxes import convert_bbox
 
@@ -23,7 +23,7 @@ class MemoryOracle:
     Subclasses may override `choose` to change which proposal is kept (see MaskOracle)."""
 
     iou_threshold: float | None = None
-    model: SamaraHieraModel | None = None
+    model: SamaraModel | None = None
     main_memory: MainMemory | None = None
     use_mask_iou: bool = True          # score against a box-prompted pseudo-GT MASK, not the GT box
 

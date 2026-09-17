@@ -1,10 +1,10 @@
 tracker:
   _target_: src.modules.samara_controller.SamaraController
-  commit_threshold: 0.5   
-  select: True    
-  gate: True      
+  commit_threshold: 0.5   # a PROBABILITY from the gate head, so 0.5 is the natural boundary
+  select: False           # SAM's IoU token picks the mask -- every measured selection arm lost to gate-only
+  gate: True              # the calibrator's commit decision, the intervention being measured
   model:
-    _target_: src.modules.samara_hiera_model.SamaraHieraModel
+    _target_: src.modules.samara_model.SamaraModel
     sam_model_path: tm/sam_large.pt
     crop_resize: 448
     pad_ratio: 0.25

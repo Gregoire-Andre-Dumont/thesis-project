@@ -1,9 +1,9 @@
-"""Train the calibrator with 5-fold cross-validation and judge it on the decision it exists to make:
+"""claim_4: train the calibrator with cross-validation and judge it on the decision it exists to make --
 ranking the three proposals SAM emits each frame.
 
 The objective is regression on a proposal's true mask IoU. A classifier answers "is this mask above
-threshold", which is the commit-gate question; ranking needs an ordering, and on the frames where the choice
-matters all three proposals usually sit on the same side of any fixed threshold.
+threshold", which is the commit-gate question; ranking needs an ordering, and on the frames where the
+choice matters all three proposals usually sit on the same side of any fixed threshold.
 
 Folds are split by TRAJECTORY. A trajectory appears once per corruption folder as a near-identical rollout
 of the same clip, and `MainDataset` pulls those together from one index, so the copies cannot land on
@@ -12,8 +12,8 @@ camera and background, and often appear as each other's distractors, so these sc
 relative to a new-scene deployment. Each fold reports how many of its test videos were also trained on.
 
 The held-out fold doubles as epochalyst's validation set, so early stopping reads the trajectories the fold
-is scored on. Across five folds every trajectory is held out exactly once, so nothing is permanently
-unseen -- the cost is that the stopping epoch is chosen on the fold being reported.
+is scored on. Across the folds every trajectory is held out exactly once, so nothing is permanently unseen
+-- the cost is that the stopping epoch is chosen on the fold being reported.
 
 Training uses every LABELLED frame (visible, annotated), pre-occlusion ones included. Evaluation stays on
 the narrower post-occlusion set, excluding the anchor frame the similarity maps are measured against.
@@ -23,6 +23,7 @@ absent from that list are pure extrapolation.
 import logging
 import os
 import pickle
+import sys
 import warnings
 from copy import deepcopy
 from pathlib import Path
@@ -34,7 +35,6 @@ from omegaconf import DictConfig
 from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 
-import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src`
 
 from src.utils.compute_iou import compute_iou
@@ -46,46 +46,71 @@ warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["HYDRA_FULL_ERROR"] = "1"
 
 MARGIN = 0.2               # a frame counts only when the best and second-best proposal differ by this much
-METRICS = ("agree", "regret", "picked", "R2", "R2 in")
+METRIC_NAMES = ("agree", "regret", "picked", "R2", "R2 in")
 
 
 # ---------------------------------------------------------------------------------------
 # scoring the held-out trajectories
 # ---------------------------------------------------------------------------------------
 
-def calibrator_scores(model, similarity_maps, batch=256):
+def calibrator_scores(model, similarity_maps, batch_size=256):
     """The calibrator's score for every proposal: (frames, proposals) from the frame's similarity maps."""
 
-    proposals = similarity_maps.shape[1]
-    features = torch.from_numpy(similarity_maps.reshape(-1, 1, *similarity_maps.shape[2:]))
+    n_proposals = similarity_maps.shape[1]
+    per_proposal = similarity_maps.reshape(-1, 1, *similarity_maps.shape[2:])
+    features = torch.from_numpy(per_proposal)
     device = next(model.parameters()).device
-    starts = range(0, len(features), batch)
 
+    chunks = []
     with torch.no_grad():
-        chunks = [model(features[start:start + batch].to(device)).reshape(-1) for start in starts]
-    return torch.cat(chunks).cpu().numpy().reshape(-1, proposals)
+        for start in range(0, len(features), batch_size):
+            batch = features[start:start + batch_size].to(device)
+            chunks.append(model(batch).reshape(-1))
+
+    scores = torch.cat(chunks).cpu().numpy()
+    return scores.reshape(-1, n_proposals)
 
 
 def held_out_scores(model, dataset, stems):
     """(calibrator, token, truth), each (frames, proposals), pooled over the given trajectories."""
 
     model.eval()
-    calibrator, token, truth = [], [], []
+    folder = dataset.folders()[0]
+
+    calibrator_columns = []
+    token_columns = []
+    truth_columns = []
+
     for stem in stems:
-        experiment = pickle.load(open(dataset.folders()[0] / f"{stem}.pkl", "rb"))
+        experiment = pickle.load(open(folder / f"{stem}.pkl", "rb"))
         keep = dataset.scorable(experiment)
         if not keep.any():
             continue
+
         similarity_maps = np.asarray(experiment.features, np.float32)[keep]
-        calibrator.append(calibrator_scores(model, similarity_maps))
-        token.append(np.asarray(experiment.proposal_iou_scores, np.float32)[keep])
-        truth.append(np.asarray(experiment.iou_scores, np.float32)[keep])
-    return np.concatenate(calibrator), np.concatenate(token), np.concatenate(truth)
+        calibrator_columns.append(calibrator_scores(model, similarity_maps))
+        token_columns.append(np.asarray(experiment.proposal_iou_scores, np.float32)[keep])
+        truth_columns.append(np.asarray(experiment.iou_scores, np.float32)[keep])
+
+    calibrator = np.concatenate(calibrator_columns)
+    token = np.concatenate(token_columns)
+    truth = np.concatenate(truth_columns)
+    return calibrator, token, truth
 
 
 # ---------------------------------------------------------------------------------------
 # ranking: does the calibrator order the three proposals better than SAM's own IoU token?
 # ---------------------------------------------------------------------------------------
+
+def explained_variance(observed, estimated):
+    """1 - residual/total, or NaN when the observations carry no variance to explain."""
+
+    residual = float(((observed - estimated) ** 2).sum())
+    total = float(((observed - observed.mean()) ** 2).sum())
+    if total <= 0:
+        return np.nan
+    return 1.0 - residual / total
+
 
 def r_squared(truth, predicted):
     """Pooled and WITHIN-FRAME R^2 against the true IoU.
@@ -96,14 +121,12 @@ def r_squared(truth, predicted):
     two can disagree sharply: a score can track frame difficulty beautifully and still be useless at
     ordering the three masks inside a frame."""
 
-    def fit(observed, estimated):
-        residual = float(((observed - estimated) ** 2).sum())
-        total = float(((observed - observed.mean()) ** 2).sum())
-        return 1.0 - residual / total if total > 0 else np.nan
+    pooled = explained_variance(truth.reshape(-1), predicted.reshape(-1))
 
     centred_truth = (truth - truth.mean(1, keepdims=True)).reshape(-1)
     centred_predicted = (predicted - predicted.mean(1, keepdims=True)).reshape(-1)
-    return fit(truth.reshape(-1), predicted.reshape(-1)), fit(centred_truth, centred_predicted)
+    within_frame = explained_variance(centred_truth, centred_predicted)
+    return pooled, within_frame
 
 
 def ranking(predicted, truth):
@@ -113,18 +136,28 @@ def ranking(predicted, truth):
     restricting it to frames picked out by the label would condition it on the label."""
 
     pooled, within_frame = r_squared(truth, predicted)
-    ordered = np.sort(truth, axis=1)[:, ::-1]
-    matters = (ordered[:, 0] - ordered[:, 1]) >= MARGIN
+
+    descending = np.sort(truth, axis=1)[:, ::-1]
+    margin = descending[:, 0] - descending[:, 1]
+    matters = margin >= MARGIN
 
     picked = predicted.argmax(1)
-    got = truth[np.arange(len(truth)), picked]
-    return {"agree": float((picked[matters] == truth.argmax(1)[matters]).mean()),
-            "regret": float((truth.max(1) - got)[matters].mean()),
-            "picked": float(got[matters].mean()),
-            "R2": pooled,
-            "R2 in": within_frame,
-            "n": int(matters.sum())}
+    best = truth.argmax(1)
+    picked_iou = truth[np.arange(len(truth)), picked]
 
+    return {
+        "agree": float((picked[matters] == best[matters]).mean()),
+        "regret": float((truth.max(1) - picked_iou)[matters].mean()),
+        "picked": float(picked_iou[matters].mean()),
+        "R2": pooled,
+        "R2 in": within_frame,
+        "n": int(matters.sum()),
+    }
+
+
+# ---------------------------------------------------------------------------------------
+# reporting
+# ---------------------------------------------------------------------------------------
 
 def fold_mean(rows):
     """Mean of each metric across folds."""
@@ -135,26 +168,41 @@ def fold_mean(rows):
 def format_metrics(metrics):
     """One score's half of a summary row."""
 
-    return f"{metrics['agree']:>9.1%}{metrics['regret']:>9.3f}{metrics['picked']:>9.3f}{metrics['R2']:>8.3f}{metrics['R2 in']:>8.3f}"
+    agree = f"{metrics['agree']:>9.1%}"
+    regret = f"{metrics['regret']:>9.3f}"
+    picked = f"{metrics['picked']:>9.3f}"
+    pooled = f"{metrics['R2']:>8.3f}"
+    within_frame = f"{metrics['R2 in']:>8.3f}"
+    return agree + regret + picked + pooled + within_frame
 
 
 def summarise(rows, levels, trained_on, folds):
     """Fold-mean table, calibrator against SAM's IoU token, one row per corruption level."""
 
     heading = f"{'agree':>9}{'regret':>9}{'picked':>9}{'R2':>8}{'R2 in':>8}"
-    print(f"\n{'':7}{'calibrator (MSE, 5-fold)':>42}{'SAM IoU token':>42}")
+    print(f"\n{'':7}{'calibrator (MSE, cross-validated)':>42}{'SAM IoU token':>42}")
     print(f"{'p':7}{heading}{heading}   trained")
 
     for level in levels:
         if not rows[level]:
             continue
+
         calibrator = fold_mean([calibrator for calibrator, _ in rows[level]])
         token = fold_mean([token for _, token in rows[level]])
         seen = "yes" if level in trained_on else "NO (extrapolation)"
         print(f"p{level:<6.2f}{format_metrics(calibrator)}{format_metrics(token)}   {seen}")
 
-    print(f"\nfold means over {folds} trajectory-grouped folds; agree/regret/picked on frames with margin >= {MARGIN:g} (chance 33.3%)")
+    print(f"\nfold means over {folds} trajectory-grouped folds; agree/regret/picked on frames with "
+          f"margin >= {MARGIN:g} (chance 33.3%)")
     print("R2 = pooled, 'R2 in' = within-frame, both over all held-out frames")
+
+
+def report_fold(level, calibrator, token):
+    """One line per corruption level inside a fold."""
+
+    cnn = (f"cnn {calibrator['agree']:.1%} regret {calibrator['regret']:.3f} " f"R2 {calibrator['R2']:.3f}/{calibrator['R2 in']:.3f}")
+    sam = (f"sam {token['agree']:.1%} regret {token['regret']:.3f} " f"R2 {token['R2']:.3f}/{token['R2 in']:.3f}")
+    print(f"      p{level:.2f}: {cnn}   {sam}   n={calibrator['n']}", flush=True)
 
 
 # ---------------------------------------------------------------------------------------
@@ -166,6 +214,7 @@ def stream_metrics(tracker, trajectories, detection_data):
 
     coverages = []
     progress = tqdm(trajectories, desc="Coverage")
+
     for stem in progress:
         video_name, person_id = stem.rsplit("_", 1)
         detection_data.initialize_target(video_name, int(person_id))
@@ -176,7 +225,10 @@ def stream_metrics(tracker, trajectories, detection_data):
         coverage = coverage_auc(iou_scores, detection_data.occlusions)
         if not np.isnan(coverage):
             coverages.append(coverage)
-        progress.set_postfix(avg_coverage_auc=(np.mean(coverages) if coverages else float("nan")))
+
+        running_mean = np.mean(coverages) if coverages else float("nan")
+        progress.set_postfix(avg_coverage_auc=running_mean)
+
     return float(np.mean(coverages)) if coverages else float("nan")
 
 
@@ -190,12 +242,32 @@ def deployed_coverage(config, model, held_out):
     if host is not None and hasattr(host, "controller"):
         host.controller = model
         host.eval()
+
     return stream_metrics(tracker, held_out, detection_data)
 
 
 # ---------------------------------------------------------------------------------------
 # cross-validation
 # ---------------------------------------------------------------------------------------
+
+def corruption_levels(dataset_path):
+    """Every corruption level on disk, read off the `pXX` folder names."""
+
+    folders = [folder for folder in Path(dataset_path).iterdir() if folder.is_dir()]
+    return sorted(float(folder.name[1:]) for folder in folders)
+
+
+def score_level(trainer, level, held_out):
+    """The calibrator and SAM's token, both ranked against the truth, at one corruption level."""
+
+    dataset = deepcopy(trainer.dataset)
+    dataset.probabilities = [level]
+
+    calibrator_score, token_score, truth = held_out_scores(trainer.model, dataset, held_out)
+    calibrator = ranking(calibrator_score, truth)
+    token = ranking(token_score, truth)
+    return calibrator, token, calibrator_score, token_score, truth
+
 
 @hydra.main(config_path="../conf", config_name="experiments/claim_4", version_base=None)
 def train_models(config: DictConfig):
@@ -206,8 +278,7 @@ def train_models(config: DictConfig):
     stems = np.array(template.dataset.trajectories())
     videos = [stem.rsplit("_", 1)[0] for stem in stems]
 
-    folders = [folder for folder in Path(template.dataset.dataset_path).iterdir() if folder.is_dir()]
-    levels = sorted(float(folder.name[1:]) for folder in folders)
+    levels = corruption_levels(template.dataset.dataset_path)
     trained_on = [float(probability) for probability in template.dataset.probabilities]
 
     print(f"{len(stems)} trajectories over {len(set(videos))} videos")
@@ -217,31 +288,23 @@ def train_models(config: DictConfig):
     predictions = {level: [] for level in levels}
     splits = GroupKFold(n_splits=folds).split(stems, groups=stems)
 
-    for fold, (train_index, test_index) in enumerate(splits):
-        test_videos = {videos[index] for index in test_index}
-        seen_videos = {videos[index] for index in train_index}
+    for fold, (train_indices, test_indices) in enumerate(splits):
+        test_videos = {videos[index] for index in test_indices}
+        seen_videos = {videos[index] for index in train_indices}
         overlap = f"{len(test_videos & seen_videos)}/{len(test_videos)} test videos also trained on"
-        print(f"fold {fold + 1}/{folds}: {len(train_index)} train / {len(test_index)} held-out ({overlap})", flush=True)
-
+        print(f"fold {fold + 1}/{folds}: {len(train_indices)} train / {len(test_indices)} held-out "
+              f"({overlap})", flush=True)
 
         trainer = hydra.utils.instantiate(config.offline_trainers.main_trainer)
-        trainer.custom_train(x=stems, y=stems, train_indices=list(train_index), validation_indices=list(test_index), fold=fold)
-        held_out = stems[test_index]
+        trainer.custom_train(x=stems, y=stems, train_indices=list(train_indices), validation_indices=list(test_indices), fold=fold)
+        held_out = stems[test_indices]
 
         for level in levels:
-            dataset = deepcopy(trainer.dataset)
-            dataset.probabilities = [level]
-            calibrator_score, token_score, truth = held_out_scores(trainer.model, dataset, held_out)
-            calibrator, token = ranking(calibrator_score, truth), ranking(token_score, truth)
+            calibrator, token, calibrator_score, token_score, truth = score_level(trainer, level, held_out)
+            predictions[level].append({"fold": fold, "trajectories": list(held_out), "truth": truth, "cnn": calibrator_score, "sam": token_score})
 
             rows[level].append((calibrator, token))
-            fold_predictions = {"fold": fold, "trajectories": list(held_out), "truth": truth,
-                                "cnn": calibrator_score, "sam": token_score}
-            predictions[level].append(fold_predictions)
-
-            report = f"cnn {calibrator['agree']:.1%} regret {calibrator['regret']:.3f} R2 {calibrator['R2']:.3f}/{calibrator['R2 in']:.3f}"
-            against = f"sam {token['agree']:.1%} regret {token['regret']:.3f} R2 {token['R2']:.3f}/{token['R2 in']:.3f}"
-            print(f"      p{level:.2f}: {report}   {against}   n={calibrator['n']}", flush=True)
+            report_fold(level, calibrator, token)
 
         if config.deploy_controller:
             coverage = deployed_coverage(config, trainer.model, held_out)
@@ -250,6 +313,7 @@ def train_models(config: DictConfig):
     destination = Path(config.predictions)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(pickle.dumps(predictions))
+
     summarise(rows, levels, trained_on, folds)
     print(f"held-out predictions saved to {destination}")
 

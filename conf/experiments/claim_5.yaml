@@ -1,7 +1,7 @@
 # @package _global_
 defaults:
-  - /offline_trainers: cnn_fixed_samara
-  - /offline_trainers@gate_trainers: cnn_gate_samara
+  - /offline_trainers: cnn_selector_samara          # the SELECTOR: MSE on true IoU
+  - /offline_trainers@gate_trainers: cnn_gate_samara   # the GATE: BCE on 'worth committing'
   - /trackers@tracker: samara_controller
 
 detection_data:
@@ -11,6 +11,7 @@ detection_data:
   video_directory: data/person_path/videos
   load_frames: True
   num_threads: 32
+
 
 person_path:
   _target_: src.typing.person_path.PersonPath
@@ -26,10 +27,8 @@ person_path:
   max_distractor_overlap: 0.6
   non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person, sitting_person, person_on_open_vehicle]
 
-# deployment parameters
-n_traj: 60          # clips to deploy on; these trajectories are removed from calibrator training
+# experiment parameters
+n_traj: 400
+folds: 4         
 max_frames: 300
-coverage_threshold: 0.5   # box IoU a visible post-occlusion frame must clear to count, as in claim_1/claim_2
-out_dir: data/samara_deploy
-baseline_config: conf/trackers/baselines/sam_baseline.yaml   # the same SAM arm claim_1 and claim_2 score
-separate_gate: False      # True trains `gate_trainers` as a second model owning the commit gate
+out_dir: data/claim_5

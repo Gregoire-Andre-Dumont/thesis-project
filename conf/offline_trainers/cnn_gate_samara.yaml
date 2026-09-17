@@ -6,7 +6,7 @@ main_trainer:
     n_channels: 64
     cnn_dim: 64
     mlp_hidden: 128
-    dropout: 0.05
+    dropout: 0.1
     channel: both
     n_outputs: 1
   criterion:
@@ -15,7 +15,7 @@ main_trainer:
   dataset:
     _target_: src.offline_training.main_dataset.MainDataset
     dataset_path: data/mask_oracle
-    probabilities: [0.0]
+    probabilities: [0.0, 0.1]
     include_occluded: True  
   collate_fn:
     _target_: hydra.utils.get_method
@@ -28,7 +28,7 @@ main_trainer:
     lr: 0.00001
   epochs: 8
   batch_size: 256
-  patience: 2               # the gate's validation loss turns earlier than the regressor's
+  patience: 3
   n_folds: 5
   checkpointing_resume_if_exists: False
   dataloader_args:

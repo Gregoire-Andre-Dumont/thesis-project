@@ -7,7 +7,7 @@ tracker:
   crop_size: 448              # pe_spatial_LARGE is a 448 / patch14 model -> 32x32 tokens (base is 512/patch16)
   pad_ratio: 0.2              # same crop padding every PE experiment in this repo uses
   model:
-    _target_: src.modules.samara_hiera_model.SamaraHieraModel
+    _target_: src.modules.samara_model.SamaraModel
     sam_model_path: tm/sam_large.pt
     crop_resize: 384
     pad_ratio: 1.0

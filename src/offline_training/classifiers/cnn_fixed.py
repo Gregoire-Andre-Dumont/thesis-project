@@ -67,11 +67,10 @@ def _build_head(cnn_dim, mlp_hidden, dropout, n_outputs=1):
 class CNNFixed(nn.Module):
     """CNN + MLP over the fixed anchor's similarity map.
 
-    With `n_outputs=2` the head emits both decisions the controller makes from one trunk: column 0 is the
-    predicted IoU that RANKS the three proposals, column 1 a raw logit for the binary 'commit this to
-    memory' GATE. They need different objectives -- ranking wants an ordering, gating wants a calibrated
-    decision boundary -- which is what `CompositeIouLoss` supplies, but they read the same features, so
-    training one trunk for both is cheaper and keeps the two heads consistent with each other."""
+    One output, one objective. The controller's two decisions get a model each, because they are different
+    questions: SELECTION wants an ordering over the three proposals (`MSEIouLoss` on true IoU), GATING wants
+    a calibrated yes/no on one mask (`BCEIouLoss` on IoU > threshold). They read the same features but
+    overfit at different rates, so sharing a trunk would force them to stop training together."""
 
     def __init__(self, n_channels=48, cnn_dim=256, mlp_hidden=256, dropout=0.2, channel="both", n_outputs=1):
         super().__init__()

@@ -1,23 +1,24 @@
+# The SELECTOR: ranks the three proposals, so it regresses the IoU and nothing else.
+# The commit gate is a separate model with its own objective -- see cnn_gate_samara.yaml.
 main_trainer:
   _target_: src.offline_training.main_trainer.MainTrainer
-  model_name: cnn_fixed_samara
+  model_name: cnn_selector_samara
   model:
     _target_: src.offline_training.classifiers.cnn_fixed.CNNFixed
-    n_channels: 128
-    cnn_dim: 128
-    mlp_hidden: 256
-    dropout: 0.05
+    n_channels: 64
+    cnn_dim: 64
+    mlp_hidden: 128
+    dropout: 0.1
     channel: both
-    n_outputs: 2             # column 0 the IoU that ranks, column 1 the logit that gates
+    n_outputs: 1
   criterion:
-    _target_: src.offline_training.losses.composite_iou.CompositeIouLoss
-    threshold: 0.2           # a proposal is worth committing when its true mask IoU clears this
-    gate_weight: 1.0
+    _target_: src.offline_training.losses.mse_iou.MSEIouLoss
   dataset:
     _target_: src.offline_training.main_dataset.MainDataset
     dataset_path: data/mask_oracle
-    probabilities: [0.0, 0.15]
-    include_occluded: True     # the calibrator scores every frame at deployment, so train it on every frame
+    probabilities: [0.0, 0.1]
+    include_occluded: False
+    label: iou_scores
   collate_fn:
     _target_: hydra.utils.get_method
     path: src.offline_training.main_dataset.collate_fn
@@ -29,7 +30,7 @@ main_trainer:
     lr: 0.00001
   epochs: 8
   batch_size: 256
-  patience: 5
+  patience: 3
   n_folds: 5
   checkpointing_resume_if_exists: False
   dataloader_args:

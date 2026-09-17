@@ -3,7 +3,7 @@ tracker:
   iou_threshold: 0.2
   use_mask_iou: False
   model:
-    _target_: src.modules.samara_hiera_model.SamaraHieraModel
+    _target_: src.modules.samara_model.SamaraModel
     sam_model_path: tm/sam_large.pt
     crop_resize: 512
     pad_ratio: 1.0

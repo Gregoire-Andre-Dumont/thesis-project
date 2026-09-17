@@ -5,23 +5,25 @@ from dataclasses import dataclass
 
 from src.typing.detection_data import DetectionData
 from src.modules.memories.main_memory import MainMemory
-from src.modules.samara_hiera_model import SamaraHieraModel
+from src.modules.samara_model import SamaraModel
 
 
 @dataclass
 class SamaraController:
     """SAM 2 VOS with the SAMARA calibrator making BOTH memory decisions.
 
-    `SamaraFixed` scores only the mask SAM already picked, so the calibrator can veto a commit but never
-    change what is tracked. Here it does both, on the same score:
+    Two decisions, from one pass over the same anchor-similarity features:
 
         selection  -- all three proposals are scored against the anchor and the best one is kept, replacing
-                      SAM's IoU-token argmax. Ranking needs an ordering, so this reads the REGRESSOR's
-                      predicted IoU. This is the decision claim_4 measures offline as `agree`.
+                      SAM's IoU-token argmax. Ranking needs an ordering, so this reads `model.controller`,
+                      a REGRESSOR on true IoU. This is the decision claim_4 measures offline as `agree`.
         gating     -- that proposal is committed only if its commit probability clears `commit_threshold`,
-                      replacing the oracles' ground-truth gate. This is a binary decision, so it reads the
-                      CLASSIFIER head when one is installed; a threshold on a regressed IoU is not a
+                      replacing the oracles' ground-truth gate. This is a binary decision, so it reads
+                      `model.gate_controller`, a CLASSIFIER: a threshold on a regressed IoU is not a
                       calibrated decision boundary and tends to leave the gate permanently open.
+
+    The two are separate models with separate objectives, so each stops training on its own schedule; only
+    the one a flag turns on has to be installed.
 
     Nothing here reads ground truth, so unlike `MemoryOracle`/`MaskOracle` it is deployable. The anchor is
     frame 0's SAM initialization mask, pinned once; the calibrator never sees the FIFO, so a poisoned bank
@@ -33,11 +35,8 @@ class SamaraController:
     select: bool = True                # calibrator picks the proposal (else SAM's IoU token picks)
     gate: bool = True                  # calibrator gates the commit (else commit every frame, as the baseline does)
 
-    model: SamaraHieraModel | None = None
+    model: SamaraModel | None = None
     main_memory: MainMemory | None = None
-
-    # {frame index: image-encoder output}, shared across arms on the same clip. The embedding depends only on
-    # the frame, never on the memory bank, so two arms rolling the same clip can reuse it.
     frame_cache: dict | None = None
 
     def __post_init__(self):
@@ -51,16 +50,19 @@ class SamaraController:
     def predict_masks(self, detection_data: DetectionData):
         """Roll SAM 2 over the sequence, letting the calibrator choose and gate every frame."""
 
-        if self.model.controller is None:
-            raise RuntimeError("no calibrator installed: set tracker.model.controller before predicting")
+        if self.select and self.model.controller is None:
+            raise RuntimeError("select=True needs a selector: set tracker.model.controller before predicting")
+        if self.gate and self.model.gate_controller is None:
+            raise RuntimeError("gate=True needs a gate model: set tracker.model.gate_controller before predicting")
 
         self.main_memory.reset_memory()
         self.main_memory.initialize_references(self.model, detection_data, anchor_index=0)
 
         n_frames = detection_data.frames.shape[0]
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)
-        self.calibrator_scores = torch.zeros((n_frames, 3), dtype=torch.float64)      # regressor: predicted IoU
-        self.commit_probabilities = torch.zeros((n_frames, 3), dtype=torch.float64)   # classifier: p(commit)
+
+        self.calibrator_scores = torch.full((n_frames, 3), float("nan"), dtype=torch.float64)    # predicted IoU
+        self.commit_probabilities = torch.full((n_frames, 3), float("nan"), dtype=torch.float64)  # p(commit)
         self.chosen_index = torch.zeros(n_frames, dtype=torch.int64)               # which proposal was kept, 0-2
         self.committed = torch.zeros(n_frames, dtype=torch.bool)                   # whether the frame was written
         self.committed_frames = []
@@ -75,30 +77,34 @@ class SamaraController:
             if cache is not None and idx not in cache:
                 cache[idx] = [e.detach().cpu() for e in image_features]
 
-            # Frame 0 is the anchor. Its reference is the PROPOSAL this tracker keeps, not SAM's box-prompted
-            # init mask -- the calibrator's dataset built its anchor the same way (`masks[0, chosen_index[0]]`
-            # from the rollout), and the two masks disagree exactly where it matters: partial occlusion and
-            # adjacent distractors. Selection on frame 0 therefore falls back to SAM's token, since there is
-            # no reference to score against yet.
             if reference_foreground is None:
                 anchor_proposal = int(torch.argmax(iou_scores[:, 1:], dim=-1))
                 anchor_mask = mask_preds[0, anchor_proposal + 1]
                 self.main_memory.initialize_calibrator_anchor(self.model, detection_data, anchor_mask, anchor_index=0)
                 reference_foreground, reference_background = self.main_memory.gather_calibrator_references()
 
-            scores, commit_probabilities = self.model.score_proposals(
-                current_frame, mask_preds[0, 1:], reference_foreground, reference_background)
-            self.calibrator_scores[idx] = torch.as_tensor(scores, dtype=torch.float64)
-            self.commit_probabilities[idx] = torch.as_tensor(commit_probabilities, dtype=torch.float64)
+            if self.select:
+                scores, probabilities = self.model.score_proposals(
+                    current_frame, mask_preds[0, 1:], reference_foreground, reference_background)
+                
+                proposal = int(np.argmax(scores))
+                self.calibrator_scores[idx] = torch.as_tensor(scores, dtype=torch.float64)
+                self.commit_probabilities[idx] = torch.as_tensor(probabilities, dtype=torch.float64)
+            else:
+                proposal = int(torch.argmax(iou_scores[:, 1:], dim=-1))
+                scores, probabilities = self.model.score_proposals(
+                    current_frame, mask_preds[0, 1 + proposal][None], reference_foreground, reference_background)
+                self.calibrator_scores[idx, proposal] = float(scores[0])
+                self.commit_probabilities[idx, proposal] = float(probabilities[0])
 
-            proposal = int(np.argmax(scores)) if self.select else int(torch.argmax(iou_scores[:, 1:], dim=-1))
             self.chosen_index[idx] = proposal
+            commit_probability = float(self.commit_probabilities[idx, proposal])
 
             chosen_mask, pointer, encoding = self.model.commit_candidate(
                 mask_preds, proposal + 1, object_pointers, object_score, lowres_imgenc)
             self.predicted_masks[idx] = chosen_mask
 
-            if not self.gate or float(commit_probabilities[proposal]) > self.commit_threshold:
+            if not self.gate or commit_probability > self.commit_threshold:
                 self.main_memory.update_memory(pointer, encoding)
                 self.committed[idx] = True
                 self.committed_frames.append(idx)

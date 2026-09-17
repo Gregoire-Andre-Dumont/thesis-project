@@ -1,5 +1,5 @@
 defaults:
-  - offline_trainers: cnn_fixed_samara
+  - offline_trainers: cnn_selector_samara
   - trackers@tracker: baselines/memory_oracle
   
 detection_data:

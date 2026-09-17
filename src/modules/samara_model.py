@@ -6,12 +6,16 @@ from numpy.typing import NDArray
 
 from muggled_sam.sam_v2_model import SAMV2Model
 from muggled_sam.make_sam_v2 import make_samv2_from_state_dict
+from src.offline_training.dataset_encoders import load_dataset_encoders
 
+class SamaraModel(SAMV2Model):
+    """SAM 2 whose memory decisions are scored against an EXTERNAL encoder's patch tokens.
 
-class SamaraHieraModel(SAMV2Model):
-    """SAM 2 with multi-reference patch-token extraction for SAMARA."""
-
-    OBJECT_SCORE_VALUE = 100.0
+    SAM's own Hiera tracks and proposes masks, exactly as in the baseline. What it does not do is judge them:
+    the calibrator's similarity features come from `feature_encoder` (the Perception Encoder), which is what
+    the calibrator's dataset was built from. Scoring with SAM's Hiera or memory encoder was possible here
+    once and is not any more -- claim_3 measured both as the weakest re-ID signals of six backbones, and
+    keeping them as options let a deployment silently feed the calibrator features it never trained on."""
 
     def __init__(
         self,
@@ -19,11 +23,10 @@ class SamaraHieraModel(SAMV2Model):
         controller: torch.nn.Module | None = None,
         crop_resize: int | None = None,
         pad_ratio: float = 0.25,
-        token_source: str = "hiera",
-        feature_encoder: str | None = None,
+        feature_encoder: str = "perception",
     ):
-        if token_source not in {"hiera", "memory"}:
-            raise ValueError(f"token_source must be 'hiera' or 'memory', got {token_source!r}")
+        if not feature_encoder:
+            raise ValueError("feature_encoder is required: the calibrator scores external tokens, not SAM's")
 
         _, sam_model = make_samv2_from_state_dict(sam_model_path)
         super().__init__(
@@ -35,25 +38,15 @@ class SamaraHieraModel(SAMV2Model):
             memory_fusion_model=sam_model.memory_fusion)
 
         self.controller = controller
-        # Optional SECOND model owning the commit gate, trained on the binary 'worth committing' target.
-        # None -> the gate reads the selector's own gate column (a composite head), or its predicted IoU
-        # when the selector has only one output.
         self.gate_controller = None
         self.crop_resize = crop_resize
         self.pad_ratio = pad_ratio
-        self.token_source = token_source
         self.anchor_size_pixels = 0
 
-        # Calibrator features come from an external ~80M backbone (perception/dino/hiera_sam/hiera_mae)
-        # when `feature_encoder` is set, so deployment matches the dataset the controller trained on.
-        # SAM's own Hiera still drives tracking/mask selection. None -> use SAM Hiera/memory tokens.
         self.feature_encoder = feature_encoder
-        self._feature_token_fn = None
-        if feature_encoder is not None:
-            from src.offline_training.dataset_encoders import load_dataset_encoders
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-            self._feature_token_fn = load_dataset_encoders([feature_encoder], device, dtype)[feature_encoder]
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        self._feature_token_fn = load_dataset_encoders([feature_encoder], device, dtype)[feature_encoder]
         self.eval()
 
     def commit_mask(self, mask_logits, pointer, object_score, lowres_imgenc):
@@ -92,25 +85,25 @@ class SamaraHieraModel(SAMV2Model):
     def _run_controller(self, features):
         """(predicted IoU, commit probability) per mask, each (n_masks,).
 
-        The IoU is column 0 of the selector, a REGRESSED value returned as-is; squashing it through a sigmoid
-        would push every value into [0.5, 0.731] and silently disable any gate thresholded on it.
+        Two models, one per decision, because the decisions are not the same question. `controller` REGRESSES
+        the IoU that ranks the proposals -- returned as-is, since a sigmoid would squash [0, 1] into
+        [0.5, 0.731] and silently disable any gate thresholded on it. `gate_controller` CLASSIFIES whether the
+        mask is worth committing, and its logit becomes a probability here, so `commit_threshold` is a real
+        decision boundary.
 
-        The commit probability comes from the first of these that exists: a separate `gate_controller`
-        trained only on the binary target, the selector's own gate column (a composite head), or -- with a
-        plain single-output regressor -- the predicted IoU itself.
+        Either may be absent when the tracker does not use that decision: the missing score comes back as NaN
+        rather than as a value that looks usable.
 
-        Autocast is disabled so a bf16 context can't corrupt the float32 calibrator."""
+        Autocast is disabled so a bf16 context can't corrupt the float32 calibrators."""
 
+        blank = np.full(len(features), np.nan, dtype=np.float32)
         with torch.autocast("cuda", enabled=False):
-            outputs = self.controller(features.float())
+            selected = self.controller(features.float()) if self.controller is not None else None
             gate_logits = self.gate_controller(features.float()) if self.gate_controller is not None else None
 
-        predicted_iou = outputs[:, 0].clamp(0.0, 1.0).cpu().numpy()
-        if gate_logits is not None:
-            return predicted_iou, torch.sigmoid(gate_logits[:, 0]).cpu().numpy()
-        if outputs.shape[1] < 2:
-            return predicted_iou, predicted_iou
-        return predicted_iou, torch.sigmoid(outputs[:, 1]).cpu().numpy()
+        predicted_iou = selected[:, 0].clamp(0.0, 1.0).cpu().numpy() if selected is not None else blank
+        commit_probability = torch.sigmoid(gate_logits[:, 0]).cpu().numpy() if gate_logits is not None else blank
+        return predicted_iou, commit_probability
 
     @torch.inference_mode()
     def score_proposals(self, current_frame, candidate_masks, reference_foreground, reference_background):
@@ -122,27 +115,6 @@ class SamaraHieraModel(SAMV2Model):
         (scores, commit_probabilities), _, _, _ = self._score_masks(
             current_frame, candidate_masks, reference_foreground, reference_background)
         return scores, commit_probabilities
-
-    @torch.inference_mode()
-    def select_best_mask_gated(self, current_frame, main_memory, reference_foreground, reference_background):
-        """Pick SAM 2's highest-IoU candidate and score it with the calibrator for the
-        memory-commit gate. Selection is plain SAM argmax, with no SAMARA re-ranking."""
-
-        chosen_mask, chosen_pointer, chosen_encoding, object_score, iou_score, _, _, _ = self.select_best_mask(current_frame, main_memory)
-        (samara_ious, commit_probabilities), foreground, background, calibrator_features = self._score_masks(
-            current_frame, chosen_mask[None], reference_foreground, reference_background)
-
-        return {
-            "chosen_mask": chosen_mask,
-            "pointer": chosen_pointer,
-            "encoding": chosen_encoding,
-            "iou_score": float(iou_score),
-            "samara_iou": float(samara_ious[0]),
-            "commit_probability": float(commit_probabilities[0]),
-            "object_score": float(object_score),
-            "target_foreground": foreground[0],
-            "target_background": background[0],
-            "calibrator_features": calibrator_features}
 
     # -------------------------------------------------------------------------------
     # Cropping — per-frame adaptive, driven entirely by pad_ratio
@@ -213,55 +185,8 @@ class SamaraHieraModel(SAMV2Model):
         return x_min, y_min, x_max, y_max
 
     # -------------------------------------------------------------------------------
-    # Patch-token extraction (Hiera or Memory) + foreground/background split
+    # Patch-token extraction + foreground/background split
     # -------------------------------------------------------------------------------
-
-    def _encode_crops(self, crops):
-        """Convert the RGB crops to the encoder's input format and run the image encoder.
-        Returns the low-resolution feature map for the batch of crops."""
-
-        prepared = [
-            self.image_encoder.prepare_image(cv2.cvtColor(crop.astype(np.uint8), cv2.COLOR_RGB2BGR), self.crop_resize, True)
-            for crop in crops]
-        return self.image_encoder(torch.cat(prepared, dim=0))[0]
-
-    def extract_raw_patch_tokens(self, cropped_frames, cropped_masks, encoder_chunk_size=16):
-        """Encode the crops and flatten the image-encoder output into per-patch tokens.
-        Also returns the foreground mask downsampled to the patch grid."""
-
-        with torch.inference_mode():
-            feats = torch.cat([
-                self._encode_crops(cropped_frames[start:start + encoder_chunk_size])
-                for start in range(0, len(cropped_frames), encoder_chunk_size)], dim=0).float()
-
-        B, F_dim, H, W = feats.shape
-        patch_tokens = feats.permute(0, 2, 3, 1).reshape(B, H * W, F_dim)
-        masks = torch.as_tensor(cropped_masks, device=feats.device).unsqueeze(1)
-        patch_masks = (F.interpolate(masks, size=(H, W), mode="nearest") > 0).flatten(2).squeeze(1)
-        return patch_tokens, patch_masks
-
-    def extract_memory_patch_tokens(self, cropped_frames, cropped_masks, encoder_chunk_size=8):
-        """Encode the crops and pass them through the memory encoder with their masks.
-        Returns the mask-conditioned memory tokens and the patch-grid foreground mask."""
-
-        token_chunks, mask_chunks = [], []
-        with torch.inference_mode():
-            for start in range(0, len(cropped_frames), encoder_chunk_size):
-                lowres = self._encode_crops(cropped_frames[start:start + encoder_chunk_size])
-                B, _, H, W = lowres.shape
-                masks = torch.as_tensor(cropped_masks[start:start + encoder_chunk_size],
-                                        device=lowres.device, dtype=lowres.dtype).unsqueeze(1)
-
-                memory_encoding = self.memory_encoder(
-                    lowres_image_encoding=lowres,
-                    mask_prediction=F.interpolate(masks, size=(4 * H, 4 * W), mode="bilinear", align_corners=False),
-                    object_score=torch.full((B, 1), self.OBJECT_SCORE_VALUE, device=lowres.device, dtype=lowres.dtype),
-                    is_prompt_encoding=True)
-
-                token_chunks.append(memory_encoding.float().permute(0, 2, 3, 1).reshape(B, H * W, memory_encoding.shape[1]))
-                mask_chunks.append((F.interpolate(masks, size=(H, W), mode="nearest") > 0).flatten(2).squeeze(1))
-
-        return torch.cat(token_chunks, dim=0), torch.cat(mask_chunks, dim=0)
 
     def split_foreground_background(self, patch_tokens, patch_masks):
         """Split patch tokens into foreground and background views using the patch mask.
@@ -274,21 +199,18 @@ class SamaraHieraModel(SAMV2Model):
         return foreground, background
 
     def extract_patch_tokens(self, cropped_frames, cropped_masks, encoder_chunk_size=16):
-        """Extract the calibrator's patch tokens for the crops and return their foreground/background
-        views. Uses the external ~80M `feature_encoder` (32x32 grid) when set -- the same tokens the
-        dataset was built with -- otherwise SAM's Hiera or memory encoder per `token_source`."""
+        """The calibrator's patch tokens for the crops, as foreground/background views.
 
-        if self._feature_token_fn is not None:
-            from src.offline_training.dataset_encoders import encode_tokens, _patch_masks
-            tokens = encode_tokens(self._feature_token_fn, np.asarray(cropped_frames), encoder_chunk_size)
-            patch_masks = _patch_masks(np.asarray(cropped_masks, dtype=np.float32), tokens.device)
-            return self.split_foreground_background(tokens, patch_masks)
+        Always the external `feature_encoder` -- the same tokens the calibrator's dataset was built with.
+        SAM's own Hiera and memory encoders were alternatives here once; they are gone because they made the
+        deployed features silently divergeable from the trained-on ones, and because claim_3 measured them as
+        the weakest re-ID signals of the six backbones tested."""
 
-        if self.token_source == "memory":
-            patch_tokens, patch_masks = self.extract_memory_patch_tokens(cropped_frames, cropped_masks)
-        else:
-            patch_tokens, patch_masks = self.extract_raw_patch_tokens(cropped_frames, cropped_masks, encoder_chunk_size)
-        return self.split_foreground_background(patch_tokens, patch_masks)
+        from src.offline_training.dataset_encoders import encode_tokens, _patch_masks
+
+        tokens = encode_tokens(self._feature_token_fn, np.asarray(cropped_frames), encoder_chunk_size)
+        patch_masks = _patch_masks(np.asarray(cropped_masks, dtype=np.float32), tokens.device)
+        return self.split_foreground_background(tokens, patch_masks)
 
     # -------------------------------------------------------------------------------
     # Patch similarity

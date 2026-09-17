@@ -40,13 +40,19 @@ class MainDataset(Dataset):
     probabilities: list[float] = field(default_factory=lambda: [0.0])
 
     # Keep frames where the target is OCCLUDED, labelled 0. At deployment the calibrator scores every frame,
-    # occluded ones included, so excluding them trains it on a distribution it will not meet and leaves its
-    # score undefined exactly where a commit poisons the bank. The label is right, not a degenerate zero: the
-    # target is absent, so every proposal really is wrong and the gate should refuse.
+    # occluded ones included, so excluding them trains it on a distribution it will not meet.
     include_occluded: bool = False
 
+    # Which per-proposal IoU to regress. The two arrays in the pickle are NOT the same contest: they
+    # correlate 0.91 but rank the three proposals differently on a third of frames.
+    #   proposal_true_iou -- box IoU against the GT box. What the oracles select on (`use_mask_iou: False`)
+    #                        and what coverage is measured in, so it is the SELECTOR's objective.
+    #   iou_scores        -- mask IoU against a box-prompted pseudo-GT mask. What the gate was calibrated
+    #                        on, kept as the default so a change here cannot silently move the gate.
+    label: str = "iou_scores"
+
     _features: torch.Tensor | None = None     # (samples, 1, grid, grid, channels) float32
-    _labels: torch.Tensor | None = None       # (samples,) float32, the proposal's true mask IoU
+    _labels: torch.Tensor | None = None       # (samples,) float32, the proposal's true IoU under `label`
 
     # ---------------------------------------------------------------------------------------
     # what the dataset is made of
@@ -107,7 +113,7 @@ class MainDataset(Dataset):
         for index in indices:
             for folder in self.folders():
                 experiment = pickle.load(open(folder / f"{stems[index]}.pkl", "rb"))
-                iou_scores = np.asarray(experiment.iou_scores, dtype=np.float32)
+                iou_scores = np.asarray(getattr(experiment, self.label), dtype=np.float32)
                 if iou_scores.ndim != 2:              # single-proposal pickle from an older schema
                     continue
                 keep = self.labelled(experiment)

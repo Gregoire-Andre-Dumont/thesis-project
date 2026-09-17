@@ -4,7 +4,7 @@ import numpy as np
 from dataclasses import dataclass
 from src.typing.detection_data import DetectionData
 from src.modules.memories.main_memory import MainMemory
-from src.modules.samara_hiera_model import SamaraHieraModel
+from src.modules.samara_model import SamaraModel
 from src.utils.load_bboxes import convert_bbox
 
 
@@ -12,7 +12,7 @@ from src.utils.load_bboxes import convert_bbox
 class SAMBaseline:
     """Baseline module for video object segmentation with SAM 2."""
 
-    model: SamaraHieraModel | None = None
+    model: SamaraModel | None = None
     iou_threshold: float | None = None
     main_memory: MainMemory | None = None
     label_mask_iou: bool = True
