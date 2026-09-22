@@ -22,6 +22,9 @@ import matplotlib.pyplot as plt
 from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "paper"))
+
+import style
 
 def anchor_area(video, person_id, anchor):
     """Visible box area on the ANCHOR frame, px² at the 1024 working resolution.
@@ -46,6 +49,7 @@ def anchor_area(video, person_id, anchor):
 COVERAGE_IOU = 0.5                           # a visible frame counts as held at this box IoU
 FAILURE_IOU = 0.1                            # below this the target is considered lost (VOT's threshold)
 N_BINS = 4
+SMALLEST_N = 400                             # clips kept in the fixed-count small-anchor figure
 SURFACE, INK, INK2 = "#fcfcfb", "#0b0b0b", "#52514e"
 MEMORY, MASK, SAM = "#2a78d6", "#eb6834", "#1baf7a"     # categorical slots 1-3, fixed order, entity-stable
 
@@ -183,13 +187,13 @@ def mean_displacement(video, person_id, anchor, n_frames):
 # ---------------------------------------------------------------------------------------
 
 score, YLABEL = {
-    "coverage": (coverage, f"post-occlusion coverage  (box IoU ≥ {COVERAGE_IOU:g})"),
-    "robustness": (robustness, (f"robustness  (fraction held before box IoU < {FAILURE_IOU:g})")),
+    "coverage": (coverage, f"coverage @ {COVERAGE_IOU:g}"),
+    "robustness": (robustness, f"robustness @ {FAILURE_IOU:g}"),
 }[METRIC]
 
 # The occlusion figure keeps the visible-only metric (see `coverage_with_occlusion` for why it must); the
 # covariates that are not occlusion length get the occlusion-aware one.
-HYGIENE_YLABEL = (f"coverage  (visible: box IoU ≥ {COVERAGE_IOU:g}   ·   occluded: did not commit)")
+HYGIENE_YLABEL = f"coverage @ {COVERAGE_IOU:g}"
 
 results = pickle.load(open(RESULTS, "rb"))
 thresholds = list(results["thresholds"])
@@ -238,14 +242,21 @@ sam = ARMS[0]
 # figures
 # ---------------------------------------------------------------------------------------
 
-def draw(values, xlabel, title, filename, arms=None, ylabel=None, tick="{:.0f}"):
-    """One figure: the three arms' score across quantile bins of `values`, over every clip.
-    `arms` selects which metric's score arrays to plot -- ARMS (visible only) or HYGIENE."""
+def draw(values, xlabel, caption, filename, arms=None, ylabel=None, tick="{:.0f}", keep=None):
+    r"""One paper figure: the three arms' score across quantile bins of `values`, over every clip.
+
+    `arms` selects which metric's score arrays to plot -- ARMS (visible only) or HYGIENE. No title is drawn:
+    `caption` is printed for pasting into the LaTeX \caption, where it is numbered and set in the paper's
+    own type rather than duplicated inside the axes at the wrong size."""
 
     baseline_scores, memory, mask = ARMS if arms is None else arms
+    if keep is not None:
+        values = values[keep]
+        baseline_scores, memory, mask = baseline_scores[keep], memory[keep], mask[keep]
     if len(baseline_scores) < 2:                 # early in a run there is nothing to bin yet
         print(f"skipped {filename}  (n={len(baseline_scores)})")
         return
+
     # Each oracle at the threshold maximising its own pooled score UNDER THIS METRIC -- picked on this data,
     # so the gap it shows is an upper bound rather than unbiased.
     memory_best = int(np.nanmean(memory, axis=0).argmax())
@@ -255,81 +266,69 @@ def draw(values, xlabel, title, filename, arms=None, ylabel=None, tick="{:.0f}")
     index = np.clip(np.digitize(values, edges[1:-1]), 0, len(edges) - 2)
     x = np.arange(len(edges) - 1)
 
-    figure, axis = plt.subplots(figsize=(8.6, 5.4), facecolor=SURFACE)
-    axis.set_facecolor(SURFACE)
+    figure, axis = plt.subplots(figsize=(style.COLUMN, 3.1))
 
-    baseline = np.array([baseline_scores[index == k].mean() for k in x])
-    axis.plot(x, baseline, color=SAM, linewidth=2, marker="o", markersize=8,
-              markeredgecolor=SURFACE, markeredgewidth=2, label="sam baseline", zorder=3)
-    ends = [(baseline[-1], SAM, "sam")]
-
-    for colour, values_by_threshold, label, short, featured in (
-            (MEMORY, memory, "memory oracle", "memory", memory_best),
-            (MASK, mask, "mask oracle", "mask", mask_best)):
+    # Slot order is fixed and entity-stable: sam always slot 0, memory 1, mask 2, in every claim_1 figure.
+    series = [(np.array([baseline_scores[index == k].mean() for k in x]), "SAM 2 baseline")]
+    for values_by_threshold, label, featured in ((memory, "memory oracle", memory_best),
+                                                 (mask, "mask oracle", mask_best)):
         per_bin = np.array([values_by_threshold[index == k, featured].mean() for k in x])
-        axis.plot(x, per_bin, color=colour, linewidth=2, marker="o", markersize=8,
-                  markeredgecolor=SURFACE, markeredgewidth=2,
-                  label=f"{label}  (thr {thresholds[featured]:g})", zorder=3)
-        ends.append((per_bin[-1], colour, short))
+        series.append((per_bin, rf"{label} ($\tau$={thresholds[featured]:g})"))
 
-    # Direct labels at the right edge, nudged apart when two arms finish at nearly the same coverage.
-    gap = max(max(e[0] for e in ends) - min(e[0] for e in ends), 0.05) * 0.16
-    placed = []
-    for value, colour, short in sorted(ends):
-        y = value if not placed else max(value, placed[-1] + gap)
-        placed.append(y)
-        axis.annotate(short, (x[-1], value), xytext=(x[-1] + 0.12, y), textcoords="data",
-                      color=colour, fontsize=10, va="center")
+    for position, (per_bin, label) in enumerate(series):
+        axis.plot(x, per_bin, label=label, zorder=3, **style.series_style(position))
 
     axis.set_xticks(x)
-    axis.set_xticklabels([f"{tick.format(edges[k])}-{tick.format(edges[k + 1])}"
-                          f"\nn={int((index == k).sum())}" for k in x], fontsize=9, color=INK2)
-    axis.set_xlabel(xlabel, fontsize=10, color=INK2)
-    axis.set_ylabel(YLABEL if ylabel is None else ylabel, fontsize=10, color=INK2)
-    axis.set_title(title, fontsize=12, color=INK, pad=12, loc="left")
-    axis.grid(axis="y", color=INK2, alpha=0.13, linewidth=0.8)
-    axis.set_axisbelow(True)
-    for side in ("top", "right"):
-        axis.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        axis.spines[side].set_color(INK2)
-        axis.spines[side].set_alpha(0.35)
-    axis.tick_params(colors=INK2, labelsize=9)
-    axis.set_xlim(-0.35, len(x) - 1 + 0.55)
-    axis.legend(frameon=False, fontsize=10, loc="best")
-    figure.text(0.008, 0.955,
-                f"n={len(baseline_scores)} clips  ·  each oracle at its own best threshold (chosen post-hoc)",
-                fontsize=9, color=INK2, ha="left")
-    figure.tight_layout(rect=[0, 0, 1, 0.93])
-    figure.savefig(filename, dpi=150, facecolor=SURFACE)
-    print(f"saved {filename}  (n={len(baseline_scores)})")
+    axis.set_xticklabels([f"{tick.format(edges[k])}-{tick.format(edges[k + 1])}" for k in x])
+    axis.set_xlim(-0.18, len(x) - 1 + 0.18)
+    style.headroom(axis, max(per_bin.max() for per_bin, _ in series))
+    style.style_axes(axis, xlabel, YLABEL if ylabel is None else ylabel)
+    axis.legend(loc="best", ncol=1)
+
+    style.save(figure, filename)
+    counts = ", ".join(str(int((index == k).sum())) for k in x)
+    print(f"   caption: {caption} n={len(baseline_scores)} clips ({counts} per bin); each oracle "
+          f"at its own best commit threshold, chosen post-hoc on this data.")
 
 
-HYGIENE_TITLE = "Coverage + memory hygiene"
+style.use_paper_style()
+FIGURES = Path("data/claim_1/paper")
 
-# Binned by occlusion length, this metric is circular and the curve has to be read with that in mind: the
-# occluded half scores higher than the visible half for every arm (1.0 by construction for the oracles,
+# Binned by occlusion length, the hygiene metric is circular and the curve has to be read with that in mind:
+# the occluded half scores higher than the visible half for every arm (1.0 by construction for the oracles,
 # ~0.81 for the baseline), so a longer-occlusion bin draws more of its score from the easier half and
 # flattens for reasons unrelated to tracking. `fig_occlusion_visible` is the same binning on visible frames
 # only, where that effect cannot arise -- read the pair together.
-draw(occlusions, "occluded frames",
-     f"{HYGIENE_TITLE} by occlusion length", f"data/claim_1/fig_occlusion{SUFFIX}.png",
-     arms=HYGIENE, ylabel=HYGIENE_YLABEL)
+draw(occlusions, "number of occluded frames",
+     "Coverage and memory hygiene by occlusion length.",
+     FIGURES / f"fig_occlusion{SUFFIX}", arms=HYGIENE, ylabel=HYGIENE_YLABEL)
 
-TITLE = METRIC.capitalize()
-draw(occlusions, "occluded frames",
-     f"{TITLE} by occlusion length", f"data/claim_1/fig_occlusion_visible{SUFFIX}.png")
+draw(occlusions, "number of occluded frames",
+     f"{METRIC.capitalize()} by occlusion length, visible frames only.",
+     FIGURES / f"fig_occlusion_visible{SUFFIX}")
 
-# How far the target travels from where the bank was seeded -- the still-vs-moving question, without
-# depending on an annotation label.
-draw(motion, "mean displacement from the anchor  (px @1024)",
-     f"{HYGIENE_TITLE} by target motion", f"data/claim_1/fig_motion{SUFFIX}.png",
-     arms=HYGIENE, ylabel=HYGIENE_YLABEL)
+# The same occlusion binning with the LARGEST anchors dropped. Every arm converges with the baseline on the
+# top quartile -- a big target is easy and the memory decision has little left to change -- so those clips
+# only dilute the occlusion trend the figure is about.
+small = areas < np.nanquantile(areas, 0.75)
+draw(occlusions, "number of occluded frames",
+     "Coverage and memory hygiene by occlusion length, largest-anchor quartile dropped.",
+     FIGURES / f"fig_occlusion_small{SUFFIX}", arms=HYGIENE, ylabel=HYGIENE_YLABEL, keep=small)
+
+# The same binning again, kept to a FIXED COUNT of the smallest anchors rather than a quantile. A quantile
+# cut moves with the pool, so the previous figure's selection changes as the run adds clips; this one names
+# the same number of trajectories whatever the pool is, which is what a figure in the paper has to do.
+smallest = np.zeros(len(areas), dtype=bool)
+smallest[np.argsort(np.where(np.isfinite(areas), areas, np.inf))[:SMALLEST_N]] = True
+smallest &= np.isfinite(areas)
+draw(occlusions, "number of occluded frames",
+     f"Coverage and memory hygiene by occlusion length, the {SMALLEST_N} smallest anchors.",
+     FIGURES / f"fig_occlusion_smallest{SUFFIX}", arms=HYGIENE, ylabel=HYGIENE_YLABEL, keep=smallest)
 
 # How big the target is where the memory bank is seeded -- the quantity `min_visible_area` gates on.
-draw(areas, "anchor visible box area  (px² @1024)",
-     f"{HYGIENE_TITLE} by anchor size", f"data/claim_1/fig_area{SUFFIX}.png",
-     arms=HYGIENE, ylabel=HYGIENE_YLABEL)
+draw(areas, "anchor visible area",
+     "Coverage and memory hygiene by anchor size.",
+     FIGURES / f"fig_area{SUFFIX}", arms=HYGIENE, ylabel=HYGIENE_YLABEL)
 
 
 def pooled(label, arms):

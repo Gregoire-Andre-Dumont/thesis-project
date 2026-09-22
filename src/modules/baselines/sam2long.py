@@ -66,4 +66,45 @@ class SAM2Long:
             mask = F.interpolate(masks.cpu(), size=(256, 256), mode="bilinear", align_corners=False)
             predicted_masks[predictor_frame_idx] = (mask.squeeze() > 0.0).to(torch.int)
 
+        self.update_memory = self._memory_flags(inference_state, n_frames)
+
         return predicted_masks
+
+    def _memory_flags(self, inference_state, n_frames):
+        """Per-frame memory-commit decisions, read back from SAM2Long's own gating predicate.
+
+        Like SAMURAI and SAMITE, SAM2Long refuses frames at READ time: memory conditioning walks the stored
+        frames and keeps one only if its mask IoU clears `iou_thre` and its object score is positive
+        (`sam2_base.py`, the `valid_indices` loop). Unlike them the scores are per PATHWAY, so the column
+        read here is the one the winning pathway used -- `mem_pick_indexs[0]`, the same index the predictor
+        uses to assemble the masks it returns.
+
+        The frame immediately before the current one is appended whatever its scores, so it is marked
+        committed to match."""
+
+        outputs = inference_state["output_dict"]["non_cond_frame_outputs"]
+        picks = inference_state.get("mem_pick_indexs")
+        flags = torch.zeros(n_frames, dtype=torch.bool)
+        scores = torch.full((n_frames, 2), float("nan"), dtype=torch.float64)
+
+        if picks is None:                      # a single-frame clip never ran the tree search
+            return flags
+
+        winning = picks[0]
+        iou_threshold = float(inference_state["iou_thre"])
+        for index in range(n_frames):
+            stored = outputs.get(index)
+            if stored is None or index not in winning:
+                continue
+
+            pick = winning[index]
+            iou_score = float(stored["ious"][..., pick])
+            object_score = float(stored["object_score_logits"][..., pick])
+            scores[index] = torch.tensor([iou_score, object_score], dtype=torch.float64)
+            flags[index] = bool(iou_score > iou_threshold and object_score > 0)
+
+        if n_frames > 1:
+            flags[n_frames - 2] = True
+
+        self.memory_scores = scores
+        return flags

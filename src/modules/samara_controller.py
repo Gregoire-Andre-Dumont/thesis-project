@@ -35,6 +35,12 @@ class SamaraController:
     select: bool = True                # calibrator picks the proposal (else SAM's IoU token picks)
     gate: bool = True                  # calibrator gates the commit (else commit every frame, as the baseline does)
 
+    # A SECOND condition on the commit, ANDed with the calibrator's: SAM's own IoU token for the kept
+    # proposal must also clear this. The two scores answer different questions -- the calibrator asks "is
+    # this the right person", the token asks "is this mask any good" -- so a frame that fails either is one
+    # neither model vouches for. Left None, only the calibrator gates, as before.
+    token_threshold: float | None = None
+
     model: SamaraModel | None = None
     main_memory: MainMemory | None = None
     frame_cache: dict | None = None
@@ -66,6 +72,7 @@ class SamaraController:
         self.chosen_index = torch.zeros(n_frames, dtype=torch.int64)               # which proposal was kept, 0-2
         self.committed = torch.zeros(n_frames, dtype=torch.bool)                   # whether the frame was written
         self.committed_frames = []
+        self.token_scores = torch.full((n_frames,), float("nan"), dtype=torch.float64)  # SAM's IoU token
 
         reference_foreground = reference_background = None
         cache = self.frame_cache
@@ -83,28 +90,41 @@ class SamaraController:
                 self.main_memory.initialize_calibrator_anchor(self.model, detection_data, anchor_mask, anchor_index=0)
                 reference_foreground, reference_background = self.main_memory.gather_calibrator_references()
 
+            # SAM's own opinion of each proposal, for a controller trained to read it alongside the
+            # anchor similarity (`dataset.scalars`). Harmless when it was not: the extra channels are
+            # sliced off before the convolutions and a model with `n_scalars: 0` never looks at them.
+            token = iou_scores[0, 1:].to(torch.float32).cpu().numpy()
+            presence = float(object_score.reshape(-1)[0])
+
             if self.select:
+                scalars = np.stack([token, np.full(len(token), presence, dtype=np.float32)], axis=-1)
                 scores, probabilities = self.model.score_proposals(
-                    current_frame, mask_preds[0, 1:], reference_foreground, reference_background)
+                    current_frame, mask_preds[0, 1:], reference_foreground, reference_background, scalars)
                 
                 proposal = int(np.argmax(scores))
                 self.calibrator_scores[idx] = torch.as_tensor(scores, dtype=torch.float64)
                 self.commit_probabilities[idx] = torch.as_tensor(probabilities, dtype=torch.float64)
             else:
                 proposal = int(torch.argmax(iou_scores[:, 1:], dim=-1))
+                scalars = np.array([[token[proposal], presence]], dtype=np.float32)
                 scores, probabilities = self.model.score_proposals(
-                    current_frame, mask_preds[0, 1 + proposal][None], reference_foreground, reference_background)
+                    current_frame, mask_preds[0, 1 + proposal][None], reference_foreground,
+                    reference_background, scalars)
                 self.calibrator_scores[idx, proposal] = float(scores[0])
                 self.commit_probabilities[idx, proposal] = float(probabilities[0])
 
             self.chosen_index[idx] = proposal
             commit_probability = float(self.commit_probabilities[idx, proposal])
 
+            token_score = float(iou_scores[0, 1 + proposal])
+            self.token_scores[idx] = token_score
+            token_holds = self.token_threshold is None or token_score > self.token_threshold
+
             chosen_mask, pointer, encoding = self.model.commit_candidate(
                 mask_preds, proposal + 1, object_pointers, object_score, lowres_imgenc)
             self.predicted_masks[idx] = chosen_mask
 
-            if not self.gate or commit_probability > self.commit_threshold:
+            if not self.gate or (commit_probability > self.commit_threshold and token_holds):
                 self.main_memory.update_memory(pointer, encoding)
                 self.committed[idx] = True
                 self.committed_frames.append(idx)

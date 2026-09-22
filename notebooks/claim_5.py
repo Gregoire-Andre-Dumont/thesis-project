@@ -60,6 +60,7 @@ ARMS = {
     "p0.05": [0.05],
     "p0.10": [0.10],
     "p0.15": [0.15],
+    "p0.20": [0.20],
 }
 
 
@@ -183,17 +184,21 @@ def clip_record(tracker, detection_data, clip, fold, arm):
     }
 
 
-def roll_every_arm(tracker, detection_data, clip, gates, fold, states):
-    """Roll one clip through every arm, sharing SAM's image features across them.
+def roll_arms(tracker, detection_data, clip, gates, fold, states, arms_to_roll):
+    """Roll one clip through the arms that still need it, sharing SAM's image features across them.
 
     The cache is filled by the first arm and read by the rest, then dropped with the clip. Verified
-    transparent: a cache-fed rollout is bit-identical to a cold one with the same gate."""
+    transparent: a cache-fed rollout is bit-identical to a cold one with the same gate.
+
+    Only `arms_to_roll` are recorded. Rolling every arm unconditionally would append a second copy of the
+    clip to arms that already had it -- which is what happens when an arm is ADDED to a finished sweep and
+    its clips are re-rolled to catch it up."""
 
     frame_cache = {}
     tracker.frame_cache = frame_cache
 
-    for arm, gate in gates.items():
-        tracker.model.gate_controller = gate
+    for arm in arms_to_roll:
+        tracker.model.gate_controller = gates[arm]
         tracker.model.eval()
         states[arm]["clips"].append(clip_record(tracker, detection_data, clip, fold, arm))
 
@@ -260,14 +265,15 @@ def run(config: DictConfig):
 
         for clip in tqdm(remaining, desc=f"block {fold + 1}"):
             video, person, _ = clip
+            arms_to_roll = [arm for arm in ARMS if (video, person) not in states[arm]["processed"]]
             for arm in ARMS:
                 states[arm]["processed"].add((video, person))
 
             if not scorable(detection_data, clip, max_frames):
                 continue
 
-            roll_every_arm(tracker, detection_data, clip, gates, fold, states)
-            for arm in ARMS:
+            roll_arms(tracker, detection_data, clip, gates, fold, states, arms_to_roll)
+            for arm in arms_to_roll:
                 save_results(out_dir / arm / "results.pkl",
                              states[arm]["processed"], states[arm]["clips"])
 

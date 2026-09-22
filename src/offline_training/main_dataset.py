@@ -51,6 +51,15 @@ class MainDataset(Dataset):
     #                        on, kept as the default so a change here cannot silently move the gate.
     label: str = "iou_scores"
 
+    # Per-proposal scalars carried ALONGSIDE the similarity map, for a controller that should see what SAM
+    # itself thinks as well as what the anchor looks like:
+    #   proposal_iou_scores -- SAM's IoU token for that proposal, its own mask-quality estimate
+    #   object_score        -- SAM's object-presence logit for the frame, shared by all three proposals
+    # They ride as constant extra channels on the map rather than a second tensor, so the loader, the
+    # collate function and the trainer are untouched; `CNNFixed` splits them off before the convolutions
+    # and feeds them straight to its head. Empty by default, so the gate is unaffected.
+    scalars: tuple[str, ...] = ()
+
     _features: torch.Tensor | None = None     # (samples, 1, grid, grid, channels) float32
     _labels: torch.Tensor | None = None       # (samples,) float32, the proposal's true IoU under `label`
 
@@ -123,11 +132,35 @@ class MainDataset(Dataset):
                 # (frames, proposals, grid, grid, channels) -> one sample per proposal, in label order.
                 similarity_maps = np.asarray(experiment.features, dtype=np.float32)[keep]
                 per_proposal = similarity_maps.reshape(-1, 1, *similarity_maps.shape[2:])
+                per_proposal = self.with_scalars(per_proposal, experiment, keep, similarity_maps.shape[1])
                 features.append(per_proposal)
                 labels.append(iou_scores[keep].reshape(-1))
 
         self._features = torch.from_numpy(np.concatenate(features, axis=0))
         self._labels = torch.from_numpy(np.concatenate(labels, axis=0))
+
+    def with_scalars(self, per_proposal, experiment, keep, n_proposals):
+        """Append each requested scalar as a constant channel on every proposal's map.
+
+        A per-frame scalar (`object_score`) is repeated across the frame's proposals; a per-proposal one
+        (`proposal_iou_scores`) is taken as it stands. Constant planes are wasteful in the convolutions,
+        which is why `CNNFixed` slices them off before them -- the point is only that one tensor still
+        carries everything, so nothing downstream has to learn about a second input."""
+
+        if not self.scalars:
+            return per_proposal
+
+        columns = []
+        for name in self.scalars:
+            values = np.asarray(getattr(experiment, name), dtype=np.float32)
+            if values.ndim == 1:                          # per-frame: every proposal sees the same value
+                values = np.repeat(values[:, None], n_proposals, axis=1)
+            columns.append(values[keep].reshape(-1))
+
+        stacked = np.stack(columns, axis=-1)              # (samples, n_scalars)
+        planes = np.broadcast_to(stacked[:, None, None, None, :],
+                                 per_proposal.shape[:4] + (len(self.scalars),))
+        return np.concatenate([per_proposal, planes.astype(np.float32)], axis=-1)
 
     def __len__(self):
         """Number of proposal samples: three per labelled frame, per corruption level."""

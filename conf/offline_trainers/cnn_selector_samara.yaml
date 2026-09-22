@@ -11,6 +11,7 @@ main_trainer:
     dropout: 0.1
     channel: both
     n_outputs: 1
+    n_scalars: 2            # SAM's IoU token and object score, appended to the pooled CNN embedding
   criterion:
     _target_: src.offline_training.losses.mse_iou.MSEIouLoss
   dataset:
@@ -19,6 +20,9 @@ main_trainer:
     probabilities: [0.0, 0.1]
     include_occluded: False
     label: iou_scores
+    # The selector ranks proposals, so it gets SAM's own opinion of them alongside the anchor similarity:
+    # the per-proposal IoU token, and the per-frame object-presence logit shared by all three.
+    scalars: [proposal_iou_scores, object_score]
   collate_fn:
     _target_: hydra.utils.get_method
     path: src.offline_training.main_dataset.collate_fn

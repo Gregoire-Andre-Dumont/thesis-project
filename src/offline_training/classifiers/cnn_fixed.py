@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 
@@ -48,11 +49,15 @@ def _build_cnn(n_channels, cnn_dim, in_channels=2):
         nn.GELU())
 
 
-def _build_head(cnn_dim, mlp_hidden, dropout, n_outputs=1):
-    """4-layer MLP head. `n_outputs` 1 is the calibrated IoU alone; 2 adds the commit logit beside it."""
+def _build_head(cnn_dim, mlp_hidden, dropout, n_outputs=1, n_scalars=0):
+    """4-layer MLP head. `n_outputs` 1 is the calibrated IoU alone; 2 adds the commit logit beside it.
+
+    `n_scalars` widens the first layer for SAM's own per-proposal scores, which join the pooled CNN
+    embedding here rather than passing through the convolutions -- they carry no spatial structure, so
+    convolving them would only cost parameters."""
 
     return nn.Sequential(
-        nn.Linear(cnn_dim, mlp_hidden),
+        nn.Linear(cnn_dim + n_scalars, mlp_hidden),
         nn.GELU(),
         nn.Dropout(dropout),
         nn.Linear(mlp_hidden, mlp_hidden),
@@ -72,21 +77,32 @@ class CNNFixed(nn.Module):
     a calibrated yes/no on one mask (`BCEIouLoss` on IoU > threshold). They read the same features but
     overfit at different rates, so sharing a trunk would force them to stop training together."""
 
-    def __init__(self, n_channels=48, cnn_dim=256, mlp_hidden=256, dropout=0.2, channel="both", n_outputs=1):
+    def __init__(self, n_channels=48, cnn_dim=256, mlp_hidden=256, dropout=0.2, channel="both", n_outputs=1,
+                 n_scalars=0):
         super().__init__()
 
         self.channel = channel
         self.n_outputs = n_outputs
+        self.n_scalars = n_scalars
         self._channel_slice = _CHANNEL_SLICE[channel]
         in_channels = self._channel_slice.stop - self._channel_slice.start
 
         self.cnn = _build_cnn(n_channels=n_channels, cnn_dim=cnn_dim, in_channels=in_channels)
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.head = _build_head(cnn_dim, mlp_hidden, dropout, n_outputs)
+        self.head = _build_head(cnn_dim, mlp_hidden, dropout, n_outputs, n_scalars)
 
     def forward(self, x):
-        """`x`: `(B, n_input_channels, H, W, 2)`. Returns `(B, n_outputs)`: predicted IoU, then commit logit."""
+        """`x`: `(B, 1, H, W, 2 + n_scalars)`. Returns `(B, n_outputs)`: predicted IoU, then commit logit.
 
-        x = x[:, 0, :, :, self._channel_slice].permute(0, 3, 1, 2)
-        x = self.global_pool(self.cnn(x)).flatten(start_dim=1)
-        return self.head(x).float()
+        The trailing channels beyond the similarity map are `MainDataset`'s constant scalar planes. They are
+        sliced off before the convolutions and read back at one pixel -- being constant, any pixel is the
+        value -- then concatenated to the pooled embedding."""
+
+        maps = x[:, 0, :, :, self._channel_slice].permute(0, 3, 1, 2)
+        pooled = self.global_pool(self.cnn(maps)).flatten(start_dim=1)
+
+        if self.n_scalars:
+            scalars = x[:, 0, 0, 0, 2:2 + self.n_scalars].float()
+            pooled = torch.cat([pooled, scalars], dim=1)
+
+        return self.head(pooled).float()

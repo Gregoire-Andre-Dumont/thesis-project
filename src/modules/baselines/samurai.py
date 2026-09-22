@@ -57,4 +57,48 @@ class Samurai:
             mask = F.interpolate(masks.cpu(), size=(256, 256), mode='bilinear', align_corners=False)
             predicted_masks[frame_idx] = (mask.squeeze() > 0.0).to(torch.int)
 
+        self.update_memory = self._memory_flags(inference_state, n_frames)
         return predicted_masks
+
+    def _memory_flags(self, inference_state, n_frames):
+        """Per-frame memory-commit decisions, read back from the predictor's own stored scores.
+
+        SAMURAI/SAMITE do not refuse to ENCODE a frame's memory; they refuse to READ it back. Memory
+        conditioning walks the stored frames and keeps one only if its mask affinity, object score and
+        Kalman motion score all clear the model's own thresholds (`sam2_base.py`, the `samurai_mode`
+        branch). A frame that never passes is a frame whose memory is never attended to, which is the same
+        decision SAMARA's commit gate makes at write time -- so the model's own predicate is replayed here
+        rather than a threshold invented for this repo.
+
+        The one asymmetry is the immediately previous frame, which the model appends unconditionally
+        whatever its scores; it is marked committed to match."""
+
+        outputs = inference_state["output_dict"]["non_cond_frame_outputs"]
+        flags = torch.zeros(n_frames, dtype=torch.bool)
+        scores = torch.full((n_frames, 3), float("nan"), dtype=torch.float64)
+
+        model = self.predictor
+        for index in range(n_frames):
+            stored = outputs.get(index)
+            if stored is None:
+                continue
+
+            iou_score = float(stored["best_iou_score"])
+            object_score = float(stored["object_score_logits"])
+            kalman_score = float(stored["kf_score"]) if stored.get("kf_score") is not None else float("nan")
+            scores[index] = torch.tensor([iou_score, object_score, kalman_score], dtype=torch.float64)
+
+            # bool(): the isnan term makes the expression a numpy.bool_, which a torch.BoolTensor
+            # refuses to take.
+            flags[index] = bool(iou_score > model.memory_bank_iou_threshold
+                                and object_score > model.memory_bank_obj_score_threshold
+                                and (np.isnan(kalman_score)
+                                     or kalman_score > model.memory_bank_kf_score_threshold))
+
+        # The frame immediately before the last one is always appended, pass or fail.
+        if n_frames > 1:
+            flags[n_frames - 2] = True
+
+        self.memory_scores = scores
+        return flags
+

@@ -1,20 +1,20 @@
-"""claim_4 figures: does the calibrator rank SAM's proposals better than SAM's own IoU token?
+"""claim_4 figure: does the calibrator judge a proposal usable better than SAM's own IoU token?
 
-Three scores, one figure per metric, both against how heavily the memory bank is poisoned.
+One figure, both scores against how heavily the memory bank is poisoned:
 
-    sam            SAM's predicted-IoU token -- free, already computed, what the tracker selects with today
-    samara p=0     the calibrator trained on CLEAN rollouts only, so every corrupted level is extrapolation
-    samara p=0,0.2 the same calibrator with the worst corruption level added to its training mix
+    SAM IoU token   free, already computed, what the tracker selects with today
+    SAMARA gate     the calibrator, trained on the corruption mix its config names
 
-The third score is the control on the second: if training on clean rollouts alone already holds up under
-poisoning, adding corrupted rollouts should buy little, and the gap between the two says how much of the
-robustness is free.
+A proposal is USABLE when its true mask IoU clears `USABLE_IOU`, and the metric is the probability a score
+ranks a usable proposal above an unusable one -- an AUC over every held-out proposal. Chance is 0.50.
 
-AGREEMENT is the decision the controller actually makes -- on frames where the best and second-best proposal
-differ by at least MARGIN, how often does the score pick the best one (chance is 1/3). POOLED R2 is
-calibration against true IoU over every held-out frame. Each point is the mean over the trajectory-grouped
-folds, with the fold spread as a band. A score whose predictions file is missing is skipped, so this draws
-while a run is still training.
+This is the gate's question, not the selector's. Selection needs an ordering WITHIN a frame; the gate needs
+to know whether the mask in hand is worth committing at all. On the frames where every proposal is bad the
+ordering is irrelevant and this is the only question left, which is exactly the regime a poisoned bank
+produces.
+
+Each point is the mean over the trajectory-grouped folds, with the fold spread as a band. A score whose
+predictions file is missing is skipped, so this draws while a run is still training.
 
     python notebooks/claim_4_visualize.py
 """
@@ -28,93 +28,78 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from notebooks.claim_4 import MARGIN, ranking
+sys.path.insert(0, str(Path(__file__).resolve().parent / "paper"))
+
+import style
+from notebooks.claim_4 import USABLE_IOU, ranking
 
 OUT = Path("data/claim_4")
-SURFACE, INK, INK2 = "#fcfcfb", "#0b0b0b", "#52514e"
-TRAINED_ON = 0.0
+FIGURES = Path("data/claim_4/paper")
 
-#         label,             predictions file,                  key,   colour
-SERIES = [("sam", OUT / "predictions.pkl", "sam", "#cc4444"),
-          ("samara p=0", OUT / "predictions.pkl", "cnn", "#22aa77"),
-          ("samara p=0,0.2", OUT / "predictions_mixed.pkl", "cnn", "#3377cc")]
-
-FIGURES = [("agree", "agreement", "agreement with the best proposal", 1 / 3, "chance (1/3)"),
-           ("R2", "r2", "pooled $R^2$ against true IoU", 0.0, "no signal (0)")]
+# Slot per SCORE, fixed: the token keeps slot 0 and the calibrator slot 1 in every claim_4 figure.
+SERIES = [("SAM IoU token", OUT / "predictions.pkl", "sam", 0),
+          ("SAMARA gate", OUT / "predictions.pkl", "cnn", 1)]
 
 
-def series_metrics(path, key):
-    """{level: {metric: [one value per fold]}} for one score, or None when its run has not finished."""
+def series_auc(path, key):
+    """{level: [AUC per fold]} for one score, or None when its run has not finished."""
 
     if not path.exists():
         return None
+
     predictions = pickle.load(open(path, "rb"))
     collected = {}
     for level, folds in predictions.items():
         if not folds:
             continue
-        scored = [ranking(fold[key], fold["truth"]) for fold in folds]
-        collected[level] = {metric: [fold[metric] for fold in scored] for metric, _, _, _, _ in FIGURES}
+        collected[level] = [ranking(fold[key], fold["truth"])["AUC"] for fold in folds]
     return collected
 
 
-def draw(axis, by_series, metric, label, floor, floor_label):
-    """One figure's axes: every score's fold-mean curve with the fold spread as a band."""
+def main():
+    style.use_paper_style()
 
-    for name, values, color in by_series:
+    drawn = []
+    for name, path, key, slot in SERIES:
+        values = series_auc(path, key)
+        if values is None:
+            print(f"skipped {name}  ({path} not found)")
+            continue
+        drawn.append((name, values, slot))
+
+    if not drawn:
+        raise SystemExit("no predictions to draw")
+
+    figure, axis = plt.subplots(figsize=(style.COLUMN, 3.1))
+    highest = 0.0
+    for name, values, slot in drawn:
         levels = sorted(values)
-        folds = np.array([values[level][metric] for level in levels])          # (levels, folds)
-        axis.fill_between(levels, folds.min(1), folds.max(1), color=color, alpha=0.13, linewidth=0)
-        axis.plot(levels, folds.mean(1), marker="o", markersize=8, linewidth=2, color=color,
-                  markeredgecolor=SURFACE, markeredgewidth=2, label=name, zorder=3)
+        folds = np.array([values[level] for level in levels])          # (levels, folds)
+        appearance = style.series_style(slot)
+        axis.fill_between(levels, folds.min(1), folds.max(1), color=appearance["color"],
+                          alpha=0.13, linewidth=0, zorder=2)
+        axis.plot(levels, folds.mean(1), label=name, zorder=3, **appearance)
+        highest = max(highest, float(folds.mean(1).max()))
 
-    axis.axhline(floor, color=INK2, linestyle=":", linewidth=1, label=floor_label)
-    axis.axvline(TRAINED_ON, color=INK2, linestyle="--", linewidth=1, alpha=0.4)
-    axis.set_title("Proposal ranking under memory-bank poisoning", fontsize=12, color=INK, pad=12, loc="left")
-    axis.set_xlabel("corruption probability  (per frame)", fontsize=10, color=INK2)
-    axis.set_ylabel(label, fontsize=10, color=INK2)
-    axis.grid(axis="y", color=INK2, alpha=0.13, linewidth=0.8)
-    axis.set_axisbelow(True)
-    for side in ("top", "right"):
-        axis.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        axis.spines[side].set_color(INK2)
-        axis.spines[side].set_alpha(0.35)
-    axis.tick_params(colors=INK2, labelsize=9)
-    axis.legend(frameon=False, fontsize=10, loc="lower left")
+    axis.axhline(0.5, color=style.INK2, linestyle=(0, (1, 2)), linewidth=0.8, zorder=2)
+
+    levels = sorted(drawn[0][1])
+    axis.set_xticks(levels)
+    axis.set_xticklabels([f"{level:g}" for level in levels])
+    span = levels[-1] - levels[0]
+    axis.set_xlim(levels[0] - 0.04 * span, levels[-1] + 0.04 * span)
+    style.gridlines(axis, 0.05)
+    style.headroom(axis, highest)
+    style.style_axes(axis, "corruption probability (per frame)", f"AUC (IoU $>$ {USABLE_IOU:g})")
+    axis.legend(loc="lower left")
+
+    style.save(figure, FIGURES / "fig_usable_auc")
+    folds_drawn = len(next(iter(drawn[0][1].values())))
+    print(f"   caption: Probability that a score ranks a usable proposal (true mask IoU > {USABLE_IOU:g}) "
+          f"above an unusable one, against the rate at which the memory bank is poisoned. Mean over "
+          f"{folds_drawn} trajectory-grouped folds, band is the fold spread. The dotted line is chance "
+          f"(0.50).")
 
 
-available = [(name, series_metrics(path, key), color) for name, path, key, color in SERIES]
-missing = [name for name, values, _ in available if values is None]
-available = [(name, values, color) for name, values, color in available if values is not None]
-if not available:
-    raise SystemExit(f"no predictions found under {OUT}")
-if missing:
-    print(f"skipped (no predictions yet): {', '.join(missing)}")
-
-reference = pickle.load(open(SERIES[0][1], "rb"))
-levels = sorted(level for level, folds in reference.items() if folds)
-folds = len(reference[levels[0]])
-trajectories = len({stem for fold in reference[levels[0]] for stem in fold["trajectories"]})
-caption = (f"claim_4  ·  {trajectories} held-out trajectories over {folds} trajectory-grouped folds  ·  "
-           f"band = fold spread")
-
-OUT.mkdir(parents=True, exist_ok=True)
-for metric, filename, label, floor, floor_label in FIGURES:
-    figure, axis = plt.subplots(figsize=(8.6, 5.4), facecolor=SURFACE)
-    axis.set_facecolor(SURFACE)
-    draw(axis, available, metric, label, floor, floor_label)
-
-    note = caption + (f"  ·  frames with margin >= {MARGIN:g}" if metric == "agree" else "")
-    figure.text(0.008, 0.955, note, fontsize=9, color=INK2, ha="left")
-    figure.tight_layout(rect=[0, 0, 1, 0.93])
-    figure.savefig(OUT / f"fig_{filename}.png", dpi=150, facecolor=SURFACE)
-    plt.close(figure)
-    print(f"saved {OUT / f'fig_{filename}.png'}")
-
-print(f"\n{trajectories} trajectories   {folds} folds   fold means")
-names = [name for name, _, _ in available]
-print(f"{'p':7}" + "".join(f"{name + ' ' + metric:>20}" for metric, _, _, _, _ in FIGURES for name in names))
-for level in levels:
-    cells = [values[level][metric] for metric, _, _, _, _ in FIGURES for _, values, _ in available]
-    print(f"p{level:<6.2f}" + "".join(f"{np.mean(cell):>20.3f}" for cell in cells))
+if __name__ == "__main__":
+    main()

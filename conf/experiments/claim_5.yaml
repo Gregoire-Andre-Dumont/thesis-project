@@ -1,7 +1,7 @@
 # @package _global_
 defaults:
-  - /offline_trainers: cnn_selector_samara          # the SELECTOR: MSE on true IoU
-  - /offline_trainers@gate_trainers: cnn_gate_samara   # the GATE: BCE on 'worth committing'
+  - /offline_trainers: cnn_selector_samara
+  - /offline_trainers@gate_trainers: cnn_gate_samara  
   - /trackers@tracker: samara_controller
 
 detection_data:
@@ -28,7 +28,7 @@ person_path:
   non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person, sitting_person, person_on_open_vehicle]
 
 # experiment parameters
-n_traj: 400
+n_traj: 752          # the whole selection pool at first_occ_min 7
 folds: 4         
 max_frames: 300
 out_dir: data/claim_5

@@ -1,4 +1,7 @@
 # @package _global_
+# No tracker or trainer defaults: each arm loads its own config from conf/trackers/baselines/.
+defaults: []
+
 detection_data:
   _target_: src.typing.detection_data.DetectionData
   amodal_directory: data/person_path/amodal
@@ -7,26 +10,22 @@ detection_data:
   load_frames: True
   num_threads: 32
 
+
 person_path:
   _target_: src.typing.person_path.PersonPath
   main_directory: data/person_path
   n_experiments: 1200
   random_seed: 44
   first_occ_min: 8
-  border_inset: 8  
+  border_inset: 8
   n_after_occlusion: 30
   min_visible_area: 900
   min_visible_ratio: 0.90
-  occlusion_ranges: [2, 50] 
+  occlusion_ranges: [2, 50]
   max_distractor_overlap: 0.6
   non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person, sitting_person, person_on_open_vehicle]
 
 # experiment parameters
-n_bins: 4
-n_traj: 752          # the whole selection pool at first_occ_min 7
+n_traj: 400          # the draw the restored claim_5 cache was scored on, so every clip joins
 max_frames: 300
-out_dir: data/claim_1
-thresholds: [0.0, 0.1, 0.2, 0.3, 0.4]
-oracle_config: conf/trackers/baselines/memory_oracle.yaml
-mask_oracle_config: conf/trackers/baselines/mask_oracle.yaml
-
+out_dir: data/baselines

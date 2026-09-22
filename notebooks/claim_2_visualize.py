@@ -20,10 +20,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "paper"))
+
+import style
 
 RESULTS = "data/claim_2/results.pkl"
-SURFACE, INK, INK2 = "#fcfcfb", "#0b0b0b", "#52514e"
-MEMORY, MASK, SAM = "#2a78d6", "#eb6834", "#1baf7a"     # categorical slots 1-3, same entity mapping as claim_1
+FIGURES = Path("data/claim_2/paper")
+
+# Slot order is the entity mapping claim_1 uses, and it has to be the same one: a reader who meets "sam" as
+# the blue solid line in one figure and the green dotted line in the next has to relearn the legend.
+ARMS = (("sam", "SAM 2 baseline"), ("memory", "memory oracle"), ("mask", "mask oracle"))
 
 
 COVERAGE_IOU = 0.5
@@ -48,43 +54,27 @@ results = pickle.load(open(RESULTS, "rb"))
 clips, probabilities = results["clips"], results["corruption_ps"]
 threshold = results["commit_threshold"]
 
-figure, axis = plt.subplots(figsize=(8.6, 5.4), facecolor=SURFACE)
-axis.set_facecolor(SURFACE)
-ends = []
-for colour, arm, label in ((SAM, "sam", "sam baseline"), (MEMORY, "memory", "memory oracle"),
-                           (MASK, "mask", "mask oracle")):
+style.use_paper_style()
+figure, axis = plt.subplots(figsize=(style.COLUMN, 3.1))
+
+highest = 0.0
+for position, (arm, label) in enumerate(ARMS):
     values = np.array([np.nanmean([hygiene(c, c[(arm, p)], c[(arm, p, "commit")]) for c in clips])
                        for p in probabilities])
-    axis.plot(probabilities, values, color=colour, linewidth=2, marker="o", markersize=8,
-              markeredgecolor=SURFACE, markeredgewidth=2, label=label, zorder=3)
-    ends.append((values[-1], colour, arm))
-
-gap = max(max(e[0] for e in ends) - min(e[0] for e in ends), 0.05) * 0.16
-ends.sort()
-placed = []
-for value, colour, short in ends:
-    y = value if not placed else max(value, placed[-1] + gap)
-    placed.append(y)
-    axis.annotate(short, (probabilities[-1], value), xytext=(probabilities[-1] + 0.008, y),
-                  textcoords="data", color=colour, fontsize=10, va="center")
+    axis.plot(probabilities, values, label=label, zorder=3, **style.series_style(position))
+    highest = max(highest, float(np.nanmax(values)))
 
 axis.set_xticks(probabilities)
-axis.set_xticklabels([f"{p:g}" for p in probabilities], fontsize=9, color=INK2)
-axis.set_xlabel("corruption probability  (per frame)", fontsize=10, color=INK2)
-axis.set_ylabel(f"coverage  (visible: box IoU ≥ {COVERAGE_IOU:g}   ·   occluded: did not commit)",
-                fontsize=10, color=INK2)
-axis.grid(axis="y", color=INK2, alpha=0.13, linewidth=0.8)
-axis.set_axisbelow(True)
-for side in ("top", "right"):
-    axis.spines[side].set_visible(False)
-for side in ("left", "bottom"):
-    axis.spines[side].set_color(INK2)
-    axis.spines[side].set_alpha(0.35)
-axis.tick_params(colors=INK2, labelsize=9)
-axis.set_xlim(-0.012, probabilities[-1] + 0.045)
-axis.legend(frameon=False, fontsize=10, loc="upper right")
-figure.suptitle(f"claim_2  ·  memory-bank poisoning with clean nearby distractors  ·  n={len(clips)} clips  ·  "
-                f"oracle commit threshold {threshold:g}", fontsize=12, color=INK, x=0.008, ha="left", y=0.985)
-figure.tight_layout(rect=[0, 0, 1, 0.93])
-figure.savefig("data/claim_2/fig_corruption.png", dpi=150, facecolor=SURFACE)
-print(f"saved data/claim_2/fig_corruption.png  (n={len(clips)} clips)")
+axis.set_xticklabels([f"{p:g}" for p in probabilities])
+span = probabilities[-1] - probabilities[0]
+axis.set_xlim(probabilities[0] - 0.04 * span, probabilities[-1] + 0.04 * span)
+style.gridlines(axis, 0.05)
+style.headroom(axis, highest)
+style.style_axes(axis, "corruption probability (per frame)", f"coverage @ {COVERAGE_IOU:g}")
+axis.legend(loc="best")
+
+style.save(figure, FIGURES / "fig_corruption")
+print(f"   caption: Post-occlusion coverage and memory hygiene as the memory bank is poisoned with "
+      f"clean nearby distractors. n={len(clips)} clips; oracle commit threshold {threshold:g}. "
+      f"p=0 is the clean rollout, so each curve starts at its own uncorrupted score and the slope is "
+      f"what matters, not the height.")

@@ -93,7 +93,7 @@ model:
   use_mask_input_as_output_without_sam: true
   # Memory
   directly_add_no_mem_embed: true
-  no_obj_embed_spatial: true
+  no_obj_embed_spatial: false    # SAM 2.1-only; tm/sam_large.pt is a 2.0 checkpoint and has no such weights
   # use high-resolution feature map in the SAM mask decoder
   use_high_res_features_in_sam: true
   # output 3 masks on the first click on initial conditioning frames
@@ -103,7 +103,7 @@ model:
   # cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
   use_obj_ptrs_in_encoder: true
   add_tpos_enc_to_obj_ptrs: true
-  proj_tpos_enc_in_obj_ptrs: true
+  proj_tpos_enc_in_obj_ptrs: false  # SAM 2.1-only; see above
   use_signed_tpos_enc_to_obj_ptrs: true
   only_obj_ptrs_in_the_past_for_eval: true
   # object occlusion prediction

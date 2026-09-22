@@ -64,7 +64,8 @@ class SamaraModel(SAMV2Model):
     # Calibrator-driven mask scoring
     # -------------------------------------------------------------------------------
 
-    def _score_masks(self, current_frame, candidate_masks_raw, reference_foreground, reference_background):
+    def _score_masks(self, current_frame, candidate_masks_raw, reference_foreground, reference_background,
+                     scalars=None):
         """Crop each candidate mask and build its anchor-similarity features.
         Returns ((predicted IoU, commit probability), foreground, background, features)."""
 
@@ -80,7 +81,24 @@ class SamaraModel(SAMV2Model):
         bg_fg = self.compute_patch_similarities(reference_foreground, background).reshape(n_masks, -1, side, side)
 
         features = torch.from_numpy(np.stack([fg_fg, bg_fg], axis=-1).astype(np.float32)).to("cuda")
+        features = self._append_scalars(features, scalars)
         return self._run_controller(features), foreground, background, features
+
+    @staticmethod
+    def _append_scalars(features, scalars):
+        """Append per-mask scalars as constant channels, the way `MainDataset` does at training time.
+
+        A controller trained with `dataset.scalars` reads SAM's own IoU token and object score off the
+        trailing channels, so deployment has to put them in the same place. The gate is unaffected: it
+        slices channels 0:2 and its `n_scalars` is 0, so extra channels pass it by."""
+
+        if scalars is None:
+            return features
+
+        values = torch.as_tensor(np.asarray(scalars, dtype=np.float32),
+                                 device=features.device).reshape(len(features), -1)
+        planes = values[:, None, None, None, :].expand(-1, *features.shape[1:4], values.shape[-1])
+        return torch.cat([features, planes], dim=-1)
 
     def _run_controller(self, features):
         """(predicted IoU, commit probability) per mask, each (n_masks,).
@@ -106,14 +124,15 @@ class SamaraModel(SAMV2Model):
         return predicted_iou, commit_probability
 
     @torch.inference_mode()
-    def score_proposals(self, current_frame, candidate_masks, reference_foreground, reference_background):
+    def score_proposals(self, current_frame, candidate_masks, reference_foreground, reference_background,
+                        scalars=None):
         """Per candidate mask: (predicted IoU for RANKING, commit probability for the GATE), each (n_masks,).
 
         Both come from one forward pass over the same similarity features -- the two heads disagree on what
         they optimise, not on what they see."""
 
         (scores, commit_probabilities), _, _, _ = self._score_masks(
-            current_frame, candidate_masks, reference_foreground, reference_background)
+            current_frame, candidate_masks, reference_foreground, reference_background, scalars)
         return scores, commit_probabilities
 
     # -------------------------------------------------------------------------------

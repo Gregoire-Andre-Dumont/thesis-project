@@ -14,7 +14,7 @@ person_path:
   main_directory: data/person_path
   n_experiments: 1200
   random_seed: 44
-  first_occ_min: 8
+  first_occ_min: 7
   border_inset: 8  
   n_after_occlusion: 30
   min_visible_area: 900
@@ -27,9 +27,10 @@ person_path:
 dataset_path: data/mask_oracle
 shard_index: 0
 num_shards: 1
-corruption_probabilities: [0.0, 0.05, 0.1, 0.15, 0.2]
-max_frames: 300
 
+corruption_probabilities: [0.0, 0.05, 0.1, 0.15, 0.2]
+
+max_frames: 300
 crop_resize: 448
 pad_ratio: 0.25
 random_seed: 42

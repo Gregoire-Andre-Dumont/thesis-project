@@ -78,3 +78,17 @@ class SAM2LongVideoPredictor(SAM2VideoPredictor):
 
         self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
         return inference_state
+
+    def _run_single_frame_inference(self, *args, **kwargs):
+        """Stash the per-pathway memory picks, which the base class keeps only as a local.
+
+        `propagate_in_video` threads `mem_pick_indexs` frame to frame and reads pathway 0 -- the winner of
+        its tree search -- when it assembles the returned masks, but never stores it. Without it there is
+        no way afterwards to tell WHICH pathway's scores gated a given frame's memory, and so no way to
+        recover the per-frame commit decision. Captured here rather than by copying the whole propagate
+        loop into this subclass."""
+
+        outputs = super()._run_single_frame_inference(*args, **kwargs)
+        state = kwargs.get("inference_state") or args[0]
+        state["mem_pick_indexs"] = outputs[2]
+        return outputs

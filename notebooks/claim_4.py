@@ -32,6 +32,7 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 
@@ -45,8 +46,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["HYDRA_FULL_ERROR"] = "1"
 
-MARGIN = 0.2               # a frame counts only when the best and second-best proposal differ by this much
-METRIC_NAMES = ("agree", "regret", "picked", "R2", "R2 in")
+USABLE_IOU = 0.2           # a proposal is usable when its true mask IoU clears this
+METRIC_NAMES = ("AUC", "usable")
 
 
 # ---------------------------------------------------------------------------------------
@@ -102,62 +103,35 @@ def held_out_scores(model, dataset, stems):
 # ranking: does the calibrator order the three proposals better than SAM's own IoU token?
 # ---------------------------------------------------------------------------------------
 
-def explained_variance(observed, estimated):
-    """1 - residual/total, or NaN when the observations carry no variance to explain."""
-
-    residual = float(((observed - estimated) ** 2).sum())
-    total = float(((observed - observed.mean()) ** 2).sum())
-    if total <= 0:
-        return np.nan
-    return 1.0 - residual / total
-
-
-def r_squared(truth, predicted):
-    """Pooled and WITHIN-FRAME R^2 against the true IoU.
-
-    Pooled R^2 is a calibration measure, and most of its variance sits BETWEEN frames -- easy frames where
-    every proposal is good, hard ones where none is. Ranking never asks that question. Centring both columns
-    on each frame's own mean strips the between-frame part and leaves exactly what a selector uses, so the
-    two can disagree sharply: a score can track frame difficulty beautifully and still be useless at
-    ordering the three masks inside a frame."""
-
-    pooled = explained_variance(truth.reshape(-1), predicted.reshape(-1))
-
-    centred_truth = (truth - truth.mean(1, keepdims=True)).reshape(-1)
-    centred_predicted = (predicted - predicted.mean(1, keepdims=True)).reshape(-1)
-    within_frame = explained_variance(centred_truth, centred_predicted)
-    return pooled, within_frame
-
-
 def ranking(predicted, truth):
-    """How well one score orders the proposals, over the frames where the choice actually matters.
+    """How well one score separates USABLE proposals from unusable ones.
 
-    The R^2 pair covers ALL frames rather than the high-margin ones: it measures calibration, and
-    restricting it to frames picked out by the label would condition it on the label."""
+    A proposal is usable when its true mask IoU clears `USABLE_IOU`, and the metric is the probability the
+    score ranks a usable proposal above an unusable one -- an AUC over every proposal, pooled. Chance is
+    0.50.
 
-    pooled, within_frame = r_squared(truth, predicted)
+    This asks a different question from ranking the three proposals against each other. Selection needs an
+    ordering WITHIN a frame; the gate needs to know whether the mask in hand is worth committing at all,
+    which is a decision about one proposal against a threshold. On the frames where all three proposals are
+    bad, the ordering is irrelevant and this is the only question left."""
 
-    descending = np.sort(truth, axis=1)[:, ::-1]
-    margin = descending[:, 0] - descending[:, 1]
-    matters = margin >= MARGIN
+    truth = np.asarray(truth, float).reshape(-1)
+    predicted = np.asarray(predicted, float).reshape(-1)
 
-    picked = predicted.argmax(1)
-    best = truth.argmax(1)
-    picked_iou = truth[np.arange(len(truth)), picked]
+    usable = truth > USABLE_IOU
+    keep = np.isfinite(truth) & np.isfinite(predicted)
+    usable, predicted = usable[keep], predicted[keep]
+
+    # AUC is undefined when every proposal falls on the same side of the threshold.
+    single_class = usable.all() or not usable.any()
+    area = np.nan if single_class else float(roc_auc_score(usable, predicted))
 
     return {
-        "agree": float((picked[matters] == best[matters]).mean()),
-        "regret": float((truth.max(1) - picked_iou)[matters].mean()),
-        "picked": float(picked_iou[matters].mean()),
-        "R2": pooled,
-        "R2 in": within_frame,
-        "n": int(matters.sum()),
+        "AUC": area,
+        "usable": float(usable.mean()) if len(usable) else np.nan,
+        "n": int(len(usable)),
     }
 
-
-# ---------------------------------------------------------------------------------------
-# reporting
-# ---------------------------------------------------------------------------------------
 
 def fold_mean(rows):
     """Mean of each metric across folds."""
@@ -168,19 +142,15 @@ def fold_mean(rows):
 def format_metrics(metrics):
     """One score's half of a summary row."""
 
-    agree = f"{metrics['agree']:>9.1%}"
-    regret = f"{metrics['regret']:>9.3f}"
-    picked = f"{metrics['picked']:>9.3f}"
-    pooled = f"{metrics['R2']:>8.3f}"
-    within_frame = f"{metrics['R2 in']:>8.3f}"
-    return agree + regret + picked + pooled + within_frame
+    return f"{metrics['AUC']:>12.3f}{metrics['usable']:>12.1%}"
 
 
 def summarise(rows, levels, trained_on, folds):
     """Fold-mean table, calibrator against SAM's IoU token, one row per corruption level."""
 
-    heading = f"{'agree':>9}{'regret':>9}{'picked':>9}{'R2':>8}{'R2 in':>8}"
-    print(f"\n{'':7}{'calibrator (MSE, cross-validated)':>42}{'SAM IoU token':>42}")
+    heading = f"{'AUC':>12}{'usable':>12}"
+    print()
+    print(f"{'':7}{'calibrator (MSE, cross-validated)':>24}{'SAM IoU token':>24}")
     print(f"{'p':7}{heading}{heading}   trained")
 
     for level in levels:
@@ -192,17 +162,16 @@ def summarise(rows, levels, trained_on, folds):
         seen = "yes" if level in trained_on else "NO (extrapolation)"
         print(f"p{level:<6.2f}{format_metrics(calibrator)}{format_metrics(token)}   {seen}")
 
-    print(f"\nfold means over {folds} trajectory-grouped folds; agree/regret/picked on frames with "
-          f"margin >= {MARGIN:g} (chance 33.3%)")
-    print("R2 = pooled, 'R2 in' = within-frame, both over all held-out frames")
+    print()
+    print(f"fold means over {folds} trajectory-grouped folds; AUC = P(the score ranks a usable "
+          f"proposal above an unusable one), usable = true mask IoU > {USABLE_IOU:g}, chance 0.500")
 
 
 def report_fold(level, calibrator, token):
     """One line per corruption level inside a fold."""
 
-    cnn = (f"cnn {calibrator['agree']:.1%} regret {calibrator['regret']:.3f} " f"R2 {calibrator['R2']:.3f}/{calibrator['R2 in']:.3f}")
-    sam = (f"sam {token['agree']:.1%} regret {token['regret']:.3f} " f"R2 {token['R2']:.3f}/{token['R2 in']:.3f}")
-    print(f"      p{level:.2f}: {cnn}   {sam}   n={calibrator['n']}", flush=True)
+    print(f"      p{level:.2f}: cnn AUC {calibrator['AUC']:.3f}   sam AUC {token['AUC']:.3f}   "
+          f"usable {calibrator['usable']:.1%}   n={calibrator['n']}", flush=True)
 
 
 # ---------------------------------------------------------------------------------------
