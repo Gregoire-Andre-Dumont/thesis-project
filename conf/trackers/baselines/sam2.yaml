@@ -1,13 +1,12 @@
 tracker:
-  _target_: src.modules.samara_controller.SamaraController
-  commit_threshold: 0.5   
-  gate: True   
+  _target_: src.modules.baselines.sam2.Sam2
+  # No gate: stock SAM 2 commits every frame, so no threshold applies.
   model:
     _target_: src.modules.samara_model.SamaraModel
     sam_model_path: tm/sam_large.pt
-    crop_resize: 448
-    pad_ratio: 0.25
-    feature_encoder: perception
+    crop_resize: 384
+    pad_ratio: 1.0
+    
   main_memory:
     _target_: src.modules.memories.main_memory.MainMemory
     max_memory_history: 6
@@ -16,5 +15,5 @@ tracker:
 experiment:
   _target_: src.experiments.tracking_experiment.TrackingExperiment
   resolution: 1024
-  experiment_name: samara_controller
-  video_path: data/visualize/samara_controller
+  experiment_name: sam2
+  video_path: data/visualize/sam2

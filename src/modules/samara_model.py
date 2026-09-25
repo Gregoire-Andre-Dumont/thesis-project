@@ -4,8 +4,8 @@ import numpy as np
 import torch.nn.functional as F
 from numpy.typing import NDArray
 
-from muggled_sam.sam_v2_model import SAMV2Model
-from muggled_sam.make_sam_v2 import make_samv2_from_state_dict
+from sam_2.sam_v2_model import SAMV2Model
+from sam_2.make_sam_v2 import make_samv2_from_state_dict
 from src.offline_training.dataset_encoders import load_dataset_encoders
 
 class SamaraModel(SAMV2Model):

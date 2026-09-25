@@ -5,10 +5,9 @@ Two figures, one per covariate, both reading the same per-clip score: the fracti
 frames held at box IoU >= COVERAGE_IOU. Absolute values, not deltas -- so the baseline's own difficulty is
 visible and the oracle gaps are read against it. sam has no commit gate, so it is a single line; each oracle
 is drawn at its own best commit threshold, chosen post-hoc on this same data, which makes the gaps an upper
-bound rather than an unbiased estimate.
+bound rather than an unbiased estimate."""
 
-    python notebooks/claim_1_visualize.py [results.pkl] [filename suffix] [config.yaml] [coverage|robustness]
-"""
+
 import sys
 import json
 import pickle
@@ -56,11 +55,8 @@ MEMORY, MASK, SAM = "#2a78d6", "#eb6834", "#1baf7a"     # categorical slots 1-3,
 RESULTS = sys.argv[1] if len(sys.argv) > 1 else "data/claim_1/results.pkl"
 SUFFIX = sys.argv[2] if len(sys.argv) > 2 else ""
 
-# Build the selection from the EXPERIMENT's own config, never a hardcoded copy: every anchor condition
-# (min_visible_area, border_inset, the occlusion window) changes which FRAME each trajectory anchors on, so a
-# stale copy silently plots covariates from anchors the run never used. An archived pkl was produced under ITS
-# OWN conditions and needs its own config passed here, or the anchors belong to different clips.
-METRIC = sys.argv[4] if len(sys.argv) > 4 else "coverage"       # "coverage" or "robustness"
+
+METRIC = sys.argv[4] if len(sys.argv) > 4 else "coverage"     
 CONFIG = sys.argv[3] if len(sys.argv) > 3 else "conf/experiments/claim_1.yaml"
 person_path = hydra.utils.instantiate(OmegaConf.load(CONFIG).person_path)
 anchor_of = {(v, int(p)): int(a) for v, p, a in zip(
@@ -315,9 +311,7 @@ draw(occlusions, "number of occluded frames",
      "Coverage and memory hygiene by occlusion length, largest-anchor quartile dropped.",
      FIGURES / f"fig_occlusion_small{SUFFIX}", arms=HYGIENE, ylabel=HYGIENE_YLABEL, keep=small)
 
-# The same binning again, kept to a FIXED COUNT of the smallest anchors rather than a quantile. A quantile
-# cut moves with the pool, so the previous figure's selection changes as the run adds clips; this one names
-# the same number of trajectories whatever the pool is, which is what a figure in the paper has to do.
+
 smallest = np.zeros(len(areas), dtype=bool)
 smallest[np.argsort(np.where(np.isfinite(areas), areas, np.inf))[:SMALLEST_N]] = True
 smallest &= np.isfinite(areas)

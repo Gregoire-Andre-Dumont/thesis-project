@@ -59,6 +59,11 @@ class MainDataset(Dataset):
     # collate function and the trainer are untouched; `CNNFixed` splits them off before the convolutions
     # and feeds them straight to its head. Empty by default, so the gate is unaffected.
     scalars: tuple[str, ...] = ()
+    # Keep ONLY the proposal SAM would pick (argmax of its IoU token), one sample per frame instead of
+    # three. Deployment scores that proposal alone, so training on all three fits the gate to a population
+    # the tracker never queries: the non-selected proposals are measurably worse (mean true IoU 0.33 vs
+    # 0.39 on 150 trajectories), which biases the calibrated boundary towards refusing.
+    selected_only: bool = False
 
     _features: torch.Tensor | None = None     # (samples, 1, grid, grid, channels) float32
     _labels: torch.Tensor | None = None       # (samples,) float32, the proposal's true IoU under `label`
@@ -133,11 +138,33 @@ class MainDataset(Dataset):
                 similarity_maps = np.asarray(experiment.features, dtype=np.float32)[keep]
                 per_proposal = similarity_maps.reshape(-1, 1, *similarity_maps.shape[2:])
                 per_proposal = self.with_scalars(per_proposal, experiment, keep, similarity_maps.shape[1])
+                frame_labels = iou_scores[keep].reshape(-1)
+
+                if self.selected_only:
+                    chosen = self.selected_mask(experiment, keep, similarity_maps.shape[1])
+                    per_proposal, frame_labels = per_proposal[chosen], frame_labels[chosen]
+
                 features.append(per_proposal)
-                labels.append(iou_scores[keep].reshape(-1))
+                labels.append(frame_labels)
 
         self._features = torch.from_numpy(np.concatenate(features, axis=0))
         self._labels = torch.from_numpy(np.concatenate(labels, axis=0))
+
+    @staticmethod
+    def selected_mask(experiment, keep, n_proposals):
+        """Flat (frames x proposals) mask marking the proposal SAM's IoU token would choose.
+
+        Taken from `proposal_iou_scores`, the same array the controller takes its argmax over at
+        deployment, so this reproduces the tracker's choice exactly rather than approximating it with the
+        true IoU -- which would leak the label."""
+
+        tokens = np.asarray(experiment.proposal_iou_scores, dtype=np.float32)[keep]
+        if tokens.ndim != 2 or tokens.shape[1] != n_proposals:
+            raise ValueError(f"proposal_iou_scores {tokens.shape} does not match {n_proposals} proposals")
+
+        chosen = np.zeros(tokens.shape, dtype=bool)
+        chosen[np.arange(len(tokens)), np.argmax(tokens, axis=1)] = True
+        return chosen.reshape(-1)
 
     def with_scalars(self, per_proposal, experiment, keep, n_proposals):
         """Append each requested scalar as a constant channel on every proposal's map.

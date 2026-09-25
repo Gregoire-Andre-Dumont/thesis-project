@@ -10,43 +10,34 @@ from src.modules.samara_model import SamaraModel
 
 @dataclass
 class SamaraController:
-    """SAM 2 VOS with the SAMARA calibrator making BOTH memory decisions.
+    """SAM 2 VOS with the SAMARA calibrator deciding WHAT GOES INTO MEMORY.
 
-    Two decisions, from one pass over the same anchor-similarity features:
+    ONE decision: SAM picks the mask with its own IoU token, as it always does, and the calibrator decides
+    whether that mask is written to the bank. The commit probability comes from `model.gate_controller`, a
+    CLASSIFIER on 'worth committing' -- a binary decision, so a threshold on a regressed IoU is not a
+    substitute; it is not a calibrated boundary and tends to leave the gate permanently open.
 
-        selection  -- all three proposals are scored against the anchor and the best one is kept, replacing
-                      SAM's IoU-token argmax. Ranking needs an ordering, so this reads `model.controller`,
-                      a REGRESSOR on true IoU. This is the decision claim_4 measures offline as `agree`.
-        gating     -- that proposal is committed only if its commit probability clears `commit_threshold`,
-                      replacing the oracles' ground-truth gate. This is a binary decision, so it reads
-                      `model.gate_controller`, a CLASSIFIER: a threshold on a regressed IoU is not a
-                      calibrated decision boundary and tends to leave the gate permanently open.
-
-    The two are separate models with separate objectives, so each stops training on its own schedule; only
-    the one a flag turns on has to be installed.
+    SELECTION WAS REMOVED. Letting the calibrator also pick among the three proposals was measured
+    repeatedly and never paid: it matched gate-only on small and heavily occluded targets and lost on large
+    ones, where it made the gate more permissive on clips SAM was already tracking well. Scoring one
+    proposal instead of three also cuts the Perception Encoder from ~40% of a rollout to ~19%.
 
     Nothing here reads ground truth, so unlike `MemoryOracle`/`MaskOracle` it is deployable. The anchor is
     frame 0's SAM initialization mask, pinned once; the calibrator never sees the FIFO, so a poisoned bank
     cannot drift the reference it scores against.
 
-    Set `select` or `gate` False to isolate one half and attribute a coverage change to it."""
+    Set `gate` False to commit every frame, as the baseline does, and attribute a coverage change to the
+    gate alone."""
 
     commit_threshold: float = 0.5
-    select: bool = True                # calibrator picks the proposal (else SAM's IoU token picks)
-    gate: bool = True                  # calibrator gates the commit (else commit every frame, as the baseline does)
-
-    # A SECOND condition on the commit, ANDed with the calibrator's: SAM's own IoU token for the kept
-    # proposal must also clear this. The two scores answer different questions -- the calibrator asks "is
-    # this the right person", the token asks "is this mask any good" -- so a frame that fails either is one
-    # neither model vouches for. Left None, only the calibrator gates, as before.
+    gate: bool = True       
     token_threshold: float | None = None
-
     model: SamaraModel | None = None
     main_memory: MainMemory | None = None
     frame_cache: dict | None = None
 
     def __post_init__(self):
-        """Move SAM 2 to the GPU; the calibrator is installed separately as `model.controller`."""
+        """Move SAM 2 to the GPU; the gate is installed separately as `model.gate_controller`."""
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
@@ -54,10 +45,8 @@ class SamaraController:
 
     @torch.inference_mode()
     def predict_masks(self, detection_data: DetectionData):
-        """Roll SAM 2 over the sequence, letting the calibrator choose and gate every frame."""
+        """Roll SAM 2 over the sequence, letting the calibrator gate every commit."""
 
-        if self.select and self.model.controller is None:
-            raise RuntimeError("select=True needs a selector: set tracker.model.controller before predicting")
         if self.gate and self.model.gate_controller is None:
             raise RuntimeError("gate=True needs a gate model: set tracker.model.gate_controller before predicting")
 
@@ -90,28 +79,17 @@ class SamaraController:
                 self.main_memory.initialize_calibrator_anchor(self.model, detection_data, anchor_mask, anchor_index=0)
                 reference_foreground, reference_background = self.main_memory.gather_calibrator_references()
 
-            # SAM's own opinion of each proposal, for a controller trained to read it alongside the
-            # anchor similarity (`dataset.scalars`). Harmless when it was not: the extra channels are
-            # sliced off before the convolutions and a model with `n_scalars: 0` never looks at them.
             token = iou_scores[0, 1:].to(torch.float32).cpu().numpy()
             presence = float(object_score.reshape(-1)[0])
 
-            if self.select:
-                scalars = np.stack([token, np.full(len(token), presence, dtype=np.float32)], axis=-1)
-                scores, probabilities = self.model.score_proposals(
-                    current_frame, mask_preds[0, 1:], reference_foreground, reference_background, scalars)
-                
-                proposal = int(np.argmax(scores))
-                self.calibrator_scores[idx] = torch.as_tensor(scores, dtype=torch.float64)
-                self.commit_probabilities[idx] = torch.as_tensor(probabilities, dtype=torch.float64)
-            else:
-                proposal = int(torch.argmax(iou_scores[:, 1:], dim=-1))
-                scalars = np.array([[token[proposal], presence]], dtype=np.float32)
-                scores, probabilities = self.model.score_proposals(
-                    current_frame, mask_preds[0, 1 + proposal][None], reference_foreground,
-                    reference_background, scalars)
-                self.calibrator_scores[idx, proposal] = float(scores[0])
-                self.commit_probabilities[idx, proposal] = float(probabilities[0])
+            # SAM keeps the mask; only that one is cropped and scored, so the Perception Encoder runs
+            proposal = int(torch.argmax(iou_scores[:, 1:], dim=-1))
+            scalars = np.array([[token[proposal], presence]], dtype=np.float32)
+
+            scores, probabilities = self.model.score_proposals(
+                current_frame, mask_preds[0, 1 + proposal][None], reference_foreground, reference_background, scalars)
+            self.calibrator_scores[idx, proposal] = float(scores[0])
+            self.commit_probabilities[idx, proposal] = float(probabilities[0])
 
             self.chosen_index[idx] = proposal
             commit_probability = float(self.commit_probabilities[idx, proposal])

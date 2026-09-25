@@ -3,9 +3,9 @@ import torch.nn as nn
 
 
 _CHANNEL_SLICE = {
-    "both":         slice(0, 2),     # anchor-FG similarities: foreground + background (channels 0, 1)
-    "foreground":   slice(0, 1),     # channel 0 only
-    "background":   slice(1, 2),     # channel 1 only
+    "both":         slice(0, 2),
+    "foreground":   slice(0, 1), 
+    "background":   slice(1, 2),    
 }
 
 
@@ -77,8 +77,7 @@ class CNNFixed(nn.Module):
     a calibrated yes/no on one mask (`BCEIouLoss` on IoU > threshold). They read the same features but
     overfit at different rates, so sharing a trunk would force them to stop training together."""
 
-    def __init__(self, n_channels=48, cnn_dim=256, mlp_hidden=256, dropout=0.2, channel="both", n_outputs=1,
-                 n_scalars=0):
+    def __init__(self, n_channels=48, cnn_dim=256, mlp_hidden=256, dropout=0.2, channel="both", n_outputs=1, n_scalars=0):
         super().__init__()
 
         self.channel = channel

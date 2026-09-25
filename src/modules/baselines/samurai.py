@@ -5,7 +5,7 @@ import numpy as np
 import torch.nn.functional as F
 from dataclasses import dataclass
 from src.typing.detection_data import DetectionData
-from muggled_sam.samurai.build_sam import build_samurai_video_predictor
+from sam_2.samurai.build_sam import build_samurai_video_predictor
 
 torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
 if torch.cuda.get_device_properties(0).major >= 8:

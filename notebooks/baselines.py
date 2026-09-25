@@ -1,47 +1,3 @@
-"""Published SAM 2 tracking baselines on the same clips, the same anchors and the same metric as SAMARA.
-
-Every arm here is an EXISTING method that modifies SAM 2's memory or its mask choice, so they answer the
-question a reviewer asks first: is the commit gate doing something these already do?
-
-    samite      SAMITE -- prototypical token propagation, resisting drift towards distractors
-    samurai     SAMURAI -- motion-aware memory selection, a Kalman filter scoring the proposals
-    sam2long    SAM2Long -- a tree search over `num_pathway` candidate memory states
-    sentry      SENTRY -- consistency-validated memory writes, the authors' released package
-
-The first three run SAM 2.1 through `muggled_sam` with their own video predictors, and `sentry` drives
-the authors' released package, which builds the official `sam2` predictor. All four own their memory state
-and their own initialisation. That is why there is no shared frame cache here as there is in claim_5: each
-predictor encodes the clip itself, so the arms are independent rollouts and the script costs one full pass
-per arm.
-
-CHECKPOINT PARITY. The stock configs under `conf/trackers/baselines/` point at `sam_base_plus`, but claim_1's
-SAM baseline and SAMARA both run `sam_large`. A comparison across a backbone size measures the backbone, so
-this script overrides each arm onto the large config and checkpoint. `OVERRIDES` is the one place that
-happens; set `--stock` to run a config exactly as it sits on disk instead.
-
-THE DRAW IS claim_1'S. Same `person_path` block, same `n_traj`, same anchors, so every record joins on
-(video, person) against claim_1's `sam` / oracle records and claim_5's gate arms. Each arm writes its own
-resumable `results.pkl` under `out_dir/<arm>/`, so a killed run resumes per arm and an arm can be added
-later without re-rolling the others.
-
-COMMIT FLAGS. Each arm reports a per-frame memory decision, so hygiene is computable and these sit on
-claim_5's heatmaps beside the gate arms. The decision is each method's OWN, not one invented here:
-
-    samurai/samite   memory conditioning keeps a stored frame only when its mask affinity, object score
-                     and Kalman motion score clear the model's thresholds, so that predicate is replayed
-                     over the scores the predictor already stored. These arms refuse frames.
-    sam2long         no per-frame refusal -- every frame enters each candidate pathway and the tree search
-                     chooses among pathways, so the flag is all-True.
-    sentry           refines WHICH mask is written rather than whether to write, so the flag is all-True;
-                     its decision shows up in `sources`, the branch of its three-tier selection.
-
-ONE ARM PER PROCESS. Each method vendors its own `sam2` fork and they are mutually incompatible --
-SAMURAI's and SAMITE's add a `samurai_mode` argument to `SAM2Base` that the others' do not have -- so two
-arms cannot share an interpreter. The arm is therefore a required argument rather than a loop, and the
-caller binds the matching fork with PYTHONPATH.
-
-    python notebooks/baselines.py <arm> [--stock]
-"""
 import logging
 import os
 import pickle
@@ -73,14 +29,15 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 
 # Arm name -> the tracker config that builds it.
 ARMS = {
+    "sam2": "conf/trackers/baselines/sam2.yaml",
+    "sam3": "conf/trackers/baselines/sam3.yaml",
     "samite": "conf/trackers/baselines/samite.yaml",
     "samurai": "conf/trackers/baselines/samurai.yaml",
     "sam2long": "conf/trackers/baselines/sam2long.yaml",
-    "sentry": "conf/trackers/baselines/sentry.yaml",
 }
 
 # Backbone parity with claim_1's SAM baseline and SAMARA, both of which run sam_large. `sentry` is absent
-# because its own config already names sam_large, through the official sam2 builder rather than muggled_sam.
+# because its own config already names sam_large, through the official sam2 builder rather than sam_2.
 OVERRIDES = {
     "samite": {"checkpoint": "tm/sam_large.pt", "model_config": "SAM2/samite_hiera_large.yaml"},
     "samurai": {"checkpoint": "tm/sam_large.pt", "model_config": "SAM2/samurai_hiera_large.yaml"},
@@ -152,6 +109,8 @@ def clip_record(tracker, detection_data, clip, arm):
         "samara": frame_record(predicted_masks, occlusions, boxes, first_occlusion),
         "samara_commit": commit_flags(tracker, predicted_masks.shape[0])[span],
         "commit_all": np.asarray(tracker.update_memory.numpy(), dtype=bool),
+        "mask_area": np.asarray(predicted_masks.reshape(len(predicted_masks), -1).sum(axis=1), dtype=np.int32)[span],
+        "memory_scores": (np.asarray(tracker.memory_scores.numpy(), dtype=np.float32)[span] if hasattr(tracker, "memory_scores") else None),
     }
 
 

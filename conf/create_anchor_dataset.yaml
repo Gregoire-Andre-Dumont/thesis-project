@@ -14,7 +14,7 @@ person_path:
   main_directory: data/person_path
   n_experiments: 1200
   random_seed: 44
-  first_occ_min: 7
+  first_occ_min: 8
   border_inset: 8  
   n_after_occlusion: 30
   min_visible_area: 900

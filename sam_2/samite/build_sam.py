@@ -107,7 +107,7 @@ def build_samite_video_predictor(
     **kwargs,
 ):
     hydra_overrides = [
-        "++model._target_=muggled_sam.samite.samite_video_predictor.SamiteVideoPredictor",
+        "++model._target_=sam_2.samite.samite_video_predictor.SamiteVideoPredictor",
     ]
     if apply_postprocessing:
         hydra_overrides_extra = hydra_overrides_extra.copy()

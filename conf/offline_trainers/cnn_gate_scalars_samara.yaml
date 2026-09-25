@@ -1,27 +1,23 @@
-# The SELECTOR: ranks the three proposals, so it regresses the IoU and nothing else.
-# The commit gate is a separate model with its own objective -- see cnn_gate_samara.yaml.
 main_trainer:
   _target_: src.offline_training.main_trainer.MainTrainer
-  model_name: cnn_selector_samara
+  model_name: cnn_gate_scalars_samara
   model:
     _target_: src.offline_training.classifiers.cnn_fixed.CNNFixed
-    n_channels: 64
-    cnn_dim: 64
+    n_channels: 96
+    cnn_dim: 96
     mlp_hidden: 128
     dropout: 0.1
     channel: both
     n_outputs: 1
-    n_scalars: 2            # SAM's IoU token and object score, appended to the pooled CNN embedding
+    n_scalars: 2
   criterion:
-    _target_: src.offline_training.losses.mse_iou.MSEIouLoss
+    _target_: src.offline_training.losses.bce_iou.BCEIouLoss
+    threshold: 0.2          
   dataset:
     _target_: src.offline_training.main_dataset.MainDataset
     dataset_path: data/mask_oracle
     probabilities: [0.0, 0.1]
-    include_occluded: False
-    label: iou_scores
-    # The selector ranks proposals, so it gets SAM's own opinion of them alongside the anchor similarity:
-    # the per-proposal IoU token, and the per-frame object-presence logit shared by all three.
+    include_occluded: True  
     scalars: [proposal_iou_scores, object_score]
   collate_fn:
     _target_: hydra.utils.get_method

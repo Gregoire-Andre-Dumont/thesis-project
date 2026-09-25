@@ -9,6 +9,11 @@ gate-only on any metric, so SAM's IoU token picks and the commit gate is the onl
 needs one proposal scored rather than three, so `SamaraController` crops and encodes only the mask SAM
 kept -- the Perception Encoder is 19% of a rollout instead of ~40%.
 
+THE GATE READS SAM'S OWN SCORES. Alongside the anchor similarity map it takes the per-proposal IoU token
+and the per-frame object-presence logit (`cnn_gate_scalars_samara.yaml`). They cost nothing -- SAM computes
+them every frame anyway -- and they answer the question the map cannot: not 'is this the target' but 'is
+this mask any good'.
+
 BLOCKED CROSS-VALIDATION. The clips are cut into `folds` blocks; for each block every arm's calibrator
 trains on every dataset trajectory EXCEPT that block's, then is deployed on it. So every clip is scored by
 a calibrator that never saw it. Checkpoint identity includes WHAT WAS HELD OUT: epochalyst hashes the
@@ -115,11 +120,13 @@ def checkpoint_name(arm, block_stems, all_stems):
 
     epochalyst's checkpoint hash covers the trainer config, which says nothing about which trajectories
     were held out. Without the digest, a run over a different number of trajectories reloads weights
-    trained on a different -- possibly overlapping -- set."""
+    trained on a different -- possibly overlapping -- set. The `scalars` prefix separates these gates from
+    the earlier map-only sweep, which shares the arm, the split and the corruption level but reads
+    fewer features."""
 
     held_out = " ".join(sorted(block_stems))
     digest = hashlib.sha1(held_out.encode()).hexdigest()[:10]
-    return f"cnn_gate_{arm}_{len(block_stems)}of{len(all_stems)}_{digest}"
+    return f"cnn_gate_scalars_{arm}_{len(block_stems)}of{len(all_stems)}_{digest}"
 
 
 def train_arm(trainer_config, probabilities, all_stems, block_stems, fold, arm):
@@ -219,8 +226,6 @@ def run(config: DictConfig):
     max_frames = int(config.max_frames)
     out_dir = Path(config.out_dir)
 
-    if tracker.select:
-        raise SystemExit("claim_5 is gate-only: set tracker.select False")
 
     states = {}
     for arm in ARMS:
@@ -240,7 +245,7 @@ def run(config: DictConfig):
     arm_summary = ", ".join(f"{arm}={levels}" for arm, levels in ARMS.items())
     print(f"{len(clips)} clips over {len(videos)} videos, {len(blocks)} blocks of ~{len(blocks[0])}")
     print(f"arms: {arm_summary}")
-    print(f"tracker: select={tracker.select} gate={tracker.gate} threshold={tracker.commit_threshold}")
+    print(f"tracker: gate={tracker.gate} threshold={tracker.commit_threshold}")
     for arm in ARMS:
         print(f"  {arm}: resuming with {len(states[arm]['processed'])} clips already scored")
     print(flush=True)

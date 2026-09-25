@@ -24,7 +24,7 @@ def build_samurai_video_predictor(
     **kwargs,):  
     
 
-    hydra_overrides = ["++model._target_=muggled_sam.samurai.samurai_video_predictor.SamuraiVideoPredictor"]
+    hydra_overrides = ["++model._target_=sam_2.samurai.samurai_video_predictor.SamuraiVideoPredictor"]
 
 
     if apply_postprocessing:

@@ -10,7 +10,7 @@ import numpy as np
 import torch.nn.functional as F
 from dataclasses import dataclass
 from src.typing.detection_data import DetectionData
-from muggled_sam.sam2long.build_sam import build_sam2long_video_predictor
+from sam_2.sam2long.build_sam import build_sam2long_video_predictor
 
 
 torch.autocast("cuda", dtype=torch.bfloat16).__enter__()

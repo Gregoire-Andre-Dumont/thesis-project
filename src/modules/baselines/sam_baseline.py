@@ -17,6 +17,13 @@ class SAMBaseline:
     main_memory: MainMemory | None = None
     label_mask_iou: bool = True
 
+    # SAM 2's OCCLUSION answer, which this repo's decoder leaves out: the released model blanks the mask
+    # outright when its object head says the target is gone (`torch.where(is_obj_appearing, masks,
+    # NO_OBJ_SCORE)`), so an empty mask is the tracker declaring absence rather than a failed segmentation.
+    # The decoder here only swaps the object POINTER, so the mask is restored to SAM 2's behaviour here.
+    blank_absent_masks: bool = True
+    absence_threshold: float = 0.5
+
     # Memory-bank corruption (claim_2): identical injection to the oracles -- at each commit, with probability
     # `corruption_p`, a CLEAN nearby distractor is written into the bank instead of the target.
     corruption_p: float = 0.0
@@ -50,8 +57,16 @@ class SAMBaseline:
     def should_commit(self, object_scores, iou_scores, chosen_mask, frame):
         """Whether to write this frame into the memory bank. Baseline gate = SAM's own confidence.
         Subclasses may add an identity check (e.g. a Perception-Encoder gate)."""
-        
+
         return object_scores > 0.5 and iou_scores > self.iou_threshold
+
+    def declares_absence(self, object_scores):
+        """Whether SAM's object head says the target is not in this frame.
+
+        `object_scores` arrives already through a sigmoid (`sam_v2_model.step_video_masking`), so the
+        boundary is 0.5 rather than the raw logit's 0."""
+
+        return self.blank_absent_masks and float(object_scores) <= self.absence_threshold
 
     def predict_masks(self, detection_data: DetectionData):
         """Predict the masks of the target object with the baseline SAM 2."""
@@ -102,6 +117,11 @@ class SAMBaseline:
                 self.main_memory.update_memory(pointer, encoding)
                 self.update_memory[idx] = 1
 
+
+            # Declaring absence is an ANSWER, not a failure: a blank mask on a frame with no ground-truth
+            # box is the tracker getting the frame right, and coverage-with-hygiene scores it that way.
+            if self.declares_absence(object_scores):
+                chosen_mask = torch.zeros_like(chosen_mask)
 
             self.predicted_masks[idx] = chosen_mask
             self.object_scores[idx] = object_scores

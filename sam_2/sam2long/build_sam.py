@@ -25,7 +25,7 @@ def build_sam2long_video_predictor(
     if hydra_overrides_extra is None:
         hydra_overrides_extra = []
     hydra_overrides = [
-        "++model._target_=muggled_sam.sam2long.sam2long_video_predictor.SAM2LongVideoPredictor",
+        "++model._target_=sam_2.sam2long.sam2long_video_predictor.SAM2LongVideoPredictor",
         f"++model.num_pathway={num_pathway}",
         f"++model.iou_thre={iou_thre}",
         f"++model.uncertainty={uncertainty}",

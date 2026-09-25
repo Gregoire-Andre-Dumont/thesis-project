@@ -1,0 +1,12 @@
+tracker:
+  _target_: src.modules.baselines.sam3.Sam3
+  # Standard SAM 3: the shipped single-object behaviour, which writes every frame. Meta's own memory
+  # gate rides with the detector-coupled path, not this one, so it stays off here.
+  memory_selection: False
+  checkpoint_version: sam3
+
+experiment:
+  _target_: src.experiments.tracking_experiment.TrackingExperiment
+  resolution: 1024
+  experiment_name: sam3
+  video_path: data/visualize/sam3

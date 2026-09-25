@@ -1,8 +1,13 @@
 """claim_1 (experiment): after an occlusion the memory oracle and mask oracle recover the target far better
-than the sam baseline, and their advantage widens the longer the occlusion lasts.
+than STANDARD SAM 2, and their advantage widens the longer the occlusion lasts.
 
-For every trajectory we roll out three trackers over the same clip, sharing one image-embedding cache: sam, the
-memory oracle, and the mask oracle -- each at a fixed commit-gate threshold (0.2). config.out_dir/results.pkl
+The published trackers -- SAMURAI, SAMITE, SAM2Long and SAM 3 -- answer the same question from the other
+side, and each vendors its own incompatible fork of SAM 2, so they cannot share a process with this one.
+`notebooks/baselines.py` rolls them over the SAME draw and its records carry these field names, so the
+two pkls join on (video, person) and the claim is assembled from both.
+
+For every trajectory we roll out three trackers over the same clip, sharing one image-embedding cache: standard
+SAM 2, the memory oracle, and the mask oracle -- the oracles swept over commit-gate thresholds. results.pkl
 holds one record PER TRAJECTORY -- its (video, person) id, occluded-frame count, the full occlusion series, and
 the raw per-frame box IoUs (predicted mask vs GT box) on the visible post-first-occlusion frames for every arm.
 Storing raw IoUs + per-clip metadata means coverage at any IoU threshold / AUC and occlusion/video/first-N/last-N
@@ -22,7 +27,7 @@ from create_anchor_dataset import anchor_trajectory_index
 from src.utils.compute_iou import compute_iou
 
 SUCCESS_IOU = 0.5                                                   # a frame is covered when box IoU >= this
-SAM_CONFIG = "conf/trackers/baselines/sam_baseline.yaml"
+SAM_CONFIG = "conf/trackers/baselines/sam2.yaml"      # STANDARD SAM 2: commits every frame
 
 
 BASE_DRAW = 400          # size of the original sample; growing n_traj EXTENDS it rather than redrawing
