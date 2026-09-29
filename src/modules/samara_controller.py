@@ -55,13 +55,15 @@ class SamaraController:
 
         n_frames = detection_data.frames.shape[0]
         self.predicted_masks = torch.zeros((n_frames, 256, 256), dtype=torch.float64)
-
         self.calibrator_scores = torch.full((n_frames, 3), float("nan"), dtype=torch.float64)    # predicted IoU
         self.commit_probabilities = torch.full((n_frames, 3), float("nan"), dtype=torch.float64)  # p(commit)
         self.chosen_index = torch.zeros(n_frames, dtype=torch.int64)               # which proposal was kept, 0-2
         self.committed = torch.zeros(n_frames, dtype=torch.bool)                   # whether the frame was written
         self.committed_frames = []
-        self.token_scores = torch.full((n_frames,), float("nan"), dtype=torch.float64)  # SAM's IoU token
+        self.token_scores = torch.full((n_frames,), float("nan"), dtype=torch.float64)
+
+        self.object_scores = torch.full((n_frames,), float("nan"), dtype=torch.float64)
+        self.mask_area = torch.zeros(n_frames, dtype=torch.int64)
 
         reference_foreground = reference_background = None
         cache = self.frame_cache
@@ -80,13 +82,13 @@ class SamaraController:
                 reference_foreground, reference_background = self.main_memory.gather_calibrator_references()
 
             token = iou_scores[0, 1:].to(torch.float32).cpu().numpy()
-            presence = float(object_score.reshape(-1)[0])
+            object_confidence = float(object_score.reshape(-1)[0])
+            self.object_scores[idx] = object_confidence
 
-            # SAM keeps the mask; only that one is cropped and scored, so the Perception Encoder runs
+            # SAM keeps the mask; only that one is cropped and scored, so the Perception Encoder runs once.
             proposal = int(torch.argmax(iou_scores[:, 1:], dim=-1))
-            scalars = np.array([[token[proposal], presence]], dtype=np.float32)
-
-            scores, probabilities = self.model.score_proposals(
+            scalars = np.array([[token[proposal], object_confidence]], dtype=np.float32)
+            scores, probabilities, _ = self.model.score_proposals(
                 current_frame, mask_preds[0, 1 + proposal][None], reference_foreground, reference_background, scalars)
             self.calibrator_scores[idx, proposal] = float(scores[0])
             self.commit_probabilities[idx, proposal] = float(probabilities[0])
@@ -100,7 +102,9 @@ class SamaraController:
 
             chosen_mask, pointer, encoding = self.model.commit_candidate(
                 mask_preds, proposal + 1, object_pointers, object_score, lowres_imgenc)
+
             self.predicted_masks[idx] = chosen_mask
+            self.mask_area[idx] = int(chosen_mask.sum())
 
             if not self.gate or (commit_probability > self.commit_threshold and token_holds):
                 self.main_memory.update_memory(pointer, encoding)

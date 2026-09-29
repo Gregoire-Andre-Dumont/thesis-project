@@ -119,21 +119,23 @@ class SamaraModel(SAMV2Model):
             selected = self.controller(features.float()) if self.controller is not None else None
             gate_logits = self.gate_controller(features.float()) if self.gate_controller is not None else None
 
-        predicted_iou = selected[:, 0].clamp(0.0, 1.0).cpu().numpy() if selected is not None else blank
+
+        predicted_iou = selected[:, 0].cpu().numpy() if selected is not None else blank
         commit_probability = torch.sigmoid(gate_logits[:, 0]).cpu().numpy() if gate_logits is not None else blank
         return predicted_iou, commit_probability
 
     @torch.inference_mode()
     def score_proposals(self, current_frame, candidate_masks, reference_foreground, reference_background,
                         scalars=None):
-        """Per candidate mask: (predicted IoU for RANKING, commit probability for the GATE), each (n_masks,).
+        """Per candidate mask: predicted IoU, commit probability, and mean anchor-foreground similarity.
 
-        Both come from one forward pass over the same similarity features -- the two heads disagree on what
-        they optimise, not on what they see."""
+        Both come from one forward pass over the same similarity features."""
 
-        (scores, commit_probabilities), _, _, _ = self._score_masks(
+        (scores, commit_probabilities), _, _, features = self._score_masks(
             current_frame, candidate_masks, reference_foreground, reference_background, scalars)
-        return scores, commit_probabilities
+
+        foreground_similarity = features[..., 0].mean(dim=(1, 2, 3)).float().cpu().numpy()
+        return scores, commit_probabilities, foreground_similarity
 
     # -------------------------------------------------------------------------------
     # Cropping — per-frame adaptive, driven entirely by pad_ratio
@@ -152,8 +154,7 @@ class SamaraModel(SAMV2Model):
         cropped_masks = np.zeros((masks.shape[0], crop_size, crop_size), dtype=np.float32)
 
         for index, (frame, mask) in enumerate(zip(frames, masks)):
-            mask = cv2.resize(mask.astype(np.float32), (frame.shape[1], frame.shape[0]),
-                              interpolation=cv2.INTER_LINEAR)
+            mask = cv2.resize(mask.astype(np.float32), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
             coordinates = cv2.findNonZero((mask > 0.0).astype(np.uint8))
             if coordinates is None:
                 continue

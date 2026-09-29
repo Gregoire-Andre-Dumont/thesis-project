@@ -1,25 +1,6 @@
 """claim_4: train the calibrator with cross-validation and judge it on the decision it exists to make --
-ranking the three proposals SAM emits each frame.
+ranking the three proposals SAM emits each frame."""
 
-The objective is regression on a proposal's true mask IoU. A classifier answers "is this mask above
-threshold", which is the commit-gate question; ranking needs an ordering, and on the frames where the
-choice matters all three proposals usually sit on the same side of any fixed threshold.
-
-Folds are split by TRAJECTORY. A trajectory appears once per corruption folder as a near-identical rollout
-of the same clip, and `MainDataset` pulls those together from one index, so the copies cannot land on
-opposite sides of a fold. Trajectories from the same video still can: people in one scene share lighting,
-camera and background, and often appear as each other's distractors, so these scores are optimistic
-relative to a new-scene deployment. Each fold reports how many of its test videos were also trained on.
-
-The held-out fold doubles as epochalyst's validation set, so early stopping reads the trajectories the fold
-is scored on. Across the folds every trajectory is held out exactly once, so nothing is permanently unseen
--- the cost is that the stopping epoch is chosen on the fold being reported.
-
-Training uses every LABELLED frame (visible, annotated), pre-occlusion ones included. Evaluation stays on
-the narrower post-occlusion set, excluding the anchor frame the similarity maps are measured against.
-Trained on the corruption levels in `dataset.probabilities`; every level on disk is evaluated, so the ones
-absent from that list are pure extrapolation.
-"""
 import logging
 import os
 import pickle
@@ -36,147 +17,129 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # project root on path for `src`
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.utils.compute_iou import compute_iou
 from src.metrics import coverage_auc
-
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["HYDRA_FULL_ERROR"] = "1"
 
-USABLE_IOU = 0.2           # a proposal is usable when its true mask IoU clears this
+USABLE_IOU = 0.2
 METRIC_NAMES = ("AUC", "usable")
 
 
-# ---------------------------------------------------------------------------------------
-# scoring the held-out trajectories
-# ---------------------------------------------------------------------------------------
-
-def calibrator_scores(model, similarity_maps, batch_size=256):
+def calibrator_scores(trained_model, similarity_maps, batch_size=256):
     """The calibrator's score for every proposal: (frames, proposals) from the frame's similarity maps."""
 
     n_proposals = similarity_maps.shape[1]
     per_proposal = similarity_maps.reshape(-1, 1, *similarity_maps.shape[2:])
     features = torch.from_numpy(per_proposal)
-    device = next(model.parameters()).device
+    device = next(trained_model.parameters()).device
 
     chunks = []
     with torch.no_grad():
         for start in range(0, len(features), batch_size):
-            batch = features[start:start + batch_size].to(device)
-            chunks.append(model(batch).reshape(-1))
+            batch = features[start : start + batch_size].to(device)
+            chunks.append(trained_model(batch).reshape(-1))
 
     scores = torch.cat(chunks).cpu().numpy()
     return scores.reshape(-1, n_proposals)
 
 
-def held_out_scores(model, dataset, stems):
-    """(calibrator, token, truth), each (frames, proposals), pooled over the given trajectories."""
+def held_out_scores(trained_model, dataset, trajectory_stems):
+    """(calibrator, token, object score, truth), each (frames, proposals), pooled over the trajectories.
 
-    model.eval()
-    folder = dataset.folders()[0]
+    SAM's OBJECT SCORE joins its IoU token as a second untrained reference. The two are not interchangeable:
+    the token estimates how good a proposal's mask is, the object score whether the target is in the frame
+    at all -- and the object score turned out to be the stronger absence signal at deployment, so it belongs
+    in any comparison that claims the learned score beats SAM's own. It is one value per FRAME, broadcast
+    across that frame's proposals, so it can only separate frames and never rank within one."""
+
+    trained_model.eval()
+    level_folder = dataset.folders()[0]
 
     calibrator_columns = []
     token_columns = []
+    object_columns = []
     truth_columns = []
 
-    for stem in stems:
-        experiment = pickle.load(open(folder / f"{stem}.pkl", "rb"))
-        keep = dataset.scorable(experiment)
-        if not keep.any():
+    for trajectory_stem in trajectory_stems:
+        experiment = pickle.load(open(level_folder / f"{trajectory_stem }.pkl", "rb"))
+        kept_indices = dataset.scorable(experiment)
+        if not kept_indices.any():
             continue
 
-        similarity_maps = np.asarray(experiment.features, np.float32)[keep]
-        calibrator_columns.append(calibrator_scores(model, similarity_maps))
-        token_columns.append(np.asarray(experiment.proposal_iou_scores, np.float32)[keep])
-        truth_columns.append(np.asarray(experiment.iou_scores, np.float32)[keep])
+        similarity_maps = np.asarray(experiment.features, np.float32)[kept_indices]
+        calibrator_columns.append(calibrator_scores(trained_model, similarity_maps))
+        token_columns.append(np.asarray(experiment.proposal_iou_scores, np.float32)[kept_indices])
+        truth_columns.append(np.asarray(experiment.iou_scores, np.float32)[kept_indices])
+
+        per_frame_object = np.asarray(experiment.object_score, np.float32).reshape(-1)[kept_indices]
+        object_columns.append(np.repeat(per_frame_object[:, None], similarity_maps.shape[1], axis=1))
 
     calibrator = np.concatenate(calibrator_columns)
-    token = np.concatenate(token_columns)
-    truth = np.concatenate(truth_columns)
-    return calibrator, token, truth
+    iou_token = np.concatenate(token_columns)
+    object_score = np.concatenate(object_columns)
+    ground_truth_iou = np.concatenate(truth_columns)
+    return calibrator, iou_token, object_score, ground_truth_iou
 
 
-# ---------------------------------------------------------------------------------------
-# ranking: does the calibrator order the three proposals better than SAM's own IoU token?
-# ---------------------------------------------------------------------------------------
+def ranking(predicted, ground_truth_iou):
+    """How well one score separates USABLE proposals from unusable ones."""
 
-def ranking(predicted, truth):
-    """How well one score separates USABLE proposals from unusable ones.
-
-    A proposal is usable when its true mask IoU clears `USABLE_IOU`, and the metric is the probability the
-    score ranks a usable proposal above an unusable one -- an AUC over every proposal, pooled. Chance is
-    0.50.
-
-    This asks a different question from ranking the three proposals against each other. Selection needs an
-    ordering WITHIN a frame; the gate needs to know whether the mask in hand is worth committing at all,
-    which is a decision about one proposal against a threshold. On the frames where all three proposals are
-    bad, the ordering is irrelevant and this is the only question left."""
-
-    truth = np.asarray(truth, float).reshape(-1)
+    ground_truth_iou = np.asarray(ground_truth_iou, float).reshape(-1)
     predicted = np.asarray(predicted, float).reshape(-1)
 
-    usable = truth > USABLE_IOU
-    keep = np.isfinite(truth) & np.isfinite(predicted)
-    usable, predicted = usable[keep], predicted[keep]
+    usable_samples = ground_truth_iou > USABLE_IOU
+    kept_indices = np.isfinite(ground_truth_iou) & np.isfinite(predicted)
+    usable_samples, predicted = usable_samples[kept_indices], predicted[kept_indices]
 
-    # AUC is undefined when every proposal falls on the same side of the threshold.
-    single_class = usable.all() or not usable.any()
-    area = np.nan if single_class else float(roc_auc_score(usable, predicted))
+    single_class = usable_samples.all() or not usable_samples.any()
+    area = np.nan if single_class else float(roc_auc_score(usable_samples, predicted))
 
     return {
         "AUC": area,
-        "usable": float(usable.mean()) if len(usable) else np.nan,
-        "n": int(len(usable)),
-    }
+        "usable": float(usable_samples.mean()) if len(usable_samples) else np.nan,
+        "n": int(len(usable_samples))}
 
 
-def fold_mean(rows):
+def fold_mean(sample_rows):
     """Mean of each metric across folds."""
 
-    return {metric: float(np.mean([row[metric] for row in rows])) for metric in rows[0]}
+    return {metric: float(np.mean([row[metric] for row in sample_rows])) for metric in sample_rows[0]}
 
 
-def format_metrics(metrics):
-    """One score's half of a summary row."""
-
-    return f"{metrics['AUC']:>12.3f}{metrics['usable']:>12.1%}"
-
-
-def summarise(rows, levels, trained_on, folds):
+def summarise(sample_rows, corruption_levels, trained_on, number_of_folds):
     """Fold-mean table, calibrator against SAM's IoU token, one row per corruption level."""
 
-    heading = f"{'AUC':>12}{'usable':>12}"
     print()
-    print(f"{'':7}{'calibrator (MSE, cross-validated)':>24}{'SAM IoU token':>24}")
-    print(f"{'p':7}{heading}{heading}   trained")
+    print(f"{number_of_folds}-fold means, calibrator vs SAM's own IoU token and object score:")
 
-    for level in levels:
-        if not rows[level]:
+    for corruption_level in corruption_levels:
+        if not sample_rows[corruption_level]:
             continue
 
-        calibrator = fold_mean([calibrator for calibrator, _ in rows[level]])
-        token = fold_mean([token for _, token in rows[level]])
-        seen = "yes" if level in trained_on else "NO (extrapolation)"
-        print(f"p{level:<6.2f}{format_metrics(calibrator)}{format_metrics(token)}   {seen}")
+        calibrator = fold_mean([row[0] for row in sample_rows[corruption_level]])
+        iou_token = fold_mean([row[1] for row in sample_rows[corruption_level]])
+        object_score = fold_mean([row[2] for row in sample_rows[corruption_level]])
+        seen = "yes" if corruption_level in trained_on else "NO (extrapolation)"
 
-    print()
-    print(f"fold means over {folds} trajectory-grouped folds; AUC = P(the score ranks a usable "
-          f"proposal above an unusable one), usable = true mask IoU > {USABLE_IOU:g}, chance 0.500")
+        print(f'p{corruption_level:<5.2f} trained_on={seen:<20} '
+              f'calibrator AUC {calibrator["AUC"]:.3f}  token {iou_token["AUC"]:.3f}  '
+              f'object {object_score["AUC"]:.3f}  usable {calibrator["usable"]:.3f}')
 
 
-def report_fold(level, calibrator, token):
+
+def report_fold(corruption_level, calibrator, iou_token, object_score):
     """One line per corruption level inside a fold."""
 
-    print(f"      p{level:.2f}: cnn AUC {calibrator['AUC']:.3f}   sam AUC {token['AUC']:.3f}   "
-          f"usable {calibrator['usable']:.1%}   n={calibrator['n']}", flush=True)
+    print(f'  p{corruption_level:<5.2f} AUC  calibrator {calibrator["AUC"]:.3f}  '
+          f'token {iou_token["AUC"]:.3f}  object {object_score["AUC"]:.3f}  '
+          f'(usable {calibrator["usable"]:.3f}, n={calibrator["n"]})')
 
 
-# ---------------------------------------------------------------------------------------
-# deployment: the calibrator inside the tracker
-# ---------------------------------------------------------------------------------------
 
 def stream_metrics(tracker, trajectories, detection_data):
     """Run the tracker on each held-out trajectory and average its post-occlusion coverage."""
@@ -184,8 +147,8 @@ def stream_metrics(tracker, trajectories, detection_data):
     coverages = []
     progress = tqdm(trajectories, desc="Coverage")
 
-    for stem in progress:
-        video_name, person_id = stem.rsplit("_", 1)
+    for trajectory_stem in progress:
+        video_name, person_id = trajectory_stem.rsplit("_", 1)
         detection_data.initialize_target(video_name, int(person_id))
         predicted_masks = tracker.predict_masks(detection_data).numpy()
 
@@ -201,7 +164,7 @@ def stream_metrics(tracker, trajectories, detection_data):
     return float(np.mean(coverages)) if coverages else float("nan")
 
 
-def deployed_coverage(config, model, held_out):
+def deployed_coverage(config, trained_model, held_out):
     """Coverage AUC with this fold's calibrator installed as the tracker's controller."""
 
     detection_data = hydra.utils.instantiate(config.detection_data)
@@ -209,82 +172,90 @@ def deployed_coverage(config, model, held_out):
 
     host = getattr(tracker, "model", None)
     if host is not None and hasattr(host, "controller"):
-        host.controller = model
+        host.controller = trained_model
         host.eval()
 
     return stream_metrics(tracker, held_out, detection_data)
 
 
-# ---------------------------------------------------------------------------------------
-# cross-validation
-# ---------------------------------------------------------------------------------------
-
 def corruption_levels(dataset_path):
     """Every corruption level on disk, read off the `pXX` folder names."""
 
-    folders = [folder for folder in Path(dataset_path).iterdir() if folder.is_dir()]
-    return sorted(float(folder.name[1:]) for folder in folders)
+    folders = [level_folder for level_folder in Path(dataset_path).iterdir() if level_folder.is_dir()]
+    return sorted(float(level_folder.name[1:]) for level_folder in folders)
 
 
-def score_level(trainer, level, held_out):
-    """The calibrator and SAM's token, both ranked against the truth, at one corruption level."""
+def score_level(trainer, corruption_level, held_out):
+    """The calibrator against BOTH of SAM's own scores, ranked on the truth, at one corruption level."""
 
     dataset = deepcopy(trainer.dataset)
-    dataset.probabilities = [level]
+    dataset.probabilities = [corruption_level]
 
-    calibrator_score, token_score, truth = held_out_scores(trainer.model, dataset, held_out)
-    calibrator = ranking(calibrator_score, truth)
-    token = ranking(token_score, truth)
-    return calibrator, token, calibrator_score, token_score, truth
+    calibrator_score, token_score, object_score, ground_truth_iou = held_out_scores(
+        trainer.model, dataset, held_out)
+    return {
+        "calibrator": ranking(calibrator_score, ground_truth_iou),
+        "iou_token": ranking(token_score, ground_truth_iou),
+        "object_score": ranking(object_score, ground_truth_iou),
+        "scores": {"cnn": calibrator_score, "sam": token_score, "object": object_score},
+        "truth": ground_truth_iou}
 
 
 @hydra.main(config_path="../conf", config_name="experiments/claim_4", version_base=None)
 def train_models(config: DictConfig):
     """Cross-validate the calibrator and report ranking quality at every corruption level."""
 
-    folds = int(config.get("folds", 5))
+    number_of_folds = int(config.get("folds", 5))
     template = hydra.utils.instantiate(config.offline_trainers.main_trainer)
-    stems = np.array(template.dataset.trajectories())
-    videos = [stem.rsplit("_", 1)[0] for stem in stems]
+    trajectory_stems = np.array(template.dataset.trajectories())
+    videos = [trajectory_stem.rsplit("_", 1)[0] for trajectory_stem in trajectory_stems]
 
-    levels = corruption_levels(template.dataset.dataset_path)
+    corruption_levels = corruption_levels(template.dataset.dataset_path)
     trained_on = [float(probability) for probability in template.dataset.probabilities]
 
-    print(f"{len(stems)} trajectories over {len(set(videos))} videos")
-    print(f"training on p={trained_on}, evaluating on p={levels}\n", flush=True)
 
-    rows = {level: [] for level in levels}
-    predictions = {level: [] for level in levels}
-    splits = GroupKFold(n_splits=folds).split(stems, groups=stems)
+    sample_rows = {corruption_level: [] for corruption_level in corruption_levels}
+    predictions = {corruption_level: [] for corruption_level in corruption_levels}
+    splits = GroupKFold(n_splits=number_of_folds).split(trajectory_stems, groups=trajectory_stems)
 
     for fold, (train_indices, test_indices) in enumerate(splits):
-        test_videos = {videos[index] for index in test_indices}
-        seen_videos = {videos[index] for index in train_indices}
-        overlap = f"{len(test_videos & seen_videos)}/{len(test_videos)} test videos also trained on"
-        print(f"fold {fold + 1}/{folds}: {len(train_indices)} train / {len(test_indices)} held-out "
-              f"({overlap})", flush=True)
+        test_videos = {videos[sample_index] for sample_index in test_indices}
+        seen_videos = {videos[sample_index] for sample_index in train_indices}
+        overlap = f"{len(test_videos &seen_videos)}/{len(test_videos)} test videos also trained on"
 
         trainer = hydra.utils.instantiate(config.offline_trainers.main_trainer)
-        trainer.custom_train(x=stems, y=stems, train_indices=list(train_indices), validation_indices=list(test_indices), fold=fold)
-        held_out = stems[test_indices]
+        trainer.custom_train(
+            x=trajectory_stems,
+            y=trajectory_stems,
+            train_indices=list(train_indices),
+            validation_indices=list(test_indices),
+            fold=fold)
+        held_out = trajectory_stems[test_indices]
 
-        for level in levels:
-            calibrator, token, calibrator_score, token_score, truth = score_level(trainer, level, held_out)
-            predictions[level].append({"fold": fold, "trajectories": list(held_out), "truth": truth, "cnn": calibrator_score, "sam": token_score})
+        for corruption_level in corruption_levels:
+            level = score_level(trainer, corruption_level, held_out)
+            predictions[corruption_level].append(
+                {
+                    "fold": fold,
+                    "trajectories": list(held_out),
+                    "truth": level["truth"],
+                    "cnn": level["scores"]["cnn"],
+                    "sam": level["scores"]["sam"],
+                    "object": level["scores"]["object"]}
+            )
 
-            rows[level].append((calibrator, token))
-            report_fold(level, calibrator, token)
+            sample_rows[corruption_level].append(
+                (level["calibrator"], level["iou_token"], level["object_score"]))
+            report_fold(corruption_level, level["calibrator"], level["iou_token"], level["object_score"])
 
         if config.deploy_controller:
             coverage = deployed_coverage(config, trainer.model, held_out)
-            print(f"      deployed coverage AUC: {coverage:.4f}", flush=True)
 
     destination = Path(config.predictions)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(pickle.dumps(predictions))
 
-    summarise(rows, levels, trained_on, folds)
-    print(f"held-out predictions saved to {destination}")
+    summarise(sample_rows, corruption_levels, trained_on, number_of_folds)
 
 
 if __name__ == "__main__":

@@ -65,8 +65,27 @@ class MainDataset(Dataset):
     # 0.39 on 150 trajectories), which biases the calibrated boundary towards refusing.
     selected_only: bool = False
 
+    # Carry a SECOND label column: 1 on a visible frame, 0 on an occluded one. The presence head asks
+    # whether the target is in the scene, which is the annotation's own question -- not whether this
+    # particular proposal overlapped it, which a zero IoU conflates with a mask that merely drifted.
+    presence_label: bool = False
+
+
+    # Stop a trajectory once the ORACLE has lost the target: the first run of this many consecutive VISIBLE
+    # frames where every proposal scores zero IoU. After that point the mask oracle never recovers, so the
+    # remaining frames are an arbitrarily long tail of negatives whose length is set by how much video was
+    # left -- not by anything the gate could learn. They swamp the positive class and drag the calibrated
+    # boundary towards refusing. Occluded frames are NOT counted towards the run: their zeros are correct
+    # and temporary. 0 disables the truncation.
+    truncate_after_lost: int = 0
+
+    # Where to start looking for that run. True scans from the first occlusion, so only a target lost
+    # THROUGH an occlusion counts. False scans from the anchor, which also catches trajectories the oracle
+    # never locked onto -- a different failure, but its zeros are just as uninformative to the gate.
+    truncate_from_occlusion: bool = True
+
     _features: torch.Tensor | None = None     # (samples, 1, grid, grid, channels) float32
-    _labels: torch.Tensor | None = None       # (samples,) float32, the proposal's true IoU under `label`
+    _labels: torch.Tensor | None = None       # (samples,) float32 true IoU, or (samples, 2) with visibility
 
     # ---------------------------------------------------------------------------------------
     # what the dataset is made of
@@ -99,7 +118,45 @@ class MainDataset(Dataset):
         occlusions = np.asarray(experiment.occlusions, float)
         has_box = np.asarray(experiment.true_bboxes)[:, 2] > 0
         visible = (occlusions < 0.5) & has_box
-        return visible | (occlusions > 0.5) if self.include_occluded else visible
+        keep = visible | (occlusions > 0.5) if self.include_occluded else visible
+
+        keep[self.lost_from(experiment, visible, occlusions):] = False
+        return keep
+
+    def lost_from(self, experiment, visible, occlusions):
+        """Index of the frame where the oracle loses the target for good, or the trajectory's length.
+
+        The loss is detected AFTER THE FIRST OCCLUSION, as `truncate_after_lost` consecutive VISIBLE frames
+        with every proposal at zero IoU, and the cut is made at the START of that run -- the target is
+        already gone by then, so the run itself is not training data either.
+
+        Only after the first occlusion, because that is the only place a lost target means what we think it
+        does. A pre-occlusion run of zeros is a different failure -- an anchor the oracle never locked onto
+        -- and truncating there would silently drop trajectories that were never about losing anything."""
+
+        if not self.truncate_after_lost:
+            return len(visible)
+
+        scores = np.asarray(getattr(experiment, self.label), dtype=np.float32)
+        occluded = np.asarray(occlusions, float) > 0.5
+        if scores.ndim != 2:
+            return len(visible)
+
+        if self.truncate_from_occlusion and not occluded.any():
+            return len(visible)
+        start = int(np.argmax(occluded)) if self.truncate_from_occlusion else 0
+
+        missed = visible & (scores.max(axis=1) <= 0.0)
+
+        run = 0
+        for frame in range(start, len(visible)):
+            if missed[frame]:
+                run += 1
+                if run >= self.truncate_after_lost:
+                    return frame - run + 1
+            elif visible[frame]:
+                run = 0                 # a visible hit clears it; an OCCLUDED frame merely pauses the count
+        return len(visible)
 
     def scorable(self, experiment):
         """The evaluation subset: labelled frames from the first occlusion on, minus the anchor.
@@ -139,6 +196,8 @@ class MainDataset(Dataset):
                 per_proposal = similarity_maps.reshape(-1, 1, *similarity_maps.shape[2:])
                 per_proposal = self.with_scalars(per_proposal, experiment, keep, similarity_maps.shape[1])
                 frame_labels = iou_scores[keep].reshape(-1)
+                if self.presence_label:
+                    frame_labels = np.stack([frame_labels, self.visibility(experiment, keep, similarity_maps.shape[1])], axis=-1)
 
                 if self.selected_only:
                     chosen = self.selected_mask(experiment, keep, similarity_maps.shape[1])
@@ -149,6 +208,13 @@ class MainDataset(Dataset):
 
         self._features = torch.from_numpy(np.concatenate(features, axis=0))
         self._labels = torch.from_numpy(np.concatenate(labels, axis=0))
+
+    @staticmethod
+    def visibility(experiment, keep, n_proposals):
+        """Flat (frames x proposals) visibility: 1 where the target is annotated visible, 0 where occluded."""
+
+        visible = (np.asarray(experiment.occlusions, dtype=np.float32)[keep] < 0.5).astype(np.float32)
+        return np.repeat(visible[:, None], n_proposals, axis=1).reshape(-1)
 
     @staticmethod
     def selected_mask(experiment, keep, n_proposals):
@@ -195,7 +261,7 @@ class MainDataset(Dataset):
         return len(self._features)
 
     def __getitem__(self, index):
-        """One proposal's similarity map and its true IoU."""
+        """One sample: a proposal's similarity map and its IoU label."""
 
         return self._features[index], self._labels[index]
 

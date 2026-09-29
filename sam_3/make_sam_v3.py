@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# %% Imports
+
+import json
+from time import sleep
+
+import torch
+
+from .sam_v3_model import SAMV3Core
+
+from .image_encoder_model import SAMV3ImageEncoder
+from .image_projection_model import SAMV3ImageProjection
+from .coordinate_encoder_model import SAMV3CoordinateEncoder
+from .prompt_encoder_model import SAMV3PromptEncoder
+from .mask_decoder_model import SAMV3MaskDecoder
+from .memory_encoder_model import SAMV3MemoryEncoder
+from .memory_image_fusion_model import SAMV3MemoryImageFusion
+
+from .state_dict_conversion.config_from_original_state_dict import get_model_config_from_state_dict
+from .state_dict_conversion.convert_original_state_dict_keys import SAM3ModuleType, convert_state_dict_keys
+
+# For type hints
+from pathlib import Path
+from torch import Tensor
+
+# ---------------------------------------------------------------------------------------------------------------------
+# %% Functions
+
+
+def make_samv3_from_state_dict(
+    state_dict_or_path: dict[str, Tensor] | str | Path,
+    strict_load: bool = True,
+    weights_only: bool = True,
+) -> SAMV3Core:
+    """
+    Helper used to load SAMv3 using either an 'original state dict'
+    (e.g. original SAM model weights) or 'muggled state dict'
+    (e.g. weights saved from a MuggledSAM instance).
+    Returns:
+        sam_v3_core
+    """
+
+    # Load state dict data & figure out how to handle model instantiation
+    loaded_state_dict = _load_state_dict(state_dict_or_path, strict_load, weights_only)
+    is_mugsam_sd = "config_muggled_samv3" in loaded_state_dict.keys()
+    if is_mugsam_sd:
+        sam_core = make_samv3_from_muggled_state_dict(loaded_state_dict, strict_load, weights_only)
+    else:
+        sam_core = make_samv3_from_original_state_dict(loaded_state_dict, strict_load, weights_only)
+
+    return sam_core
+
+
+# .....................................................................................................................
+
+
+def make_samv3_from_original_state_dict(
+    original_state_dict: dict | str | Path, strict_load: bool = True, weights_only: bool = True
+) -> SAMV3Core:
+    """
+    Function used to initialize a SAMV3 model from a state dictionary (i.e. model weights) file.
+    This function will automatically figure out the model sizing parameters from the state dict,
+    assuming it comes from the original SAMV3 repo (or matches the implementation).
+
+    The state dict can be provided directly (e.g. from state_dict = torch.load(...)) or
+    a string can be given, in which case it will be assumed to be a path to load the state dict
+
+    Returns:
+        sam_v3_core
+    """
+
+    # Load state dict data
+    original_state_dict = _load_state_dict(original_state_dict, strict_load, weights_only)
+
+    # Get model config from weights (i.e. sam large vs sam base) & convert to new keys/state dict
+    model_config_dict = get_model_config_from_state_dict(original_state_dict)
+    new_state_dict, _ = convert_state_dict_keys(model_config_dict, original_state_dict)
+
+    # Load model & set model weights
+    sam_core = make_sam_v3(**model_config_dict)
+
+    # Image encoding & masking
+    sam_core.image_encoder.load_state_dict(new_state_dict[SAM3ModuleType.image_encoder], strict_load)
+    sam_core.image_projection.load_state_dict(new_state_dict[SAM3ModuleType.image_projection], strict_load)
+    sam_core.coordinate_encoder.load_state_dict(new_state_dict[SAM3ModuleType.coordinate_encoder], strict_load)
+    sam_core.prompt_encoder.load_state_dict(new_state_dict[SAM3ModuleType.prompt_encoder], strict_load)
+    sam_core.mask_decoder.load_state_dict(new_state_dict[SAM3ModuleType.mask_decoder], strict_load)
+
+    # Video components
+    sam_core.memory_encoder.load_state_dict(new_state_dict[SAM3ModuleType.memory_encoder], strict_load)
+    sam_core.memory_image_fusion.load_state_dict(new_state_dict[SAM3ModuleType.memory_image_fusion], strict_load)
+
+    return sam_core
+
+
+# .....................................................................................................................
+
+
+def make_samv3_from_muggled_state_dict(
+    muggled_state_dict: dict | str | Path,
+    strict_load: bool = True,
+    weights_only: bool = True,
+) -> SAMV3Core:
+    """
+    Similar to the '...from_original_state_dict' function, this function instantiates a
+    SAMV3 model from a state dictionary file (e.g. model weights) and automatically
+    handles setting up the model configuration/sizing parameters.
+
+    This variant of the function is meant for loading from weights that were directly
+    saved from a muggled-SAMV3 instance, rather than the original model weights.
+
+    The state dict can be provided directly (e.g. from state_dict = torch.load(...)) or
+    a string can be given, in which case it will be assumed to be a path to load the state dict
+
+    Returns:
+        sam_v3_core
+    """
+
+    # Load state dict data
+    muggled_state_dict = _load_state_dict(muggled_state_dict, strict_load, weights_only)
+
+    # Try to get config from state dict
+    config_key = "config_muggled_samv3"
+    config_as_tensor = muggled_state_dict.get(config_key, None)
+    if config_as_tensor is None:
+        raise KeyError(f"Cannot load model! State dict is missing configuration ({config_key})")
+
+    # Convert config from tensor->bytes->string/json->dictionary
+    config_as_bytes = bytearray(config_as_tensor.cpu().tolist())
+    config_as_str = config_as_bytes.decode()
+    config_dict = json.loads(config_as_str)
+
+    # Load model & set model weights
+    sam_core = make_sam_v3(**config_dict)
+    sam_core.load_state_dict(muggled_state_dict, strict_load)
+
+    return sam_core
+
+
+# .....................................................................................................................
+
+
+def make_sam_v3(
+    features_per_prompt_token=256,
+    features_per_decoder_token=128,
+    features_per_memory_token=64,
+    features_per_detection_token=256,
+    imgencoder_features=1024,
+    imgencoder_num_stages=4,
+    imgencoder_num_blocks=32,
+    imgencoder_num_heads=16,
+    imgencoder_patch_size_px=14,
+    imgencoder_posenc_tile_hw=(24, 24),
+    imgencoder_window_size=24,
+    maskdecoder_num_blocks=2,
+    maskdecoder_num_heads=8,
+    maskdecoder_num_mask_tokens=4,
+    memencoder_num_downsample_layers=4,
+    memencoder_num_mixer_layers=2,
+    memimgfusion_num_fusion_layers=4,
+    memimgfusion_num_heads=1,
+    # ACCEPTED BUT UNUSED. The detection branch is stripped from this copy (see README.md), but
+    # `get_model_config_from_state_dict` still reports these sizes and muggled checkpoints still record
+    # them in their stored config, so removing them from the signature would break `make_sam_v3(**config)`
+    # on any existing weights.
+    txtencoder_features=1024,
+    txtencoder_num_blocks=24,
+    txtencoder_num_heads=16,
+    txtencoder_vocab_size=49408,
+    samplingenc_num_blocks=3,
+    samplingenc_num_heads=8,
+    imgexmfuse_num_blocks=6,
+    imgexmfuse_num_heads=8,
+    exmdetector_num_detections=200,
+    exmdetector_num_blocks=6,
+    exmdetector_num_heads=8,
+    exmsegment_num_heads=8,
+) -> SAMV3Core:
+    """
+    Helper used to build all SAMV3 model components. The arguments for this function are
+    expected to come from the 'make_samv3_from_original_state_dict' function, which
+    will fill in the function arguments based on a loaded state dictionary.
+
+    See the original 'model builder' code for more information:
+    https://github.com/facebookresearch/sam3/blob/757bbb0206a0b68bee81b17d7eb4877177025b2f/sam3/model_builder.py
+    """
+
+    # Convert config to byte-data so it can be stored with the model
+    config_dict = locals()
+    config_as_str = json.dumps(config_dict, separators=(",", ":"), indent=None)
+    config_bytes = bytearray(config_as_str.encode())
+
+    # Construct model components
+    imgenc_model = SAMV3ImageEncoder(
+        imgencoder_features,
+        imgencoder_num_stages,
+        imgencoder_num_blocks,
+        imgencoder_num_heads,
+        imgencoder_patch_size_px,
+        imgencoder_posenc_tile_hw,
+        imgencoder_window_size,
+    )
+    imgproj_model = SAMV3ImageProjection(imgencoder_features, features_per_prompt_token, features_per_detection_token)
+    coordenc_model = SAMV3CoordinateEncoder(features_per_prompt_token)
+    promptenc_model = SAMV3PromptEncoder(features_per_prompt_token)
+    maskdec_model = SAMV3MaskDecoder(
+        features_per_prompt_token,
+        features_per_decoder_token,
+        maskdecoder_num_blocks,
+        maskdecoder_num_heads,
+        maskdecoder_num_mask_tokens,
+    )
+
+    # Video components
+    memenc_model = SAMV3MemoryEncoder(
+        features_per_prompt_token,
+        features_per_memory_token,
+        num_downsample_layers=memencoder_num_downsample_layers,
+        num_mixer_layers=memencoder_num_mixer_layers,
+    )
+    memfuse_model = SAMV3MemoryImageFusion(
+        features_per_prompt_token,
+        features_per_memory_token,
+        num_layers=memimgfusion_num_fusion_layers,
+        num_heads=memimgfusion_num_heads,
+    )
+
+    # Bundle components into final model
+    return SAMV3Core(
+        imgenc_model,
+        imgproj_model,
+        coordenc_model,
+        promptenc_model,
+        maskdec_model,
+        memenc_model,
+        memfuse_model,
+        config_bytes,
+    )
+
+
+# .....................................................................................................................
+
+
+def _load_state_dict(
+    state_dict_or_path: dict[str, Tensor] | str | Path,
+    strict_load: bool = True,
+    weights_only: bool = True,
+) -> dict[str, Tensor]:
+    """
+    Helper used to handling load of model weights, which may
+    be given directly (as a dictionary) or as a file path
+    Returns: loaded_state_dict
+    """
+
+    # Feedback for not using weights_only
+    if not weights_only:
+        print(
+            "",
+            "*" * 16,
+            "*" * 16,
+            "*" * 16,
+            "WARNING (dangerous):",
+            "  Loading model weights without 'weights_only' enabled!",
+            "  This can allow for arbitrary executable code to be loaded.",
+            "  Be sure that the loaded weights are from a trusted source!",
+            "",
+            "  !!! This should not normally be disabled !!!",
+            "*" * 16,
+            "*" * 16,
+            "*" * 16,
+            sep="\n",
+            flush=True,
+        )
+        sleep(5)
+
+    # If we're given a string, assume it's a path to the state dict
+    out_state_dict = state_dict_or_path
+    need_to_load = isinstance(state_dict_or_path, (str, Path))
+    if need_to_load:
+        # Load model weights with fail check in case weights are in cuda format and user doesn't have cuda
+        try:
+            out_state_dict = torch.load(state_dict_or_path, weights_only=weights_only)
+        except RuntimeError:
+            out_state_dict = torch.load(state_dict_or_path, map_location="cpu", weights_only=weights_only)
+
+    # Feedback on using non-strict loading
+    if not strict_load:
+        print(
+            "",
+            "WARNING:",
+            "  Loading model weights without 'strict' mode enabled!",
+            "  Some weights may be missing or unused!",
+            sep="\n",
+            flush=True,
+        )
+
+    return out_state_dict

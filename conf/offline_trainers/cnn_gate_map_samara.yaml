@@ -1,0 +1,39 @@
+main_trainer:
+  _target_: src.offline_training.main_trainer.MainTrainer
+  model_name: cnn_gate_map_samara
+  model:
+    _target_: src.offline_training.classifiers.cnn_fixed.CNNFixed
+    n_channels: 96
+    cnn_dim: 96
+    mlp_hidden: 128
+    dropout: 0.1
+    channel: both
+    n_outputs: 1
+    n_scalars: 0
+  criterion:
+    _target_: src.offline_training.losses.bce_iou.BCEIouLoss
+    threshold: 0.2          
+  dataset:
+    _target_: src.offline_training.main_dataset.MainDataset
+    dataset_path: data/mask_oracle
+    probabilities: [0.0, 0.1]
+    include_occluded: True  
+  collate_fn:
+    _target_: hydra.utils.get_method
+    path: src.offline_training.main_dataset.collate_fn
+  optimizer:
+    _target_: functools.partial
+    _args_:
+      - _target_: hydra.utils.get_class
+        path: torch.optim.Adam
+    lr: 0.00001
+  epochs: 8
+  batch_size: 256
+  patience: 3
+  n_folds: 5
+  checkpointing_resume_if_exists: False
+  dataloader_args:
+    num_workers: 2
+    prefetch_factor: 4
+    pin_memory: True
+    persistent_workers: True

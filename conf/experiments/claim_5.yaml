@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - /offline_trainers: cnn_selector_samara
+  - /offline_trainers: cnn_gate_map_samara   # reported confidence: the same gate on maps alone
   - /offline_trainers@gate_trainers: cnn_gate_scalars_samara   # gate reads SAM's IoU token and object score
   - /trackers@tracker: samara_controller
 

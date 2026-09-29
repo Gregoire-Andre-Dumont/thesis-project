@@ -1,0 +1,11 @@
+tracker:
+  _target_: src.modules.baselines.dam4sam.Dam4Sam
+  checkpoint: tm/sam2.1_hiera_large.pt
+  # Resolved inside the fork's own config module, not this repo's conf/ tree.
+  model_config: sam21pp_hiera_l.yaml
+
+experiment:
+  _target_: src.experiments.tracking_experiment.TrackingExperiment
+  resolution: 1024
+  experiment_name: dam4sam
+  video_path: data/visualize/dam4sam

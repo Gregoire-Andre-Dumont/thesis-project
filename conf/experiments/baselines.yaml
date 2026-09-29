@@ -29,3 +29,5 @@ person_path:
 n_traj: 400          # the draw the restored claim_5 cache was scored on, so every clip joins
 max_frames: 300
 out_dir: data/baselines
+first_clip: 0
+last_clip: 0

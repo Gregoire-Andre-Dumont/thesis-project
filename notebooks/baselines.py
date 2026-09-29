@@ -19,6 +19,7 @@ from claim_1 import first_occlusion_frame
 from claim_1 import visible_frames
 from claim_1 import frame_record
 from claim_1 import commit_flags
+from claim_1 import confidence_signals
 from claim_5 import load_results
 from claim_5 import save_results
 
@@ -34,6 +35,10 @@ ARMS = {
     "samite": "conf/trackers/baselines/samite.yaml",
     "samurai": "conf/trackers/baselines/samurai.yaml",
     "sam2long": "conf/trackers/baselines/sam2long.yaml",
+    "sam_baseline": "conf/trackers/baselines/sam_baseline.yaml",
+    "dam4sam": "conf/trackers/baselines/dam4sam.yaml",
+    # SAM 3 ports from SAM3_Tracking_Zoo. Third-party re-implementations, not the original authors'.
+    "samurai3": "conf/trackers/baselines/samurai3.yaml",
 }
 
 # Backbone parity with claim_1's SAM baseline and SAMARA, both of which run sam_large. `sentry` is absent
@@ -42,6 +47,8 @@ OVERRIDES = {
     "samite": {"checkpoint": "tm/sam_large.pt", "model_config": "SAM2/samite_hiera_large.yaml"},
     "samurai": {"checkpoint": "tm/sam_large.pt", "model_config": "SAM2/samurai_hiera_large.yaml"},
     "sam2long": {"checkpoint": "tm/sam_large.pt", "model_config": "SAM2/sam2long_hiera_large.yaml"},
+    # DAM4SAM resolves its config inside its OWN package, so the name is not a path in this repo.
+    "dam4sam": {"checkpoint": "tm/sam2.1_hiera_large.pt", "model_config": "sam21pp_hiera_l.yaml"},
 }
 
 
@@ -61,10 +68,7 @@ def build_tracker(arm, stock):
         for key, value in OVERRIDES[arm].items():
             config[key] = value
 
-    try:
-        return hydra.utils.instantiate(config), None
-    except Exception as error:                     # a missing checkpoint or vendored module, not a bug here
-        return None, f"{type(error).__name__}: {error}"
+    return hydra.utils.instantiate(config), None
 
 
 def scorable(detection_data, clip, max_frames):
@@ -94,6 +98,7 @@ def clip_record(tracker, detection_data, clip, arm):
     first_occlusion = first_occlusion_frame(occlusions)
     span = slice(first_occlusion, len(occlusions))
     predicted_masks = tracker.predict_masks(detection_data).numpy()
+    confidence = confidence_signals(tracker, predicted_masks.shape[0])
 
     return {
         "video": video,
@@ -111,6 +116,11 @@ def clip_record(tracker, detection_data, clip, arm):
         "commit_all": np.asarray(tracker.update_memory.numpy(), dtype=bool),
         "mask_area": np.asarray(predicted_masks.reshape(len(predicted_masks), -1).sum(axis=1), dtype=np.int32)[span],
         "memory_scores": (np.asarray(tracker.memory_scores.numpy(), dtype=np.float32)[span] if hasattr(tracker, "memory_scores") else None),
+        # The confidence VOT-LT sweeps. Stored for EVERY arm, not just those with `memory_scores`: without
+        # it an arm cannot appear in a VOT-LT or MaxGM table at all, which is why sam2/samite/sam2long had
+        # to be re-run. `samara` above is this arm's per-frame mask IoU, the overlap both measures consume.
+        "iou_token": confidence["iou_token"][span],
+        "object_score": confidence["object_score"][span],
     }
 
 
@@ -139,6 +149,9 @@ def run(config: DictConfig):
 
     drawn = test_trajectories(person_path, int(config.n_traj))
     clips = [(video, int(person), int(anchor)) for video, person, anchor, *_ in drawn]
+    first_clip = int(config.get("first_clip", 0))
+    last_clip = int(config.get("last_clip", 0)) or len(clips)
+    clips = clips[first_clip:last_clip]
     videos = {video for video, _, _ in clips}
 
     print(f"{len(clips)} clips over {len(videos)} videos")
@@ -156,14 +169,10 @@ def run(config: DictConfig):
         return
 
     tracker, failure = build_tracker(arm, stock)
-    if tracker is None:
-        # A missing checkout, checkpoint or dependency is a setup problem, not a bug here -- report what
-        # it was rather than a stack trace from deep inside hydra.
-        raise SystemExit(f"{arm}: cannot build -- {failure}")
-
     print(f"{arm}: {len(processed)} clips already scored, {len(remaining)} to go", flush=True)
-    progress = tqdm(remaining, desc=arm)
-    for clip in progress:
+    progress_bar = tqdm(remaining, desc=arm)
+    
+    for clip in progress_bar:
         video, person, _ = clip
         processed.add((video, person))
 
@@ -172,7 +181,7 @@ def run(config: DictConfig):
 
         clips_scored.append(clip_record(tracker, detection_data, clip, arm))
         save_results(results_path, processed, clips_scored)
-        progress.set_postfix(coverage=float(np.nanmean([coverage(r) for r in clips_scored])))
+        progress_bar.set_postfix(coverage=float(np.nanmean([coverage(r) for r in clips_scored])))
 
     held = float(np.nanmean([coverage(record) for record in clips_scored]))
     print(f"{arm}: {len(clips_scored)} clips -> {results_path}   coverage@0.5 {held:.4f}", flush=True)
