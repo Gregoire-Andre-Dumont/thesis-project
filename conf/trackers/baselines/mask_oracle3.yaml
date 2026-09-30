@@ -1,0 +1,24 @@
+tracker:
+  _target_: src.modules.baselines.mask_oracle_v3.MaskOracle3
+  # Identical to baselines/mask_oracle.yaml except for the backbone: same oracle threshold, same selection
+  # rule, same crop geometry. The dataset this produces differs from the SAM 2 one in what generated the
+  # masks and nothing else, which is what makes the two gates comparable.
+  iou_threshold: 0.2
+  use_mask_iou: False
+  model:
+    _target_: src.modules.samara3_model.SamaraModel3
+    sam_model_path: tm/sam3.pt
+    crop_resize: 512
+    pad_ratio: 1.0
+    max_side_length: 1008
+
+  main_memory:
+    _target_: src.modules.memories.main_memory_v3.MainMemoryV3
+    max_memory_history: 6
+    max_pointer_history: 6
+
+experiment:
+  _target_: src.experiments.tracking_experiment.TrackingExperiment
+  resolution: 1008
+  experiment_name: mask oracle sam3
+  video_path: data/visualize

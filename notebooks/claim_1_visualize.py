@@ -1,235 +1,218 @@
-"""claim_1 figures: post-occlusion COVERAGE for all three arms (sam, memory oracle, mask oracle), binned by
-occlusion length and by how far the target travels from its anchor."""
+"""claim_1 table: VOT-LT F for the published baselines AND the oracles, split by occlusion length.
 
-import sys
-import json
+VOT-LT is the primary metric. The coverage@0.5, robustness and memory-hygiene scores this file used to
+compute are gone, as is the anchor-area split -- occlusion length is the covariate the claim is about.
+
+The oracles read ground truth, so their margin over the baselines is the HEADROOM a deployable commit gate
+could recover. Putting them in one table is the point of claim_1: the baselines say where the field is, the
+oracles say how much is left on the table.
+
+The baselines cannot be rolled inside claim_1 -- each fork vendors its own top-level `sam2` package and
+only one can be on the path per interpreter -- so they are JOINED from their own runs on the clips every
+arm scored.
+
+FAIRNESS: the oracles' stored records predate confidence recording. VOT-LT scores a tracker on the frames
+it chooses to report, so an arm with a confidence can earn precision by abstaining and an arm without one
+cannot. Mixing the two in one table would hand the baselines ~0.06 F for free. So when ANY arm lacks a
+confidence, every arm is scored always-report and the table says so. Re-run claim_1.py -- which now records
+confidences -- to get the swept version.
+
+    python notebooks/claim_1_visualize.py [results.pkl] [out_dir]
+    WINDOW=1 python notebooks/claim_1_visualize.py
+"""
+
+import os
 import pickle
+import sys
 from pathlib import Path
 
-import hydra
 import numpy as np
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "paper"))
 
-import style
+from src.metrics.vot_lt import Predictions
 
-
-def anchor_area(video_name, person_id, anchor_frame):
-    """Visible box area on the ANCHOR frame, px² at the 1024 working resolution."""
-
-    if video_name not in _visible_cache:
-        _visible_cache[video_name] = json.load(open(f"data/person_path/visible/{video_name}.json"))
-    visible = _visible_cache[video_name]
-    resolution_scale = 1024 / max(float(visible["metadata"]["resolution"]["width"]), float(visible["metadata"]["resolution"]["height"]))
-    for annotation_entity in visible["entities"]:
-        if annotation_entity["id"] == person_id and int(annotation_entity["blob"]["frame_idx"]) == int(anchor_frame):
-            box = annotation_entity["bb"]
-            return float(box[2]) * float(box[3]) * resolution_scale**2 if float(box[2]) > 0 else np.nan
-    return np.nan
-
-
-COVERAGE_IOU = 0.5
-FAILURE_IOU = 0.1  # below this the target is considered lost (our choice; VOT declares failure at ZERO overlap)
+STEPS = 61
 N_BINS = 4
-SURFACE, INK, INK2 = "#fcfcfb", "#0b0b0b", "#52514e"
-MEMORY, MASK, SAM = "#2a78d6", "#eb6834", "#1baf7a"  # categorical slots 1-3, fixed order, entity-stable
-
-RESULTS = sys.argv[1] if len(sys.argv) > 1 else "data/claim_1/results.pkl"
-SUFFIX = sys.argv[2] if len(sys.argv) > 2 else ""
+WINDOW = os.environ.get("WINDOW", "0") != "0"
+THRESHOLD = float(os.environ.get("THRESHOLD", "0.2"))
 
 
-METRIC = sys.argv[4] if len(sys.argv) > 4 else "coverage"
-CONFIG = sys.argv[3] if len(sys.argv) > 3 else "conf/experiments/claim_1.yaml"
-person_path = hydra.utils.instantiate(OmegaConf.load(CONFIG).person_path)
-anchor_of = {(v, int(p)): int(a) for v, p, a in zip(person_path.selected_video_names.tolist(), person_path.selected_person_ids.tolist(), person_path.selected_anchor_video_frames.tolist())}
+BASELINES = [
+    ("SAM 2",   "data/baselines_votlt/sam2/results.pkl",    ["object_score", "iou_token"]),
+    ("SAMITE",  "data/baselines_votlt/samite/results.pkl",  ["object_score", "iou_token"]),
+    ("SAMURAI", "data/baselines/samurai/results.pkl",       ["memory_scores:0", "memory_scores:1"]),
+]
+
+ORACLES = [("memory oracle", "memory"), ("mask oracle", "mask")]
+ORACLE_CONFIDENCES = ["__true_iou__"]
 
 
-def visible(clip_record, box_ious):
-    """The clip's per-frame IoUs on the VISIBLE annotated post-occlusion frames."""
+def at_threshold(value):
+    """The swept oracles store {threshold: array}; everything else stores the array itself."""
 
-    box_ious = np.asarray(box_ious, dtype=float)
-    return box_ious[clip_record["has_box"] & ~clip_record["occluded"]] if "occluded" in clip_record else box_ious
-
-
-def coverage(clip_record, box_ious, commits=None):
-    """Fraction of visible post-occlusion frames held at box IoU >= COVERAGE_IOU. Credits a tracker that
-    loses the target and re-finds it, and is indifferent to WHEN in the clip the held frames fall."""
-
-    box_ious = visible(clip_record, box_ious)
-    return float((box_ious >= COVERAGE_IOU).mean()) if len(box_ious) else np.nan
+    if isinstance(value, dict):
+        if THRESHOLD in value:
+            return value[THRESHOLD]
+        return value[min(value, key=lambda key: abs(float(key) - THRESHOLD))]
+    return value
 
 
-def coverage_with_occlusion(clip_record, box_ious, commits):
-    """Coverage over ALL annotated post-occlusion frames, scoring the two kinds of frame by what the arm can
-    actually get right on each: a VISIBLE frame counts when box IoU >= COVERAGE_IOU, an OCCLUDED frame counts"""
+def values(record, signal):
+    """One confidence as a per-frame vector; `field:column` selects a column."""
 
-    if commits is None or "occluded" not in clip_record:
-        return np.nan
-
-    box_ious = np.asarray(box_ious, dtype=float)
-    seen, hidden = clip_record["has_box"] & ~clip_record["occluded"], np.asarray(clip_record["occluded"])
-    scored_rows = int(seen.sum() + hidden.sum())
-    if not scored_rows:
-        return np.nan
-
-    held_frames = float((box_ious[seen] >= COVERAGE_IOU).sum())
-    clean_refusals = float((~np.asarray(commits, dtype=bool)[hidden]).sum())
-    return (held_frames + clean_refusals) / scored_rows
+    field, _, column = signal.partition(":")
+    value = np.asarray(record[field], dtype=float)
+    value = value[:, int(column)] if column else (np.nanmax(value, axis=1) if value.ndim == 2 else value)
+    return np.nan_to_num(value, nan=-np.inf)
 
 
-def robustness(clip_record, box_ious):
-    """Fraction of the visible post-occlusion frames that precede the FIRST failure, a failure being the first
-    visible frame at box IoU < FAILURE_IOU. 1.0 when the arm never fails."""
+def frame_masks(record):
+    """`(occluded, evaluated)` for one clip, with the memory window applied when asked for."""
 
-    box_ious = visible(clip_record, box_ious)
-    if not len(box_ious):
-        return np.nan
-    failure_mask = box_ious < FAILURE_IOU
-    return float(int(np.argmax(failure_mask)) / len(box_ious)) if failure_mask.any() else 1.0
-
-
-_visible_cache = {}
+    occluded = np.asarray(record["occluded"], dtype=bool)
+    kept = np.asarray(record["has_box"], dtype=bool).copy()
+    if WINDOW and occluded.any():
+        kept[: int(np.where(occluded)[0][-1]) + 1] = False
+    return occluded, kept
 
 
-def mean_displacement(video_name, person_id, anchor_frame, n_frames):
-    """Mean distance from the ANCHOR box centre to the box centre on every visible frame of the clip, px at the
-    1024 working resolution."""
+def always_report(arm, clip_keys):
+    """VOT-LT with every frame reported: precision = recall = mean overlap over the scored frames."""
 
-    if video_name not in _visible_cache:
-        _visible_cache[video_name] = json.load(open(f"data/person_path/visible/{video_name}.json"))
-    visible = _visible_cache[video_name]
-    resolution_scale = 1024 / max(float(visible["metadata"]["resolution"]["width"]), float(visible["metadata"]["resolution"]["height"]))
-
-    entity_boxes = {e["blob"]["frame_idx"]: e["bb"] for e in visible["entities"] if e["id"] == person_id}
-    box_centre = lambda b: (float(b[0]) + float(b[2]) / 2.0, float(b[1]) + float(b[3]) / 2.0)
-    frame_indices = sorted(frame_index for frame_index in entity_boxes if frame_index >= anchor_frame and float(entity_boxes[frame_index][2]) > 0)[:n_frames]
-    if not frame_indices:
-        return np.nan
-
-    anchor_x, anchor_y = box_centre(entity_boxes[frame_indices[0]])
-    offsets = [np.hypot(box_centre(entity_boxes[frame_index])[0] - anchor_x, box_centre(entity_boxes[frame_index])[1] - anchor_y) for frame_index in frame_indices]
-    return float(np.mean(offsets) * resolution_scale)
+    predictions = Predictions()
+    for key in clip_keys:
+        record, overlap = arm.record(key), np.asarray(arm.overlap(key), dtype=float)
+        occluded, kept = frame_masks(record)
+        predictions.add(overlap, np.ones(len(overlap)), occluded, kept)
+    return predictions.macro_scores([0.5])[3]
 
 
-score_function, YLABEL = {"coverage": (coverage, f"coverage @ {COVERAGE_IOU:g}"), "robustness": (robustness, f"robustness @ {FAILURE_IOU:g}")}[METRIC]
-HYGIENE_YLABEL = f"coverage @ {COVERAGE_IOU:g}"
+def swept(arm, clip_keys):
+    """Best VOT-LT F over the arm's confidences, each on its own quantile grid."""
 
-results = pickle.load(open(RESULTS, "rb"))
-thresholds = list(results["thresholds"])
+    best = 0.0
+    for signal in arm.signals:
+        vectors = [arm.confidence(key, signal) for key in clip_keys]
+        if any(vector is None for vector in vectors):
+            continue
+        pool = np.concatenate(vectors)
+        pool = pool[np.isfinite(pool)]
+        if not len(pool):
+            continue
+        thresholds = np.unique(np.quantile(pool, np.linspace(0, 1, STEPS)))
 
-
-def arm_scores(clip_record, metric_name):
-    """(sam, [memory per threshold], [mask per threshold]) under one metric, with the matching commit flags."""
-
-    return (
-        metric_name(clip_record, clip_record["sam"], clip_record.get("sam_commit")),
-        [
-            metric_name(
-                clip_record,
-                clip_record["memory"][commit_threshold],
-                clip_record.get("memory_commit", {}).get(commit_threshold))
-            for commit_threshold in thresholds
-        ],
-        [
-            metric_name(
-                clip_record,
-                clip_record["mask"][commit_threshold],
-                clip_record.get("mask_commit", {}).get(commit_threshold))
-            for commit_threshold in thresholds
-        ])
+        predictions = Predictions()
+        for key, vector in zip(clip_keys, vectors):
+            record = arm.record(key)
+            occluded, kept = frame_masks(record)
+            predictions.add(arm.overlap(key), vector, occluded, kept)
+        best = max(best, predictions.macro_scores(thresholds)[3])
+    return best
 
 
-occlusions, displacements, anchor_areas, scored_rows, scored_hygiene = [], [], [], [], []
-for clip_record in results["clips"]:
-    anchor_frame = anchor_of.get((clip_record["video"], int(clip_record["person"])))
-    if not len(clip_record["sam"]) or anchor_frame is None:
-        continue
-    displacement = mean_displacement(clip_record["video"], int(clip_record["person"]), anchor_frame, int(clip_record["n_frames"]))
-    area = anchor_area(clip_record["video"], int(clip_record["person"]), anchor_frame)
-    if not (np.isfinite(displacement) and np.isfinite(area)):
-        continue
+class Arm:
+    """One row of the table: where its overlap lives, where its confidence lives, and whether it has one."""
 
-    occlusions.append(int(clip_record["occ_count"]))
-    displacements.append(displacement)
-    anchor_areas.append(area)
-    scored_rows.append(arm_scores(clip_record, score_function))
-    scored_hygiene.append(arm_scores(clip_record, coverage_with_occlusion))
+    def __init__(self, label, clips, overlap_key, signals, from_claim_1):
+        self.label, self.clips, self.overlap_key = label, clips, overlap_key
+        self.signals, self.from_claim_1 = signals, from_claim_1
 
-occlusions = np.array(occlusions)
-displacements = np.array(displacements)
-anchor_areas = np.array(anchor_areas)
+    def record(self, key):
+        return self.clips[key]
 
+    def overlap(self, key):
+        record = self.clips[key]
+        return at_threshold(record[self.overlap_key]) if self.from_claim_1 else record["samara"]
 
-def arm_arrays(rows):
-    """Stack the per-clip tuples into (sam (n), memory (n, thresholds), mask (n, thresholds))."""
-    return (
-        np.array([score_row[0] for score_row in rows]),
-        np.array([score_row[1] for score_row in rows]),
-        np.array([score_row[2] for score_row in rows]))
+    def confidence(self, key, signal):
+        record = self.clips[key]
+        n_frames = len(record["occluded"])
+        if signal == "__true_iou__":
+            # An oracle reports on what it can verify: the true IoU of the mask it just produced.
+            value = np.nan_to_num(np.asarray(self.overlap(key), dtype=float), nan=0.0)
+        elif self.from_claim_1:
+            stored = record.get(f"{self.overlap_key}_confidence")
+            if stored is None:
+                return None
+            stored = at_threshold(stored)
+            if signal not in stored:
+                return None
+            value = np.nan_to_num(np.asarray(stored[signal], dtype=float), nan=-np.inf)
+        else:
+            value = values(record, signal)
+        return value[-n_frames:] if len(value) >= n_frames else np.pad(
+            value, (0, n_frames - len(value)), constant_values=-np.inf)
 
-
-ARMS = arm_arrays(scored_rows)
-HYGIENE = arm_arrays(scored_hygiene)
-baseline_scores = ARMS[0]
-
-
-def draw(covariate_values, xlabel, caption, filename, arm_arrays_selected=None, ylabel=None, tick="{:.0f}", keep=None):
-    """One paper figure: the three arms' score across quantile bins of `values`, over every clip."""
-
-    baseline_scores, memory_oracle_scores, mask_oracle_scores = (ARMS if arm_arrays_selected is None else arm_arrays_selected)
-    if keep is not None:
-        covariate_values = covariate_values[keep]
-        baseline_scores, memory_oracle_scores, mask_oracle_scores = (baseline_scores[keep], memory_oracle_scores[keep], mask_oracle_scores[keep])
-    if len(baseline_scores) < 2:
-        return
-
-    memory_best = int(np.nanmean(memory_oracle_scores, axis=0).argmax())
-    mask_best = int(np.nanmean(mask_oracle_scores, axis=0).argmax())
-
-    edges = np.unique(np.quantile(covariate_values, np.linspace(0, 1, N_BINS + 1)))
-    index = np.clip(np.digitize(covariate_values, edges[1:-1]), 0, len(edges) - 2)
-    x = np.arange(len(edges) - 1)
-
-    figure, axis = plt.subplots(figsize=(style.COLUMN, 3.1))
-    series = [(np.array([baseline_scores[index == bin_index].mean() for bin_index in x]), "SAM 2 baseline")]
-
-    for values_by_threshold, series_label, featured in (
-        (memory_oracle_scores, "memory oracle", memory_best),
-        (mask_oracle_scores, "mask oracle", mask_best)):
-        
-        per_bin = np.array([values_by_threshold[index == bin_index, featured].mean() for bin_index in x])
-        series.append((per_bin, rf"{series_label} ($\tau$={thresholds[featured]:g})"))
-
-    for position, (per_bin, series_label) in enumerate(series):
-        axis.plot(x, per_bin, label=series_label, zorder=3, **style.series_style(position))
-
-    axis.set_xticks(x)
-    axis.set_xticklabels([f"{tick.format(edges[bin_index])}-{tick.format(edges[bin_index + 1])}" for bin_index in x])
-    axis.set_xlim(-0.18, len(x) - 1 + 0.18)
-    style.headroom(axis, max(per_bin.max() for per_bin, _ in series))
-    style.style_axes(axis, xlabel, YLABEL if ylabel is None else ylabel)
-    axis.legend(loc="best", ncol=1)
-
-    style.save(figure, filename)
-    counts = ",".join(str(int((index == bin_index).sum())) for bin_index in x)
+    def has_confidence(self, clip_keys):
+        return any(all(self.confidence(key, signal) is not None for key in clip_keys)
+                   for signal in self.signals)
 
 
-style.use_paper_style()
-FIGURES = Path("data/claim_1/paper")
+def occlusion_bins(reference, clip_keys):
+    """Four QUANTILE bins on the number of occluded frames, plus a pooled column.
 
-draw(occlusions, "number of occluded frames", "Coverage and memory hygiene by occlusion length.", FIGURES / f"fig_occlusion{SUFFIX}",arm_arrays_selected=HYGIENE,ylabel=HYGIENE_YLABEL)
-draw(anchor_areas, "anchor visible area","Coverage and memory hygiene by anchor size.", FIGURES / f"fig_area{SUFFIX}", arm_arrays_selected=HYGIENE, ylabel=HYGIENE_YLABEL)
+    Quantiles rather than fixed cut-points so every bin rests on roughly the same number of clips; a fixed
+    grid puts most of the draw in one bin and leaves the long tail too thin to read."""
 
-def pooled(series_label, arm_arrays_selected):
-    baseline, memory_oracle_scores, mask_oracle_scores = arm_arrays_selected
-    best_memory, best_mask = int(np.nanmean(memory_oracle_scores, 0).argmax()), int(np.nanmean(mask_oracle_scores, 0).argmax())
+    counts = np.array([reference[key]["occ_count"] for key in clip_keys], dtype=float)
+    edges = np.quantile(counts, np.linspace(0, 1, N_BINS + 1))
+    bins, labels = [], []
+    for index in range(N_BINS):
+        low, high = edges[index], (np.inf if index == N_BINS - 1 else edges[index + 1])
+        bins.append((low, high))
+        labels.append(f"{int(low)}-{int(counts.max()) if np.isinf(high) else int(high)}")
+    return bins + [(0.0, np.inf)], labels + ["all"]
 
 
-pooled(METRIC, ARMS)
-pooled("coverage + hygiene", HYGIENE)
+def main():
+    results_path = Path(sys.argv[1] if len(sys.argv) > 1 else "data/claim_1/results.pkl")
+    out_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "data/sam-2/claim_1")
+
+    oracle_clips = {(r["video"], r["person"]): r
+                    for r in pickle.load(open(results_path, "rb"))["clips"]}
+
+    arms = []
+    for label, path, signals in BASELINES:
+        if not Path(path).exists():
+            continue
+        clips = {(r["video"], r["person"]): r for r in pickle.load(open(path, "rb"))["clips"]}
+        arms.append(Arm(label, clips, None, signals, from_claim_1=False))
+
+    for label, arm_key in ORACLES:
+        arms.append(Arm(label, oracle_clips, arm_key, ORACLE_CONFIDENCES, from_claim_1=True))
+
+    clip_keys = sorted(set.intersection(*(set(arm.clips) for arm in arms)))
+    clip_keys = [key for key in clip_keys
+                 if all(not arm.from_claim_1 or at_threshold(arm.clips[key].get(arm.overlap_key)) is not None
+                        for arm in arms)]
+    if not clip_keys:
+        raise SystemExit("no clip is scored by every baseline and both oracles")
+
+    missing = [arm.label for arm in arms if not arm.has_confidence(clip_keys)]
+    score = always_report if missing else swept
+
+    reference = arms[0].clips
+    bins, labels = occlusion_bins(reference, clip_keys)
+
+    rows = {}
+    for arm in arms:
+        cells = []
+        for low, high in bins:
+            keys = [key for key in clip_keys if low <= reference[key]["occ_count"] < high]
+            cells.append(score(arm, keys) if keys else float("nan"))
+        rows[arm.label] = cells
+        print(f"{arm.label:16s}" + "".join(f"{value:12.4f}" for value in cells))
+
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = "table_votlt_by_occlusion" + ("_window" if WINDOW else "") + ".csv"
+    with open(out_dir / name, "w") as handle:
+        handle.write("arm," + ",".join(labels) + "\n")
+        for label, cells in rows.items():
+            handle.write(label + "," + ",".join(f"{value:.4f}" for value in cells) + "\n")
+        handle.write("n clips," + ",".join(str(count) for count in counts) + "\n")
+
+
+if __name__ == "__main__":
+    main()

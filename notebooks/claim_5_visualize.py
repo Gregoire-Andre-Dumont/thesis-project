@@ -1,326 +1,226 @@
-"""claim_5 figures: every gate arm against SAM's own gate, on the covariates where the gate should matter."""
+"""claim_5 table: VOT-LT F for SAMARA and the published baselines, split by occlusion length.
 
-import json
+VOT-LT is the primary metric. It scores a tracker on the frames it CHOOSES to report, so a controller that
+stays silent through an occlusion is credited for the silence rather than only for what it says afterwards
+-- which coverage@0.5 cannot express.
+
+THE OPERATING POINT IS CHOSEN ONCE, ON HELD-OUT FOLDS.
+
+  * ONE threshold for the whole table. Re-sweeping inside each occlusion bin would report what an arm
+    could achieve in that regime if it knew which regime it was in; a deployed controller ships one
+    threshold and meets every occlusion length with it.
+  * That threshold, and the confidence it applies to, are picked on the TRAINING folds and applied to the
+    held-out fold. Picking them on the same clips the number is reported on is selection on the evaluation
+    set and inflates every arm -- most the ones with the most signals to choose between.
+
+Each clip is therefore scored at a threshold chosen without having seen it. The bins then just group
+clips; they never re-tune.
+
+WINDOW=1 restricts scoring to the memory window -- every occluded frame plus only the visible frames AFTER
+the last occlusion.
+
+    python notebooks/claim_5_visualize.py [arms_dir] [out_dir]
+    WINDOW=1 python notebooks/claim_5_visualize.py
+"""
+
+import os
 import pickle
 import sys
 from pathlib import Path
 
 import numpy as np
-import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "paper"))
+from src.metrics.vot_lt import Predictions
 
-import style
+STEPS = 61
+N_BINS = 4
+N_FOLDS = 5
+WINDOW = os.environ.get("WINDOW", "0") != "0"
 
-VISIBLE_DIR = Path("data/person_path/visible")
-
-COVERAGE_IOU = 0.5
-BINS = 4
-SMALL_ANCHOR_QUANTILE = 0.50
-
-
-COMBINED = ("p0.00", "p0.15")
-BOOTSTRAP = 10000
-SURFACE, INK, INK2 = "#fcfcfb", "#0b0b0b", "#52514e"
-
-
-BASELINE_COLOUR = "#cc4444"
-ARM_RAMP = ["#a1d99b", "#74c476", "#41ab5d", "#238b45", "#005a32"]
-
-
-DIVERGING = LinearSegmentedColormap.from_list("gate_vs_sam", ["#7f2222", "#cc4444", "#e6b3b3", "#f0efec", "#a9c8ea", "#2a78d6", "#154272"])
-
-
-def hygiene(clip_record, box_ious, commits):
-    """Coverage over ALL annotated post-occlusion frames: a visible frame counts when it is held, an occluded frame
-    when the arm did NOT write it to memory -- committing while the target is hidden is exactly how a bank gets"""
-
-    seen = clip_record["has_box"] & ~clip_record["occluded"]
-    occluded_frames = np.asarray(clip_record["occluded"])
-    scored_values = int(seen.sum() + occluded_frames.sum())
-    if not scored_values:
-        return np.nan
-
-    box_ious = np.asarray(box_ious, dtype=float)
-    held = float((box_ious[seen] >= COVERAGE_IOU).sum())
-    clean = float((~np.asarray(commits, dtype=bool)[occluded_frames]).sum())
-    return (held + clean) / scored_values
-
-
-def arm_hygiene(scored_clips, clip_keys):
-    """One arm's hygiene per clip, in the given clip order."""
-
-    return np.array(
-        [
-            hygiene(scored_clips[clip_key], scored_clips[clip_key]["samara"], scored_clips[clip_key]["samara_commit"])
-            for clip_key in clip_keys
-        ]
-    )
-
-
-def baseline_hygiene(baseline, clip_keys):
-    """SAM's hygiene per clip, in the given clip order."""
-
-    return np.array(
-        [
-            hygiene(baseline[clip_key], baseline[clip_key]["sam"], baseline[clip_key]["sam_commit"])
-            for clip_key in clip_keys
-        ]
-    )
-
-
-_boxes = {}
-
-
-def anchor_area(clip_record):
-    """The target's VISIBLE box area at its anchor, px^2 at the 1024 working resolution; NaN if missing."""
-
-    video = clip_record["video"]
-    if video not in _boxes:
-        _boxes[video] = json.load(open(VISIBLE_DIR / f"{video }.json"))
-
-    data = _boxes[video]
-    resolution = data["metadata"]["resolution"]
-    scale = 1024 / max(float(resolution["width"]), float(resolution["height"]))
-
-    for entity in data["entities"]:
-        matches_person = entity["id"] == clip_record["person"]
-        matches_anchor = int(entity["blob"]["frame_idx"]) == int(clip_record["anchor"])
-        if matches_person and matches_anchor:
-            box = entity["bb"]
-            if float(box[2]) <= 0:
-                return np.nan
-            return float(box[2]) * float(box[3]) * scale**2
-    return np.nan
-
-
-def occluded_frames(clip_record):
-    """Number of frames of the scored span on which the target is hidden -- the stored occlusion flags."""
-
-    occluded_frames = np.asarray(clip_record["occluded"], dtype=bool)
-    return float(occluded_frames.sum()) if len(occluded_frames) else np.nan
+# ONE confidence per arm, fixed in advance -- no sweep over signals.
+#
+# Every baseline is scored on SAM's OBJECT SCORE: the presence logit, which is the signal a long-term
+# tracker is supposed to report on. Sweeping each arm over both of its scores and keeping the better one
+# would quietly reward whichever arm happens to own two usable heads. SAMURAI's run predates the split
+# columns and keeps the object logit in `memory_scores` column 1.
+#
+# SAMARA is scored on its GATE PROBABILITY, because that is its contribution: the commit decision is the
+# thing under test, and the gate probability is what a deployed SAMARA would report on.
+#
+# Two arms are deliberately absent. DAM4SAM runs `tm/sam2.1_hiera_large.pt` where every other arm here --
+# and the oracles in claim_1 -- runs `tm/sam_large.pt`, because the 2.0 weights lack keys its architecture
+# needs; its row would confound a better BACKBONE with a better memory. SAM2Long's run stalled at 57 clips
+# and the table scores the intersection, so including it would cut every other arm to 57.
+BASELINES = [
+    ("SAM 2",   "data/baselines_votlt/sam2/results.pkl",    "object_score"),
+    ("SAMITE",  "data/baselines_votlt/samite/results.pkl",  "object_score"),
+    ("SAMURAI", "data/baselines/samurai/results.pkl",       "memory_scores:1"),
+]
+SAMARA_SIGNAL = "commit_probability"
 
 
 def keyed(results_path):
-    """Clip records indexed by (video, person)."""
-
-    scored_clips = pickle.load(open(results_path, "rb"))["clips"]
-    return {(clip_record["video"], clip_record["person"]): clip_record for clip_record in scored_clips}
+    clips = pickle.load(open(results_path, "rb"))["clips"]
+    return {(record["video"], record["person"]): record for record in clips}
 
 
-def combined_arm(arm_names, clip_keys, quantile=SMALL_ANCHOR_QUANTILE):
-    """A synthetic arm taking `COMBINED[0]` on large anchors and `COMBINED[1]` on small ones."""
-
-    large, small_anchor_mask = arm_names[COMBINED[0]], arm_names[COMBINED[1]]
-    anchor_areas = np.array([anchor_area(large[clip_key]) for clip_key in clip_keys], dtype=float)
-    bin_cut = np.nanquantile(anchor_areas, quantile)
-    return {
-        clip_key: (small_anchor_mask[clip_key] if np.isfinite(a) and a < bin_cut else large[clip_key])
-        for clip_key, a in zip(clip_keys, anchor_areas)
-    }
 
 
-def shared_clips(arm_names, baseline):
-    """The clips every arm AND the baseline scored, so all the lines rest on the same set."""
+def values(record, signal):
+    """One confidence as a per-frame vector; `field:column` selects a column."""
 
-    scored_by_all = set.intersection(*(set(scored_clips) for scored_clips in arm_names.values()))
-    return sorted(scored_by_all & set(baseline))
-
-
-def interval(metric_values, random_generator):
-    """95% bootstrap interval for the mean, resampled over clips."""
-
-    metric_values = metric_values[np.isfinite(metric_values)]
-    if not len(metric_values):
-        return np.nan, np.nan
-
-    draws = random_generator.choice(metric_values, (BOOTSTRAP, len(metric_values)), replace=True).mean(axis=1)
-    return np.percentile(draws, [2.5, 97.5])
+    field, _, column = signal.partition(":")
+    value = np.asarray(record[field], dtype=float)
+    value = value[:, int(column)] if column else (np.nanmax(value, axis=1) if value.ndim == 2 else value)
+    return np.nan_to_num(value, nan=-np.inf)
 
 
-def quantile_bins(metric_values):
-    """(bin index per clip, edges) for equal-count bins, so every point rests on the same many clips."""
+def curves(scored_clips, signal, clip_keys):
+    """`(precision, recall, grid)` -- per-clip curves over a shared threshold grid.
 
-    bin_edges = np.unique(np.quantile(metric_values, np.linspace(0, 1, BINS + 1)))
-    bin_index = np.clip(np.digitize(metric_values, bin_edges[1:-1]), 0, len(bin_edges) - 2)
-    return bin_index, bin_edges
+    Rows follow `clip_keys`, so a fold can index them directly."""
 
+    vectors = []
+    for key in clip_keys:
+        record = scored_clips[key]
+        n_frames = len(record["occluded"])
+        vector = values(record, signal)
+        vectors.append(vector[-n_frames:] if len(vector) >= n_frames
+                       else np.pad(vector, (0, n_frames - len(vector)), constant_values=-np.inf))
 
-def heatmap(
-    arm_names, baseline, clip_keys, covariate, table_title, subtitle, x_axis_label, filename, tick_format="{:.0f}"
-):
-    """Relative improvement over SAM per (corruption level, covariate bin)."""
+    pool = np.concatenate(vectors)
+    pool = pool[np.isfinite(pool)]
+    if not len(pool):
+        return None
+    grid = np.unique(np.quantile(pool, np.linspace(0, 1, STEPS)))
 
-    reference = next(iter(arm_names.values()))
-    metric_values = np.array([covariate(reference[clip_key]) for clip_key in clip_keys], dtype=float)
-    finite_values = np.isfinite(metric_values)
-    clip_keys = [record_key for record_key, usable_mask in zip(clip_keys, finite_values) if usable_mask]
-    metric_values = metric_values[finite_values]
+    # `sequence_curves` DROPS a clip with no present frame, which the memory window creates whenever a
+    # target never reappears after its last occlusion. The returned rows would then no longer line up with
+    # `clip_keys`, so the surviving clips are tracked here and every caller indexes through `scored`.
+    predictions = Predictions()
+    scored = []
+    for position, (key, vector) in enumerate(zip(clip_keys, vectors)):
+        record = scored_clips[key]
+        occluded = np.asarray(record["occluded"], dtype=bool)
+        kept = np.asarray(record["has_box"], dtype=bool).copy()
+        if WINDOW and occluded.any():
+            kept[: int(np.where(occluded)[0][-1]) + 1] = False
+        present = kept & ~occluded
+        if not present.any():
+            continue
+        predictions.add(record["samara"], vector, occluded, kept)
+        scored.append(position)
 
-    if len(metric_values) < BINS:
-        return
-
-    bin_index, bin_edges = quantile_bins(metric_values)
-    baseline_scores = baseline_hygiene(baseline, clip_keys)
-    n_bins = len(bin_edges) - 1
-
-    relative = np.full((len(arm_names), n_bins), np.nan)
-    for table_row, scored_clips in enumerate(arm_names.values()):
-        scored_values = arm_hygiene(scored_clips, clip_keys)
-        for column_values in range(n_bins):
-            in_bin = bin_index == column_values
-            sam_level = np.nanmean(baseline_scores[in_bin])
-            if sam_level > 0:
-                relative[table_row, column_values] = np.nanmean(scored_values[in_bin]) / sam_level - 1.0
-
-    limit = float(np.nanmax(np.abs(relative))) or 1.0
-
-    figure_handle, axis = plt.subplots(figsize=(style.COLUMN, 0.42 * len(arm_names) + 1.2))
-    image = axis.imshow(relative, cmap=DIVERGING, vmin=-limit, vmax=limit, aspect="auto")
-
-    for table_row in range(len(arm_names)):
-        for column_values in range(n_bins):
-            value = relative[table_row, column_values]
-            if not np.isfinite(value):
-                continue
-
-            shade = style.INK if abs(value) < 0.6 * limit else SURFACE
-            axis.text(column_values, table_row, f"{value:+.1%}", ha="center", va="center", fontsize=7, color=shade)
-
-    axis.set_xticks(np.arange(n_bins + 1) - 0.5, minor=True)
-    axis.set_yticks(np.arange(len(arm_names) + 1) - 0.5, minor=True)
-    axis.grid(which="minor", color=SURFACE, linewidth=1.2)
-    axis.tick_params(which="minor", length=0)
-
-    axis.set_xticks(np.arange(n_bins))
-    axis.set_xticklabels(
-        [
-            f"{tick_format.format(bin_edges[clip_key])}-{tick_format.format(bin_edges[clip_key +1])}"
-            for clip_key in range(n_bins)
-        ]
-    )
-    axis.set_yticks(np.arange(len(arm_names)))
-    axis.set_yticklabels(list(arm_names))
-    axis.set_xlabel(x_axis_label)
-    axis.set_ylabel("corruption level the gate trains on")
-    for spine in axis.spines.values():
-        spine.set_visible(False)
-    axis.tick_params(length=0)
-
-    bar = figure_handle.colorbar(image, ax=axis, fraction=0.030, pad=0.02)
-    bar.set_label("memory hygiene, relative to SAM")
-    bar.outline.set_visible(False)
-    bar.ax.tick_params(length=2)
-
-    counts = ", ".join(str(int((bin_index == clip_key).sum())) for clip_key in range(n_bins))
-    style.save(figure_handle, filename)
+    if not scored:
+        return None
+    precision, recall = predictions.sequence_curves(grid)
+    return precision, recall, grid, np.asarray(scored)
 
 
-def report(arm_names, baseline, clip_keys, covariate, table_title):
-    """Each arm's hygiene per bin, with its paired margin over SAM."""
+def f_from(precision, recall):
+    """Harmonic mean of the AVERAGED precision and recall -- the macro statistic."""
 
-    reference = next(iter(arm_names.values()))
-    metric_values = np.array([covariate(reference[clip_key]) for clip_key in clip_keys], dtype=float)
-    finite_values = np.isfinite(metric_values)
-    clip_keys = [record_key for record_key, usable_mask in zip(clip_keys, finite_values) if usable_mask]
-    metric_values = metric_values[finite_values]
-    if len(metric_values) < BINS:
-        return
+    denominator = precision + recall
+    return 0.0 if denominator <= 0 else float(2 * precision * recall / denominator)
 
-    bin_index, bin_edges = quantile_bins(metric_values)
-    random_generator = np.random.default_rng(0)
-    baseline_scores = baseline_hygiene(baseline, clip_keys)
 
-    table_header = f"{'bin':22}{'n':>5}{'sam':>8}"
-    for arm_label in arm_names:
-        table_header += f"{arm_label:>17}"
+def cross_validated(scored_clips, signal, clip_keys, rng):
+    """Per-clip (precision, recall) at a threshold chosen WITHOUT that clip.
 
-    for clip_key in range(len(bin_edges) - 1):
-        in_bin = bin_index == clip_key
-        table_row = f"{f'{bin_edges[clip_key]:.3g}-{bin_edges[clip_key +1]:.3g}':22}{int(in_bin.sum()):>5}{np.nanmean(baseline_scores[in_bin]):>8.3f}"
-        for arm_label, scored_clips in arm_names.items():
-            scored_values = arm_hygiene(scored_clips, clip_keys)
-            difference = scored_values[in_bin] - baseline_scores[in_bin]
-            keep = np.isfinite(difference)
-            low, high = interval(difference[keep], random_generator)
-            table_row += f"  {np.nanmean(scored_values[in_bin]):.3f} {difference[keep].mean():+.3f}"
-            table_row += "*" if low > 0 or high < 0 else " "
+    For each fold: pick the threshold maximising macro F on the other folds, then read this fold's clips
+    off that operating point. The returned arrays therefore contain no information the threshold was
+    fitted on, so binning them afterwards cannot re-tune anything. The signal is fixed in advance, so the
+    only thing cross-validation protects is the threshold."""
 
+    result = curves(scored_clips, signal, clip_keys)
+    if result is None:
+        return None
+    precision, recall, grid, scored = result
+
+    # NaN for clips the window left with nothing to score; the binning means are nan-aware.
+    out_precision = np.full(len(clip_keys), np.nan)
+    out_recall = np.full(len(clip_keys), np.nan)
+
+    order = rng.permutation(len(scored))
+    for fold in np.array_split(order, N_FOLDS):
+        train = np.setdiff1d(order, fold)
+        if not len(train) or not len(fold):
+            continue
+        f_scores = [f_from(precision[train, i].mean(), recall[train, i].mean()) for i in range(len(grid))]
+        index = int(np.argmax(f_scores))
+        out_precision[scored[fold]] = precision[fold, index]
+        out_recall[scored[fold]] = recall[fold, index]
+
+    return out_precision, out_recall
+
+
+def occlusion_bins(reference, clip_keys):
+    """Four QUANTILE bins on the number of occluded frames, plus a pooled column."""
+
+    counts = np.array([reference[key]["occ_count"] for key in clip_keys], dtype=float)
+    edges = np.quantile(counts, np.linspace(0, 1, N_BINS + 1))
+    bins, labels = [], []
+    for index in range(N_BINS):
+        low, high = edges[index], (np.inf if index == N_BINS - 1 else edges[index + 1])
+        bins.append((low, high))
+        labels.append(f"{int(low)}-{int(counts.max()) if np.isinf(high) else int(high)}")
+    return bins + [(0.0, np.inf)], labels + ["all"]
 
 
 def main():
-    style.use_paper_style()
-    target = Path(sys.argv[1] if len(sys.argv) > 1 else "data/claim_5")
-    baseline_path = Path(sys.argv[2] if len(sys.argv) > 2 else "data/claim_1/results.pkl")
+    arms_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "data/claim_5")
+    out_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "data/sam-2/claim_5")
 
-    arm_paths = sorted(target.glob("*/results.pkl"))
-    if not arm_paths:
-        raise SystemExit(f"no arm results under {target } (expected <arm>/results.pkl)")
+    loaded = {}
+    for label, path, signal in BASELINES:
+        if Path(path).exists():
+            loaded[label] = (keyed(path), signal)
+    for path in sorted(arms_dir.glob("*/results.pkl")):
+        loaded[f"SAMARA {path.parent.name}"] = (keyed(path), SAMARA_SIGNAL)
+    if not loaded:
+        raise SystemExit(f"no arms found under {arms_dir} and no baselines present")
 
-    arm_names = {path.parent.name: keyed(path) for path in arm_paths}
-    baseline = keyed(baseline_path)
-    clip_keys = shared_clips(arm_names, baseline)
+    clip_keys = sorted(set.intersection(*(set(scored) for scored, _ in loaded.values())))
+    reference = next(iter(loaded.values()))[0]
+    bins, labels = occlusion_bins(reference, clip_keys)
+    counts = np.array([reference[key]["occ_count"] for key in clip_keys], dtype=float)
 
-    if all(name in arm_names for name in COMBINED):
-        label = f"{COMBINED[0]}/{COMBINED[1]}"
-        arm_names[label] = combined_arm(arm_names, clip_keys)
+    print(f"VOT-LT F  ·  {len(clip_keys)} clips  ·  window={WINDOW}  ·  "
+          f"{N_FOLDS}-fold threshold, one operating point per arm")
+    print()
+    header = f"{'arm':16s}" + "".join(f"{label:>12s}" for label in labels)
+    print(header)
+    print("-" * len(header))
 
-    if len(clip_keys) < BINS:
-        raise SystemExit("not enough shared clips to bin yet")
+    rows = {}
+    for label, (scored_clips, signal) in loaded.items():
+        result = cross_validated(scored_clips, signal, clip_keys, np.random.default_rng(0))
+        if result is None:
+            continue
+        precision, recall = result
 
-    caption = (f"claim_5 · {len(clip_keys)} clips scored by every arm · SAM picks the mask in all of them, " f"the commit gate is the only difference")
+        cells = []
+        for low, high in bins:
+            inside = (counts >= low) & (counts < high)
+            cells.append(f_from(np.nanmean(precision[inside]), np.nanmean(recall[inside]))
+                         if inside.any() else float("nan"))
+        rows[label] = cells
+        print(f"{label:16s}" + "".join(f"{value:12.4f}" for value in cells))
 
-    heatmap(
-        arm_names,
-        baseline,
-        clip_keys,
-        anchor_area,
-        "Coverage + memory hygiene by anchor size",
-        caption,
-        "anchor visible box area (px$^2$ @1024)",
-        target / "fig_by_area",
-        "{:.0f}")
-    report(arm_names, baseline, clip_keys, anchor_area, "by anchor size")
+    per_bin = [int(((counts >= low) & (counts < high)).sum()) for low, high in bins]
+    print("-" * len(header))
+    print(f"{'n clips':16s}" + "".join(f"{count:12d}" for count in per_bin))
 
-    heatmap(
-        arm_names,
-        baseline,
-        clip_keys,
-        occluded_frames,
-        "Coverage + memory hygiene by number of occlusion frames",
-        caption,
-        "number of occlusion frames",
-        target / "fig_by_occlusion",
-        "{:.0f}")
-    report(arm_names, baseline, clip_keys, occluded_frames, "by number of occlusion frames")
 
-    reference = next(iter(arm_names.values()))
-    anchor_areas = np.array([anchor_area(reference[clip_key]) for clip_key in clip_keys], dtype=float)
-    bin_cut = np.nanquantile(anchor_areas, SMALL_ANCHOR_QUANTILE)
-    small_anchor_mask = [record_key for record_key, area in zip(clip_keys, anchor_areas) if np.isfinite(area) and area < bin_cut]
-
-    small_caption = (f"claim_5 · {len(small_anchor_mask)} clips, smallest {SMALL_ANCHOR_QUANTILE:.0%} of anchors " f"(area < {bin_cut:.0f} px²) · the commit gate is the only difference")
-    heatmap(
-        arm_names,
-        baseline,
-        small_anchor_mask,
-        occluded_frames,
-        "Coverage + memory hygiene by number of occlusion frames",
-        small_caption,
-        "number of occlusion frames",
-        target / "fig_by_occlusion_small",
-        "{:.0f}")
-    report(
-        arm_names,
-        baseline,
-        small_anchor_mask,
-        occluded_frames,
-        f"by number of occlusion frames  (anchor area < {bin_cut:.0f} px², smallest "
-        f"{SMALL_ANCHOR_QUANTILE:.0%} of anchors)")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = "table_votlt_by_occlusion" + ("_window" if WINDOW else "") + ".csv"
+    with open(out_dir / name, "w") as handle:
+        handle.write("arm," + ",".join(labels) + "\n")
+        for label, cells in rows.items():
+            handle.write(label + "," + ",".join(f"{value:.4f}" for value in cells) + "\n")
+        handle.write("n clips," + ",".join(str(count) for count in per_bin) + "\n")
 
 
 if __name__ == "__main__":

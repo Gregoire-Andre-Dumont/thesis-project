@@ -1,0 +1,40 @@
+# @package _global_
+# SAMARA-3: claim_5 unchanged except that the tracker underneath is SAM 3.
+#
+# The gate trainers are the SAME ones claim_5 uses, deliberately. The calibrator scores Perception Encoder
+# tokens, never SAM's features, so its training set does not depend on the backbone -- and reusing the
+# checkpoints means SAMARA-2 vs SAMARA-3 differs in exactly one thing. The checkpoint hash covers the
+# trainer config, so on a pod that already ran claim_5 these load from `tm/` instead of retraining.
+defaults:
+  - /offline_trainers: cnn_gate_map_samara   # reported confidence: the same gate on maps alone
+  - /offline_trainers@gate_trainers: cnn_gate_iou_samara   # gate reads SAM's IoU token, NOT its object score
+  - /trackers@tracker: samara3_controller
+
+detection_data:
+  _target_: src.typing.detection_data.DetectionData
+  amodal_directory: data/person_path/amodal
+  visible_directory: data/person_path/visible
+  video_directory: data/person_path/videos
+  load_frames: True
+  num_threads: 32
+
+
+person_path:
+  _target_: src.typing.person_path.PersonPath
+  main_directory: data/person_path
+  n_experiments: 1200
+  random_seed: 44
+  first_occ_min: 8
+  border_inset: 8
+  n_after_occlusion: 30
+  min_visible_area: 900
+  min_visible_ratio: 0.90
+  occlusion_ranges: [2, 50]
+  max_distractor_overlap: 0.6
+  non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person, sitting_person, person_on_open_vehicle]
+
+# experiment parameters
+n_traj: 400          # the draw every other experiment now uses, so the pkls join
+folds: 4
+max_frames: 300
+out_dir: data/samara3

@@ -156,26 +156,34 @@ def save_results(results_path, processed, clips, thresholds, n_bins):
 
 
 def roll_arm(tracker, detection_data, occlusions, boxes, first_occlusion):
-    """One arm over the loaded clip: per-frame IoUs across the scored span, and its commit decisions."""
+    """One arm over the loaded clip: per-frame IoUs, commit decisions, and the arm's own CONFIDENCES.
+
+    The confidences are what makes VOT-LT computable here. It scores a tracker on the frames it chooses to
+    report, so without a per-frame confidence the metric collapses to mean overlap -- every frame reported,
+    precision equal to recall. `confidence_signals` normalises the arms to `iou_token`/`object_score`
+    exactly as `baselines.py` does, so claim_1's records join the baseline tables."""
 
     predicted_masks = tracker.predict_masks(detection_data).numpy()
     ious = frame_record(predicted_masks, occlusions, boxes, first_occlusion)
     commits = commit_flags(tracker, predicted_masks.shape[0])[first_occlusion:]
-    return ious, commits
+    confidence = confidence_signals(tracker, predicted_masks.shape[0])
+    span = slice(first_occlusion, len(occlusions))
+    return ious, commits, {name: values[span] for name, values in confidence.items()}
 
 
 def sweep_arm(oracle, detection_data, occlusions, boxes, first_occlusion, thresholds):
     """The same oracle at every commit-gate threshold, keyed by threshold.
     The shared frame cache means SAM's image encoder runs once for the clip however long the sweep is."""
 
-    ious, commits = {}, {}
+    ious, commits, confidences = {}, {}, {}
     for threshold in thresholds:
         oracle.iou_threshold = threshold
-        ious[threshold], commits[threshold] = roll_arm(oracle, detection_data, occlusions, boxes, first_occlusion)
-    return ious, commits
+        ious[threshold], commits[threshold], confidences[threshold] = roll_arm(
+            oracle, detection_data, occlusions, boxes, first_occlusion)
+    return ious, commits, confidences
 
 
-def clip_record(trajectory, occlusions, boxes, first_occlusion, ious_per_arm, commits_per_arm):
+def clip_record(trajectory, occlusions, boxes, first_occlusion, ious_per_arm, commits_per_arm, confidences_per_arm):
     """One trajectory's record: identity, occlusion structure, and every arm's raw IoUs.
     The scored span starts at the first occlusion, so `occluded` and `has_box` align with each arm's array."""
 
@@ -193,6 +201,9 @@ def clip_record(trajectory, occlusions, boxes, first_occlusion, ious_per_arm, co
     for arm_name, ious in ious_per_arm.items():
         record[arm_name] = ious
         record[f"{arm_name}_commit"] = commits_per_arm[arm_name]
+        # Keyed by threshold for the swept oracles and flat for the baseline, mirroring `ious` exactly, so
+        # the visualiser indexes confidence the same way it indexes overlap.
+        record[f"{arm_name}_confidence"] = confidences_per_arm[arm_name]
     return record
 
 
@@ -213,15 +224,18 @@ def process_trajectory(trackers, detection_data, trajectory, max_frames, thresho
         tracker.frame_cache = frame_cache
 
     try:
-        ious_per_arm, commits_per_arm = {}, {}
-        ious_per_arm["sam"], commits_per_arm["sam"] = roll_arm(baseline, detection_data, occlusions, boxes, first_occlusion)
-        ious_per_arm["memory"], commits_per_arm["memory"] = sweep_arm(memory_oracle, detection_data, occlusions, boxes, first_occlusion, thresholds)
-        ious_per_arm["mask"], commits_per_arm["mask"] = sweep_arm(mask_oracle, detection_data, occlusions, boxes, first_occlusion, thresholds)
+        ious_per_arm, commits_per_arm, confidences_per_arm = {}, {}, {}
+        ious_per_arm["sam"], commits_per_arm["sam"], confidences_per_arm["sam"] = roll_arm(
+            baseline, detection_data, occlusions, boxes, first_occlusion)
+        ious_per_arm["memory"], commits_per_arm["memory"], confidences_per_arm["memory"] = sweep_arm(
+            memory_oracle, detection_data, occlusions, boxes, first_occlusion, thresholds)
+        ious_per_arm["mask"], commits_per_arm["mask"], confidences_per_arm["mask"] = sweep_arm(
+            mask_oracle, detection_data, occlusions, boxes, first_occlusion, thresholds)
     finally:
         for tracker in trackers:
             tracker.frame_cache = None
 
-    return clip_record(trajectory, occlusions, boxes, first_occlusion, ious_per_arm, commits_per_arm)
+    return clip_record(trajectory, occlusions, boxes, first_occlusion, ious_per_arm, commits_per_arm, confidences_per_arm)
 
 
 @hydra.main(config_path="../conf", config_name="experiments/claim_1", version_base=None)

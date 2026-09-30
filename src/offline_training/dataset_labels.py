@@ -124,6 +124,21 @@ def _mask_ious(proposals, truth):
     return scores
 
 
+def _to_device(encoding, device):
+    """Move a cached image encoding to `device`, preserving its structure.
+
+    SAM 2's encoding is a flat list of tensors; SAM 3's is a nested tuple whose first element is the
+    feature list. A flat comprehension over the SAM 3 form iterates the wrong level and raises on the
+    inner tuple, so the move has to recurse. SAM 2's result is unchanged -- a list of moved tensors."""
+
+    if torch.is_tensor(encoding):
+        return encoding.to(device)
+    if isinstance(encoding, (list, tuple)):
+        moved = [_to_device(item, device) for item in encoding]
+        return type(encoding)(moved) if isinstance(encoding, tuple) else moved
+    return encoding
+
+
 def _image_features(model, frames, precomputed_features, chunk):
     """One frame's SAM image encoding at a time: cached ones reused, the rest encoded in batches.
 
@@ -133,7 +148,7 @@ def _image_features(model, frames, precomputed_features, chunk):
     if precomputed_features is not None:
         device = next(model.image_encoder.parameters()).device
         for frame in range(len(frames)):
-            yield [features.to(device) for features in precomputed_features[frame]]
+            yield _to_device(precomputed_features[frame], device)
         return
 
     prepared = [model.image_encoder.prepare_image(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), 1024, True) for frame in frames]

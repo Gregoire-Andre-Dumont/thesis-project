@@ -1,0 +1,6 @@
+tracker:
+  _target_: src.modules.baselines.dam4sam3.Dam4Sam3
+  # Resolved inside the fork's own package, like samurai3 -- not a path in this repo.
+  zoo_root: /workspace/SAM3_Tracking_Zoo
+  fork: DAM4SAM
+  tracker_name: sam3

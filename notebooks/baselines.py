@@ -37,8 +37,8 @@ ARMS = {
     "sam2long": "conf/trackers/baselines/sam2long.yaml",
     "sam_baseline": "conf/trackers/baselines/sam_baseline.yaml",
     "dam4sam": "conf/trackers/baselines/dam4sam.yaml",
-    # SAM 3 ports from SAM3_Tracking_Zoo. Third-party re-implementations, not the original authors'.
     "samurai3": "conf/trackers/baselines/samurai3.yaml",
+    "dam4sam3": "conf/trackers/baselines/dam4sam3.yaml",
 }
 
 # Backbone parity with claim_1's SAM baseline and SAMARA, both of which run sam_large. `sentry` is absent
