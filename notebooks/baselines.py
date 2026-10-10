@@ -31,14 +31,17 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 # Arm name -> the tracker config that builds it.
 ARMS = {
     "sam2": "conf/trackers/baselines/sam2.yaml",
-    "sam3": "conf/trackers/baselines/sam3.yaml",
     "samite": "conf/trackers/baselines/samite.yaml",
     "samurai": "conf/trackers/baselines/samurai.yaml",
     "sam2long": "conf/trackers/baselines/sam2long.yaml",
     "sam_baseline": "conf/trackers/baselines/sam_baseline.yaml",
     "dam4sam": "conf/trackers/baselines/dam4sam.yaml",
-    "samurai3": "conf/trackers/baselines/samurai3.yaml",
-    "dam4sam3": "conf/trackers/baselines/dam4sam3.yaml",
+    # Single-pathway ablation: identical to sam3long except num_pathway=1, so the pair isolates
+    # SAM2Long's tree search from everything else (same package, checkpoint, resize path).
+    # BASE zoo fork, so none of SAM2Long's machinery -- notably not its object-score key scaling,
+    # which `sam3long_p1` keeps even at one pathway. `sam3_plain` always updates memory;
+    # `sam3_gate` turns on Meta's own `frame_filter`, which admits a frame when
+    # `eff_iou_score > mf_threshold` -- zero unless object_score > 0, else the IoU scaled by it.
 }
 
 # Backbone parity with claim_1's SAM baseline and SAMARA, both of which run sam_large. `sentry` is absent
@@ -152,6 +155,18 @@ def run(config: DictConfig):
     first_clip = int(config.get("first_clip", 0))
     last_clip = int(config.get("last_clip", 0)) or len(clips)
     clips = clips[first_clip:last_clip]
+
+    # `+only_folds=[1] folds=6` restricts the run to one cross-validation block, built the SAME way
+    # claim_5 builds them (`np.array_split(arange(len(clips)), folds)`) off the same draw -- so a
+    # single-fold baseline scores exactly the clips a single-fold gated arm scored, and the two are
+    # directly comparable without waiting for all 600.
+    selected_folds = config.get("only_folds", None)
+    if selected_folds is not None:
+        blocks = np.array_split(np.arange(len(clips)), int(config.get("folds", 6)))
+        wanted = set(int(f) for f in selected_folds)
+        keep = sorted(i for fold, block in enumerate(blocks) if fold in wanted for i in block)
+        clips = [clips[i] for i in keep]
+        print(f"only_folds={sorted(wanted)}: {len(clips)} clips", flush=True)
     videos = {video for video, _, _ in clips}
 
     print(f"{len(clips)} clips over {len(videos)} videos")

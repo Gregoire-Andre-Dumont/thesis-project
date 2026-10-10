@@ -127,8 +127,7 @@ class MemoryOracle3(MemoryOracle):
             # `reported_mask` -- shared with the SAM 2 oracle -- indexes the same proposal it would there.
             all_masks = _resize_masks(mask_preds[0])
             proposals = all_masks[1:]
-            proposal_iou = (self.score((proposals > 0.0).cpu().numpy(), bboxes_norm, truth)
-                            if visible else None)
+            proposal_iou = (self.score((proposals > 0.0).cpu().numpy(), bboxes_norm, truth) if visible else None)
             self.proposal_iou_scores[idx] = iou_scores.reshape(-1)[1:4].to(torch.float64).cpu()
             self.proposal_masks[idx] = proposals.to(torch.float16).cpu()
             if proposal_iou is not None:

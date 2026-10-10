@@ -70,19 +70,28 @@ class Predictions:
         denominator = precision + recall
         return precision, recall, (2 * precision * recall / denominator if denominator else 0.0)
 
-    def sequence_curves(self, thresholds):
+    def sequence_curves(self, thresholds, localisation=0.0):
         """Per-sequence `(precision, recall)` at each threshold: two `(clips, thresholds)` arrays.
 
         VOT-LT's protocol computes the precision-recall graph on EACH sequence and averages the graphs --
         "this guarantees that the result is not dominated by extremely long sequences" (Lukezic et al.).
         A sequence with no prediction at a threshold scores precision 0 there; one with no present frame
-        contributes nothing and is dropped."""
+        contributes nothing and is dropped.
+
+        `localisation` BINARISES the overlap: 0.0 is the published measure, where a frame contributes its
+        raw IoU and a 0.55 mask earns 0.55; a positive value credits 1.0 for a frame at or above it and 0
+        below, so precision becomes the fraction of reported frames that are LOCATED rather than their mean
+        IoU. That variant makes VOT-LT commensurable with coverage@0.5 -- same overlap criterion -- while
+        keeping the thing coverage lacks, namely that reporting on an absent frame still costs precision.
+        It is not the published statistic, so anything computed with it must say so."""
 
         thresholds = np.asarray(thresholds, dtype=float)
         precisions, recalls = [], []
         for overlap, present, evaluated, confidence in self.clips:
             if not present.any():
                 continue
+            if localisation > 0:
+                overlap = (overlap >= localisation).astype(float)
             reported = evaluated[None, :] & (confidence[None, :] >= thresholds[:, None])
             collected = (reported * overlap[None, :]).sum(axis=1)
             predicted = reported.sum(axis=1)
@@ -91,13 +100,14 @@ class Predictions:
             recalls.append(collected / present.sum())
         return np.asarray(precisions), np.asarray(recalls)
 
-    def macro_scores(self, thresholds):
+    def macro_scores(self, thresholds, localisation=0.0):
         """`(threshold, precision, recall, f_score)` at the best F of the SEQUENCE-AVERAGED curve.
 
         This is the published VOT-LT statistic. `tracking_scores` pools frames instead, which weights a
-        300-frame clip three times a 100-frame one and gives systematically higher values."""
+        300-frame clip three times a 100-frame one and gives systematically higher values. `localisation`
+        is passed through to `sequence_curves`."""
 
-        precisions, recalls = self.sequence_curves(thresholds)
+        precisions, recalls = self.sequence_curves(thresholds, localisation)
         precision, recall = precisions.mean(axis=0), recalls.mean(axis=0)
         denominator = precision + recall
         f_scores = np.divide(2 * precision * recall, denominator,

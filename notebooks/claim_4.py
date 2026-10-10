@@ -210,12 +210,14 @@ def train_models(config: DictConfig):
     trajectory_stems = np.array(template.dataset.trajectories())
     videos = [trajectory_stem.rsplit("_", 1)[0] for trajectory_stem in trajectory_stems]
 
-    corruption_levels = corruption_levels(template.dataset.dataset_path)
+    # Named `levels`, NOT `corruption_levels`: assigning to the function's own name would make it a local
+    # for the whole body, so the call on the right-hand side would resolve to the unbound local and raise
+    # `UnboundLocalError` before the function ever ran.
+    levels = corruption_levels(template.dataset.dataset_path)
     trained_on = [float(probability) for probability in template.dataset.probabilities]
 
-
-    sample_rows = {corruption_level: [] for corruption_level in corruption_levels}
-    predictions = {corruption_level: [] for corruption_level in corruption_levels}
+    sample_rows = {corruption_level: [] for corruption_level in levels}
+    predictions = {corruption_level: [] for corruption_level in levels}
     splits = GroupKFold(n_splits=number_of_folds).split(trajectory_stems, groups=trajectory_stems)
 
     for fold, (train_indices, test_indices) in enumerate(splits):
@@ -232,7 +234,7 @@ def train_models(config: DictConfig):
             fold=fold)
         held_out = trajectory_stems[test_indices]
 
-        for corruption_level in corruption_levels:
+        for corruption_level in levels:
             level = score_level(trainer, corruption_level, held_out)
             predictions[corruption_level].append(
                 {
@@ -255,7 +257,7 @@ def train_models(config: DictConfig):
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(pickle.dumps(predictions))
 
-    summarise(sample_rows, corruption_levels, trained_on, number_of_folds)
+    summarise(sample_rows, levels, trained_on, number_of_folds)
 
 
 if __name__ == "__main__":

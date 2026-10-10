@@ -23,7 +23,7 @@ person_path:
 
 # experiment parameters
 n_bins: 4
-n_traj: 752          # the whole selection pool at first_occ_min 7
+n_traj: 600          # the same prefix the baselines draw, so claim_1 and the 592-clip tables join exactly
 max_frames: 300
 out_dir: data/claim_1
 thresholds: [0.0, 0.1, 0.2, 0.3, 0.4]

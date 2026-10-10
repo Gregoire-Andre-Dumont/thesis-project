@@ -2,7 +2,7 @@ tracker:
   _target_: src.modules.baselines.sam2long.SAM2Long
   checkpoint: tm/sam_base_plus.pt
   model_config: SAM2/sam2long_hiera_base_plus.yaml
-  num_pathway: 2
+  num_pathway: 3   # the published setting (vos_inference.py, vot_inference.py); iou_thre and uncertainty already match
   iou_thre: 0.1
   uncertainty: 2
 

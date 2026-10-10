@@ -21,6 +21,7 @@ class MainTrainer(TorchTrainer, Logger):
     """Main training block for training the memory control of DSAM 2."""
 
     max_grad_norm: float | None = None
+    retrain: bool = False
 
     def train_one_epoch(self, dataloader: DataLoader[tuple[Tensor, ...]], epoch: int) -> float:
         """Single training epoch with optional gradient-norm clipping. Mirrors
@@ -87,6 +88,18 @@ class MainTrainer(TorchTrainer, Logger):
         prediction_dataset.initialize(x)
 
         return prediction_dataset
+
+    def _model_exists(self) -> bool:
+        """Whether a cached checkpoint may stand in for training.
+
+        `TorchTrainer._model_exists` asks only whether a file with this hash is on disk, so ANY earlier
+        run that happened to produce the same hash is reloaded in silence -- including a degenerate one.
+        A `folds=1, n_traj=6` smoke run trains and validates on the same six trajectories, diverges to
+        logits around 1e10, saves that, and every later run with those settings loads it and reports a
+        commit probability of exactly 1.0 for every frame. `retrain: True` forces the fold to be trained
+        from scratch; it still saves, so the checkpoint on disk is the one this run actually produced."""
+
+        return False if self.retrain else super()._model_exists()
 
     def get_hash(self) -> str:
         """Get the hash of the main trainer."""

@@ -1,8 +1,5 @@
 tracker:
   _target_: src.modules.baselines.mask_oracle_v3.MaskOracle3
-  # Identical to baselines/mask_oracle.yaml except for the backbone: same oracle threshold, same selection
-  # rule, same crop geometry. The dataset this produces differs from the SAM 2 one in what generated the
-  # masks and nothing else, which is what makes the two gates comparable.
   iou_threshold: 0.2
   use_mask_iou: False
   model:
