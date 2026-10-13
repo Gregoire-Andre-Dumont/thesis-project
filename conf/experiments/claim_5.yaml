@@ -28,7 +28,7 @@ person_path:
   non_targets: [crowd, person_in_vehicle, reflection, person_in_background, severly_occluded_person, sitting_person, person_on_open_vehicle]
 
 # experiment parameters
-n_traj: 400          # the draw every other experiment now uses, so the pkls join
+n_traj: 400  
 folds: 4         
 max_frames: 300
 out_dir: data/claim_5

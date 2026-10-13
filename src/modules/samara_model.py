@@ -56,7 +56,7 @@ class SamaraModel(CalibratorScoring, SAMV2Model):
         connected-component subset of a proposal; the pointer still comes from that parent proposal."""
 
         with torch.inference_mode():
-            chosen_mask = mask_logits[None, None]                  # (H, W) -> (B, 1, H, W) the encoder expects
+            chosen_mask = mask_logits[None, None]
             chosen_encoding = self.memory_encoder(
                 mask_prediction=chosen_mask, object_score=object_score, lowres_image_encoding=lowres_imgenc)
         return chosen_mask.squeeze().to(torch.float64).cpu(), pointer, chosen_encoding
